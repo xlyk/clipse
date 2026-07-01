@@ -146,6 +146,82 @@ func TestTick_ContinueRespawnsUntilTurnCapThenBlocks(t *testing.T) {
 	}
 }
 
+// TestTick_SpawnFailureBlocksWithoutRetry asserts that when the
+// Spawner/Workspacer machinery itself fails to produce a process to Wait on
+// (fakeSpawner.SpawnErr), the issue is blocked directly via
+// blockOnSpawnFailure rather than through the normal applyResult/runResult
+// path: no run is ever inflight, so there is nothing for reconcile to drain
+// on a later tick. This exercises the ws.Ensure/spawner.Spawn error branch in
+// dispatcher/spawn.go's spawnAttempt, which TestTick_FailureResultsBlockWithoutRetry
+// does not cover (that test only exercises worker-process failures reported
+// through a spawned handle's Wait()).
+func TestTick_SpawnFailureBlocksWithoutRetry(t *testing.T) {
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	spawner := newFakeSpawner()
+	spawner.SpawnErr = errors.New("fake exec failure: no such file or directory")
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	// A single tick both claims the issue and calls spawnAttempt, which fails
+	// immediately (SpawnErr, not a Wait()-reported result) and blocks the
+	// issue synchronously within the same Tick — unlike a worker-process
+	// failure, there is no inflight run/goroutine to drain on a later tick.
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: unexpected error: %v", err)
+	}
+
+	snap, err := s.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	if snap.Issues[0].BoardStatus != string(contract.ColumnBlocked) {
+		t.Fatalf("BoardStatus = %q, want blocked", snap.Issues[0].BoardStatus)
+	}
+	if snap.Issues[0].ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+	if snap.Issues[0].LatestRun == nil || !snap.Issues[0].LatestRun.Error.Valid {
+		t.Errorf("run error not recorded, want the spawn failure reason stored")
+	}
+	if snap.Issues[0].LatestRun != nil && snap.Issues[0].LatestRun.Status != "blocked" {
+		t.Errorf("LatestRun.Status = %q, want blocked", snap.Issues[0].LatestRun.Status)
+	}
+
+	// blockOnSpawnFailure enqueues a blocked-reason comment (Comment field on
+	// the TransitionReq), same as the worker-failure path.
+	if len(lc.CommentCalls) == 0 {
+		t.Fatalf("no Comment call recorded, want a block-reason comment")
+	}
+	if lc.CommentCalls[0].Body == "" {
+		t.Errorf("comment body empty, want a block reason")
+	}
+
+	// blockOnSpawnFailure never spawns a process to Wait on, so there is
+	// nothing inflight; a bare spawn count of 1 (the failed attempt itself)
+	// confirms spawnAttempt actually reached d.spawner.Spawn.
+	if spawner.SpawnCount() != 1 {
+		t.Fatalf("SpawnCount = %d, want 1 (the failed spawn attempt)", spawner.SpawnCount())
+	}
+
+	// A second tick must NOT re-claim the blocked issue (no auto-retry).
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: unexpected error: %v", err)
+	}
+	if spawner.SpawnCount() != 1 {
+		t.Errorf("SpawnCount grew to %d after a blocked issue's later tick, want no re-claim (1)", spawner.SpawnCount())
+	}
+	snap2, err := s.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	if snap2.Issues[0].BoardStatus != string(contract.ColumnBlocked) {
+		t.Errorf("BoardStatus after tick 2 = %q, want still blocked", snap2.Issues[0].BoardStatus)
+	}
+}
+
 // TestTick_FailureResultsBlockWithoutRetry asserts each Spawner-reported
 // failure mode (nonzero exit, malformed result, context-deadline timeout)
 // lands the issue in blocked with a comment and no auto-retry.
