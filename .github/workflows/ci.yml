@@ -34,9 +34,7 @@ jobs:
       - run: cd agent && uvx ruff check .
 
   codegen-drift:
-    # runs on macOS: `make codegen` shells out to BSD sed (`sed -i ''`), which
-    # is not compatible with GNU sed on ubuntu-latest.
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
