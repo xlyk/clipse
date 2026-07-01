@@ -25,9 +25,9 @@
       ]
     },
     "BlockKind": {
-      "type": ["string", "null"],
-      "description": "Why a run is parked in Blocked, or null when not blocked.",
-      "enum": ["needs_input", "capability", "transient", null]
+      "type": "string",
+      "description": "The reason a run is blocked; present on a worker result iff outcome==\"blocked\".",
+      "enum": ["needs_input", "capability", "transient"]
     }
   }
 }

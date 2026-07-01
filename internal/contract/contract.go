@@ -6,39 +6,33 @@ import "encoding/json"
 import "fmt"
 import "reflect"
 
-type BlockKind struct {
-	Value interface{}
-}
+type BlockKind string
 
-// MarshalJSON implements json.Marshaler.
-func (j *BlockKind) MarshalJSON() ([]byte, error) {
-	return json.Marshal(j.Value)
-}
+const BlockKindCapability BlockKind = "capability"
+const BlockKindNeedsInput BlockKind = "needs_input"
+const BlockKindTransient BlockKind = "transient"
 
 var enumValues_BlockKind = []interface{}{
 	"needs_input",
 	"capability",
 	"transient",
-	nil,
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *BlockKind) UnmarshalJSON(value []byte) error {
-	var v struct {
-		Value interface{}
-	}
-	if err := json.Unmarshal(value, &v.Value); err != nil {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
 		return err
 	}
 	var ok bool
 	for _, expected := range enumValues_BlockKind {
-		if reflect.DeepEqual(v.Value, expected) {
+		if reflect.DeepEqual(v, expected) {
 			ok = true
 			break
 		}
 	}
 	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_BlockKind, v.Value)
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_BlockKind, v)
 	}
 	*j = BlockKind(v)
 	return nil
@@ -130,7 +124,7 @@ type WorkerResult struct {
 	// Paths or references produced this turn (files touched, logs, etc).
 	Artifacts []string `json:"artifacts" yaml:"artifacts" mapstructure:"artifacts"`
 
-	// BlockKind corresponds to the JSON schema field "block_kind".
+	// Present iff outcome == "blocked"; omitted otherwise.
 	BlockKind *BlockKind `json:"block_kind,omitempty,omitzero" yaml:"block_kind,omitempty" mapstructure:"block_kind,omitempty"`
 
 	// Linear issue identifier this run is working.

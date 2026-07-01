@@ -34,7 +34,8 @@
       "enum": ["done", "needs_review", "changes_requested", "blocked", "continue"]
     },
     "block_kind": {
-      "$ref": "board.schema.json#/$defs/BlockKind"
+      "$ref": "board.schema.json#/$defs/BlockKind",
+      "description": "Present iff outcome == \"blocked\"; omitted otherwise."
     },
     "summary": {
       "type": "string",

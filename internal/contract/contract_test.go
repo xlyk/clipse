@@ -8,17 +8,34 @@ import (
 // validWorkerResultJSON is a hand-written, schema-valid WorkerResult payload
 // (see schema/worker-result.schema.json). It exercises every required field
 // plus the cross-file Lane enum ref into schema/board.schema.json.
+//
+// block_kind is OMITTED here (not blocked), reflecting the "present iff
+// outcome == blocked" invariant (see amendment X2).
 const validWorkerResultJSON = `{
 	"run_id": "run-1",
 	"issue_id": "SPAC-123",
 	"lane": "coder",
 	"outcome": "done",
-	"block_kind": null,
 	"summary": "did the thing",
 	"artifacts": ["path/to/file.go"],
 	"thread_id": "thread-1",
 	"turn_count": 3,
 	"tokens": {"in": 100, "out": 200}
+}`
+
+// blockedWorkerResultJSON is the counterpart payload where outcome ==
+// "blocked" and block_kind is present with a valid enum value.
+const blockedWorkerResultJSON = `{
+	"run_id": "run-2",
+	"issue_id": "SPAC-124",
+	"lane": "coder",
+	"outcome": "blocked",
+	"block_kind": "needs_input",
+	"summary": "waiting on input",
+	"artifacts": [],
+	"thread_id": "thread-2",
+	"turn_count": 1,
+	"tokens": {"in": 10, "out": 20}
 }`
 
 func TestWorkerResult_UnmarshalJSON_RoundTripsKeyFields(t *testing.T) {
@@ -50,6 +67,62 @@ func TestWorkerResult_UnmarshalJSON_RoundTripsKeyFields(t *testing.T) {
 	}
 	if got.TurnCount != 3 {
 		t.Errorf("TurnCount = %d, want 3", got.TurnCount)
+	}
+}
+
+func TestWorkerResult_BlockKind_PresentIffBlocked(t *testing.T) {
+	// Non-blocked result: block_kind omitted from the JSON entirely.
+	var done WorkerResult
+	if err := json.Unmarshal([]byte(validWorkerResultJSON), &done); err != nil {
+		t.Fatalf("Unmarshal (done): %v", err)
+	}
+	if done.Outcome != WorkerResultOutcomeDone {
+		t.Errorf("Outcome = %q, want %q", done.Outcome, WorkerResultOutcomeDone)
+	}
+	if done.BlockKind != nil {
+		t.Errorf("BlockKind = %v, want nil for non-blocked result", done.BlockKind)
+	}
+
+	// Blocked result: block_kind present with a valid enum value.
+	var blocked WorkerResult
+	if err := json.Unmarshal([]byte(blockedWorkerResultJSON), &blocked); err != nil {
+		t.Fatalf("Unmarshal (blocked): %v", err)
+	}
+	if blocked.Outcome != WorkerResultOutcomeBlocked {
+		t.Errorf("Outcome = %q, want %q", blocked.Outcome, WorkerResultOutcomeBlocked)
+	}
+	if blocked.BlockKind == nil {
+		t.Fatal("BlockKind = nil, want set for blocked result")
+	}
+	if *blocked.BlockKind != BlockKindNeedsInput {
+		t.Errorf("BlockKind = %v, want %q", *blocked.BlockKind, BlockKindNeedsInput)
+	}
+
+	// Marshalling the non-blocked result must OMIT block_kind entirely
+	// (not emit it as a null-valued key) — this is the wart X2 removes.
+	out, err := json.Marshal(done)
+	if err != nil {
+		t.Fatalf("Marshal (done): %v", err)
+	}
+	var asMap map[string]interface{}
+	if err := json.Unmarshal(out, &asMap); err != nil {
+		t.Fatalf("Unmarshal into map: %v", err)
+	}
+	if _, present := asMap["block_kind"]; present {
+		t.Errorf("marshalled done result has block_kind key, want omitted: %s", out)
+	}
+
+	// Marshalling the blocked result must include block_kind.
+	outBlocked, err := json.Marshal(blocked)
+	if err != nil {
+		t.Fatalf("Marshal (blocked): %v", err)
+	}
+	var asMapBlocked map[string]interface{}
+	if err := json.Unmarshal(outBlocked, &asMapBlocked); err != nil {
+		t.Fatalf("Unmarshal into map: %v", err)
+	}
+	if v, present := asMapBlocked["block_kind"]; !present || v != "needs_input" {
+		t.Errorf("marshalled blocked result block_kind = %v (present=%v), want %q", v, present, "needs_input")
 	}
 }
 
