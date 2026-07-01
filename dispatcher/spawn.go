@@ -39,7 +39,13 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		Env:       env,
 	}
 
-	spawnCtx, cancel := context.WithTimeout(ctx, time.Duration(d.cfg.MaxRuntimeS)*time.Second)
+	// Root the worker's timeout at a context that keeps ctx's values but
+	// drops its cancellation (context.WithoutCancel), so a graceful
+	// dispatcher shutdown (Run's ctx being cancelled) does not tear down a
+	// live worker mid-commit/push. Only MaxRuntimeS — never shutdown — kills
+	// a spawned worker; a worker still running when the process exits
+	// becomes an orphan the next dispatcher's RecoverOrphans reaps.
+	spawnCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(d.cfg.MaxRuntimeS)*time.Second)
 	handle, err := d.spawner.Spawn(spawnCtx, spec)
 	if err != nil {
 		cancel()
