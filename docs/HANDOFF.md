@@ -1,6 +1,6 @@
 # Clipse — session handoff
 
-**Date:** 2026-07-01 · **Phase:** 0 + 1 complete (on draft PR #1); resuming at **Phase 2** (prerequisite-gated — DAC spike done, board + target repo pending).
+**Date:** 2026-07-01 · **Phase:** 0 + 1 complete (on draft PR #1); resuming at **Phase 2** (prerequisite-gated — DAC spike done, target repo = this repo; Linear board pending).
 
 Resume brief for a fresh Claude Code session (terminal). Read this, then the guide + design + plan, then execute.
 
@@ -27,7 +27,7 @@ Before writing any Phase-2 code, verify these prerequisites and **STOP + report*
 1. **DAC API spike** (do first, blocking) — ✅ **DONE 2026-07-01** against `deepagents_code` 0.1.22. Findings recorded in the design doc's "DAC API spike findings" subsection. Net: wrap DAC as an **in-process LangGraph graph** via `create_cli_agent(...)` (do not shell out to `dcode -n`); the kernel owns the `AsyncSqliteSaver` checkpointer + `thread_id`; **the worker must use `auto_approve=False, interrupt_shell_only=True`** or the shell allow-list is silently dropped.
 2. `ANTHROPIC_API_KEY` — ✅ available (`../agents/apps/estimator-v2/.env`; `sk-ant…`). `gh` — ✅ authenticated (`xlyk`, `repo` scope).
 3. Linear board — ⏳ **workspace `clipse-development` being created**; needs columns `Rework`/`Merging`/`Documentation` and labels `agent:coder|reviewer|git_operator|scribe`; candidate-issue query + branch auto-link verified against it. **Access it via the `linear` CLI (`linear --workspace clipse-development …`), not the MCP.**
-4. Target repo — ❌ **not yet**: a throwaway repo with required checks + branch protection.
+4. Target repo — ✅ **`xlyk/clipse` itself** (private, default `main`). Phase 2 only *opens* PRs (no merge), so this is fine as-is. ⚠️ `main` has **no branch protection / required checks yet** — stand these up before Phase-3 CI-gated auto-merge.
 
 If prerequisites aren't ready, do the DAC spike + any doc updates, then stop.
 
@@ -62,5 +62,5 @@ Use `superpowers:subagent-driven-development`. In a normal interactive session, 
 
 1. Read AGENTS.md + design + plan + amendments + ledger.
 2. DAC API spike — ✅ done; findings in the design doc.
-3. Verify the remaining prerequisites: Linear board (`clipse-development`, via the `linear` CLI) + throwaway target repo with branch protection.
-4. Once the board + repo exist, report the Phase-2 implementation plan (prerequisite status first) before writing worker code.
+3. Verify the last prerequisite: Linear board (`clipse-development`, via the `linear` CLI). Target repo = `xlyk/clipse` (add branch protection for Phase 3).
+4. Once the board exists, report the Phase-2 implementation plan (prerequisite status first) before writing worker code.
