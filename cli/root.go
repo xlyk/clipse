@@ -29,6 +29,7 @@ a deterministic state machine.`,
 	root.SetVersionTemplate(fmt.Sprintf("clipse %s\n", Version))
 
 	root.AddCommand(newDispatchCmd())
+	root.AddCommand(newStatusCmd())
 
 	return root
 }
