@@ -72,6 +72,11 @@ type Dispatcher struct {
 
 	logger *slog.Logger
 
+	// pollInterval overrides the Tick interval Run uses when set (via
+	// WithPollInterval); zero means "use cfg.PollIntervalS" — see
+	// pollIntervalOrDefault in run.go.
+	pollInterval time.Duration
+
 	results  chan runResult
 	inflight map[string]inflightRun
 }
