@@ -238,7 +238,43 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		snap.Issues[i].LatestRun = latest
 	}
 
+	unmirrored, err := s.unmirroredIssueIDs(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	for i := range snap.Issues {
+		if unmirrored[snap.Issues[i].ID] {
+			snap.Issues[i].Unmirrored = true
+			snap.UnmirroredCount++
+		}
+	}
+
 	return snap, nil
+}
+
+// unmirroredIssueIDs returns the set of issue ids that have at least one
+// pending linear_writes row (A2's outbox), via a single grouped query rather
+// than a per-issue lookup in ReadSnapshot's issue loop.
+func (s *Store) unmirroredIssueIDs(ctx context.Context) (map[string]bool, error) {
+	const q = `SELECT DISTINCT issue_id FROM linear_writes WHERE status = 'pending'`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("reading unmirrored issue ids: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning unmirrored issue id row: %w", err)
+		}
+		ids[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating unmirrored issue id rows: %w", err)
+	}
+	return ids, nil
 }
 
 // GetIssue fetches the single issue row for id, e.g. so the dispatcher can

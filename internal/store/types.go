@@ -70,6 +70,12 @@ type LinearWrite struct {
 type IssueSnapshot struct {
 	Issue
 	LatestRun *Run
+
+	// Unmirrored is true iff this issue has at least one linear_writes row
+	// with status='pending' (A2's outbox) — i.e. a board transition
+	// committed locally but hasn't yet been mirrored to Linear, typically
+	// because Linear was unreachable when the dispatcher tried to drain it.
+	Unmirrored bool
 }
 
 // Snapshot is a point-in-time read of the kernel store, shaped for
@@ -77,4 +83,8 @@ type IssueSnapshot struct {
 type Snapshot struct {
 	Issues         []IssueSnapshot
 	CountsByStatus map[string]int
+
+	// UnmirroredCount is the number of issues with Unmirrored=true, i.e. how
+	// many issues currently have a pending Linear mirror write outstanding.
+	UnmirroredCount int
 }

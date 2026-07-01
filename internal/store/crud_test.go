@@ -217,3 +217,75 @@ func TestBumpRunTurn_NoSuchRun(t *testing.T) {
 		t.Fatalf("BumpRunTurn on nonexistent run: err = nil, want error")
 	}
 }
+
+// TestReadSnapshot_FlagsUnmirroredIssues asserts that ReadSnapshot marks an
+// issue Unmirrored=true iff it has at least one pending linear_writes row
+// (A2's outbox), and that Snapshot.UnmirroredCount reflects the total number
+// of such issues. issue-2's write is marked done, so it must not be flagged
+// even though it has a linear_writes row at all.
+func TestReadSnapshot_FlagsUnmirroredIssues(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	for _, issue := range []store.Issue{
+		{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "running"},
+		{ID: "issue-2", Identifier: "CLP-2", BoardStatus: "review"},
+		{ID: "issue-3", Identifier: "CLP-3", BoardStatus: "ready"},
+	} {
+		if err := s.UpsertIssue(ctx, issue); err != nil {
+			t.Fatalf("UpsertIssue(%s): unexpected error: %v", issue.ID, err)
+		}
+	}
+
+	// issue-1 has a pending mirror write (Linear was unreachable).
+	if err := s.EnqueueLinearSetState(ctx, "issue-1", "running", 100); err != nil {
+		t.Fatalf("EnqueueLinearSetState(issue-1): unexpected error: %v", err)
+	}
+
+	// issue-2 has a write too, but it already mirrored successfully.
+	if err := s.EnqueueLinearSetState(ctx, "issue-2", "review", 100); err != nil {
+		t.Fatalf("EnqueueLinearSetState(issue-2): unexpected error: %v", err)
+	}
+	pending, err := s.DrainPendingLinearWrites(ctx, 10)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	var issue2WriteID int64
+	for _, w := range pending {
+		if w.IssueID == "issue-2" {
+			issue2WriteID = w.ID
+		}
+	}
+	if issue2WriteID == 0 {
+		t.Fatalf("no pending linear_writes row found for issue-2")
+	}
+	if err := s.MarkLinearWriteDone(ctx, issue2WriteID, 200); err != nil {
+		t.Fatalf("MarkLinearWriteDone: unexpected error: %v", err)
+	}
+
+	// issue-3 has no linear_writes row at all.
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+
+	byID := make(map[string]store.IssueSnapshot)
+	for _, is := range snap.Issues {
+		byID[is.ID] = is
+	}
+
+	if !byID["issue-1"].Unmirrored {
+		t.Errorf("issue-1.Unmirrored = false, want true (has pending linear_writes row)")
+	}
+	if byID["issue-2"].Unmirrored {
+		t.Errorf("issue-2.Unmirrored = true, want false (write marked done)")
+	}
+	if byID["issue-3"].Unmirrored {
+		t.Errorf("issue-3.Unmirrored = true, want false (no linear_writes row)")
+	}
+
+	if snap.UnmirroredCount != 1 {
+		t.Errorf("UnmirroredCount = %d, want 1", snap.UnmirroredCount)
+	}
+}
