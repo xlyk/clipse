@@ -1,0 +1,215 @@
+package spawn
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"syscall"
+
+	"github.com/xlyk/clipse/internal/contract"
+)
+
+// LocalSpawner spawns workers as local subprocesses via exec.CommandContext.
+// It is the only Spawner implementation in v1 (see the design doc's Spawner
+// seam note); a remote/SSH host-pool Spawner is reserved for v2.
+type LocalSpawner struct {
+	binaryPath string
+	boardDir   string
+}
+
+// NewLocalSpawner returns a LocalSpawner that execs binaryPath for every
+// worker, redirecting each worker's stderr to <boardDir>/logs/<issue>.log.
+func NewLocalSpawner(binaryPath, boardDir string) *LocalSpawner {
+	return &LocalSpawner{binaryPath: binaryPath, boardDir: boardDir}
+}
+
+// Spawn starts binaryPath with args built from spec's fixed fields
+// (--issue/--lane/--run/--thread/--workspace), running it as the leader of
+// its own process group (so Kill and the max_runtime deadline can reap the
+// whole group, not just the leader). ctx's deadline governs the worker's
+// max_runtime: the caller sets it, and once it fires the process group is
+// killed and Wait returns a timeout Result.
+func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, error) {
+	logPath, err := s.stderrLogPath(spec.Issue)
+	if err != nil {
+		return nil, err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("opening worker stderr log %s: %w", logPath, err)
+	}
+
+	args := []string{
+		"--issue=" + spec.Issue,
+		"--lane=" + spec.Lane,
+		"--run=" + spec.RunID,
+		"--thread=" + spec.ThreadID,
+		"--workspace=" + spec.Workspace,
+	}
+	cmd := exec.CommandContext(ctx, s.binaryPath, args...)
+	cmd.Env = spec.Env
+	cmd.Stderr = logFile
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	// Run the worker as its own process-group leader so Kill (and the
+	// context-deadline kill exec.CommandContext performs on the leader
+	// alone) can be extended to signal the whole group, reaping any
+	// children the worker spawns.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return nil, fmt.Errorf("starting worker %s: %w", s.binaryPath, err)
+	}
+
+	startedAt, psErr := processStartTime(cmd.Process.Pid)
+	if psErr != nil {
+		// Best-effort: leave ProcStartedAt at 0 ("unverifiable") rather than
+		// failing the spawn outright.
+		startedAt = 0
+	}
+
+	h := &localHandle{
+		cmd:       cmd,
+		logFile:   logFile,
+		pid:       cmd.Process.Pid,
+		startedAt: startedAt,
+		ctx:       ctx,
+	}
+	return h, nil
+}
+
+// stderrLogPath ensures <boardDir>/logs exists and returns the per-issue log
+// path within it.
+func (s *LocalSpawner) stderrLogPath(issue string) (string, error) {
+	logsDir := filepath.Join(s.boardDir, "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		return "", fmt.Errorf("creating logs dir %s: %w", logsDir, err)
+	}
+	return filepath.Join(logsDir, issue+".log"), nil
+}
+
+// localHandle is the LocalSpawner's RunHandle implementation.
+type localHandle struct {
+	cmd       *exec.Cmd
+	logFile   *os.File
+	pid       int
+	startedAt int64
+	ctx       context.Context
+
+	mu       sync.Mutex
+	killed   bool
+	waitOnce sync.Once
+	waitRes  Result
+	waitErr  error
+}
+
+func (h *localHandle) PID() int { return h.pid }
+
+func (h *localHandle) ProcStartedAt() int64 { return h.startedAt }
+
+// Kill signals the worker's entire process group with SIGTERM, then
+// SIGKILL, rather than just the leader pid: Setpgid:true at Start made the
+// leader the group leader, so -pgid addresses the whole group, catching any
+// children the worker spawned.
+func (h *localHandle) Kill() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.killed {
+		return nil
+	}
+	h.killed = true
+
+	pgid := h.pid
+	// Best-effort graceful termination first; ignore errors here since the
+	// process may already be gone or may ignore SIGTERM, either of which
+	// the follow-up SIGKILL handles.
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			// Process group is already gone: not an error.
+			return nil
+		}
+		return fmt.Errorf("killing worker process group %d: %w", pgid, err)
+	}
+	return nil
+}
+
+// Wait blocks until the process exits or ctx's deadline fires (in which
+// case it kills the process group and reports a timeout), then parses
+// stdout into a Result. It is safe to call more than once; the underlying
+// wait/parse work runs exactly once.
+func (h *localHandle) Wait() (Result, error) {
+	h.waitOnce.Do(func() {
+		h.waitRes, h.waitErr = h.wait()
+	})
+	return h.waitRes, h.waitErr
+}
+
+func (h *localHandle) wait() (Result, error) {
+	defer func() { _ = h.logFile.Close() }()
+
+	runErr := h.cmd.Wait()
+
+	// exec.CommandContext kills the leader pid (not the group) itself once
+	// ctx's deadline passes, so cmd.Wait() above can return promptly even
+	// though other children in the group are still alive. Kill the whole
+	// group ourselves whenever the deadline has fired, whether or not
+	// cmd.Wait() already returned — this both handles the leader (Kill is
+	// idempotent) and reaps stray children.
+	if h.ctx.Err() != nil {
+		_ = h.Kill()
+		return Result{
+			ExitCode: h.exitCode(runErr),
+			Err:      fmt.Errorf("worker killed after context deadline: %w", h.ctx.Err()),
+		}, nil
+	}
+
+	exitCode := h.exitCode(runErr)
+	if runErr != nil {
+		return Result{
+			ExitCode: exitCode,
+			Err:      fmt.Errorf("%w: exit code %d: %w", ErrWorkerExit, exitCode, runErr),
+		}, nil
+	}
+
+	var worker contract.WorkerResult
+	stdout := h.stdoutBytes()
+	if err := json.Unmarshal(stdout, &worker); err != nil {
+		return Result{
+			ExitCode: exitCode,
+			Err:      fmt.Errorf("%w: %w", ErrMalformedResult, err),
+		}, nil
+	}
+
+	return Result{Worker: worker, ExitCode: exitCode}, nil
+}
+
+// exitCode extracts the process exit code from cmd.Wait()'s error (nil
+// meaning exit 0), falling back to -1 for failure modes that have no exit
+// code (e.g. the process was killed by a signal before exiting normally).
+func (h *localHandle) exitCode(runErr error) int {
+	if runErr == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
+}
+
+func (h *localHandle) stdoutBytes() []byte {
+	if buf, ok := h.cmd.Stdout.(*bytes.Buffer); ok {
+		return buf.Bytes()
+	}
+	return nil
+}
