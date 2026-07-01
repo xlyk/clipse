@@ -37,6 +37,7 @@ caps:
 turn_cap: 7
 max_runtime_s: 1800
 lane_label_prefix: "lane:"
+max_attempts: 4
 `)
 
 	cfg, err := config.Load(path)
@@ -80,6 +81,9 @@ lane_label_prefix: "lane:"
 	if cfg.LaneLabelPrefix != "lane:" {
 		t.Errorf("LaneLabelPrefix = %q, want %q", cfg.LaneLabelPrefix, "lane:")
 	}
+	if cfg.MaxAttempts != 4 {
+		t.Errorf("MaxAttempts = %d, want 4", cfg.MaxAttempts)
+	}
 }
 
 func TestLoad_MinimalConfigGetsDefaults(t *testing.T) {
@@ -121,6 +125,9 @@ repo:
 	}
 	if cfg.LaneLabelPrefix != "agent:" {
 		t.Errorf("LaneLabelPrefix = %q, want default %q", cfg.LaneLabelPrefix, "agent:")
+	}
+	if cfg.MaxAttempts != 3 {
+		t.Errorf("MaxAttempts = %d, want default 3", cfg.MaxAttempts)
 	}
 }
 
@@ -226,6 +233,17 @@ caps:
     coder: -1
 `,
 			wantErrSubstr: "caps.per_lane.coder",
+		},
+		{
+			name: "non-positive max_attempts",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+max_attempts: 0
+`,
+			wantErrSubstr: "max_attempts",
 		},
 	}
 

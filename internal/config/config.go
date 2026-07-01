@@ -18,6 +18,7 @@ const (
 	defaultTurnCap           = 5
 	defaultMaxRuntimeS       = 3600
 	defaultLaneLabelPrefix   = "agent:"
+	defaultMaxAttempts       = 3
 )
 
 // Repo describes the single repository clipse manages.
@@ -49,6 +50,7 @@ type Config struct {
 	TurnCap         int    `yaml:"turn_cap"`
 	MaxRuntimeS     int    `yaml:"max_runtime_s"`
 	LaneLabelPrefix string `yaml:"lane_label_prefix"`
+	MaxAttempts     int    `yaml:"max_attempts"`
 }
 
 // rawPerLaneCaps mirrors PerLaneCaps with pointer fields so we can tell
@@ -77,6 +79,7 @@ type rawConfig struct {
 	TurnCap         *int    `yaml:"turn_cap"`
 	MaxRuntimeS     *int    `yaml:"max_runtime_s"`
 	LaneLabelPrefix *string `yaml:"lane_label_prefix"`
+	MaxAttempts     *int    `yaml:"max_attempts"`
 }
 
 // Load reads the clipse config file at path, applies defaults for fields
@@ -99,6 +102,7 @@ func Load(path string) (*Config, error) {
 		TurnCap:         intOrDefault(raw.TurnCap, defaultTurnCap),
 		MaxRuntimeS:     intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),
 		LaneLabelPrefix: stringOrDefault(raw.LaneLabelPrefix, defaultLaneLabelPrefix),
+		MaxAttempts:     intOrDefault(raw.MaxAttempts, defaultMaxAttempts),
 		Caps: Caps{
 			Global: intOrDefault(raw.Caps.Global, defaultCapsGlobal),
 			PerLane: PerLaneCaps{
@@ -149,6 +153,9 @@ func validate(cfg *Config) error {
 	}
 	if cfg.MaxRuntimeS <= 0 {
 		return fmt.Errorf("max_runtime_s must be positive, got %d", cfg.MaxRuntimeS)
+	}
+	if cfg.MaxAttempts < 1 {
+		return fmt.Errorf("max_attempts must be at least 1, got %d", cfg.MaxAttempts)
 	}
 	if cfg.Caps.Global < 1 {
 		return fmt.Errorf("caps.global must be at least 1, got %d", cfg.Caps.Global)

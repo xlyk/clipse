@@ -37,3 +37,8 @@ max_runtime_s: 3600
 # lane_label_prefix: Linear label prefix used to select a lane for an issue.
 # e.g. the label "agent:coder" selects the coder lane.
 lane_label_prefix: "agent:"
+
+# max_attempts: maximum dispatch attempts for a single issue (across retries
+# and dispatcher-restart requeues) before it is parked in Blocked instead of
+# requeued again.
+max_attempts: 3
