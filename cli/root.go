@@ -30,11 +30,3 @@ a deterministic state machine.`,
 
 	return root
 }
-
-// Execute is the single entry point called by cmd/clipse/main.go.
-func Execute() {
-	if err := NewRootCmd().Execute(); err != nil {
-		// cobra already prints the error; exit is handled by the os package.
-		// Return here; main calls os.Exit via cobra's default error path.
-	}
-}
