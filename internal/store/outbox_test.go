@@ -346,6 +346,33 @@ func TestMarkLinearWriteDone_RemovesFromPending(t *testing.T) {
 	}
 }
 
+// TestEnqueueLinearSetState_AddsPendingSetstateWrite asserts
+// EnqueueLinearSetState inserts a standalone pending 'setstate' linear_writes
+// row outside of a Transition — used to mirror a fresh ClaimReady win
+// ('running') to Linear, since ClaimReady itself doesn't enqueue any outbox
+// row.
+func TestEnqueueLinearSetState_AddsPendingSetstateWrite(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+
+	if err := s.EnqueueLinearSetState(ctx, "issue-1", "running", 100); err != nil {
+		t.Fatalf("EnqueueLinearSetState: unexpected error: %v", err)
+	}
+
+	pending, err := s.DrainPendingLinearWrites(ctx, 10)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("len(pending) = %d, want 1", len(pending))
+	}
+	got := pending[0]
+	if got.IssueID != "issue-1" || got.Kind != "setstate" || got.Target != "running" || got.Status != "pending" {
+		t.Errorf("pending write = %+v, want IssueID=issue-1 Kind=setstate Target=running Status=pending", got)
+	}
+}
+
 // TestMarkLinearWriteFailed_BumpsAttemptsAndStaysPending asserts a failed
 // write increments attempts, records last_error, and remains pending so the
 // dispatcher retries it on a later tick.

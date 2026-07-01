@@ -137,6 +137,23 @@ func enqueueLinearWrite(ctx context.Context, tx *sql.Tx, issueID, kind, target, 
 	return err
 }
 
+// EnqueueLinearSetState enqueues a standalone pending 'setstate' linear_writes
+// row mirroring issueID's board state to column, outside of a Transition.
+// This exists because ClaimReady's CAS win (ready -> running) is not itself a
+// Transition call, so nothing else enqueues the outbox row that mirrors a
+// fresh claim to Linear.
+func (s *Store) EnqueueLinearSetState(ctx context.Context, issueID, column string, now int64) error {
+	const q = `
+		INSERT INTO linear_writes (issue_id, kind, target, body, status, attempts, created_at, updated_at)
+		VALUES (?, 'setstate', ?, '', 'pending', 0, ?, ?)
+	`
+	_, err := s.db.ExecContext(ctx, q, issueID, column, now, now)
+	if err != nil {
+		return fmt.Errorf("enqueueing setstate for issue %s: %w", issueID, err)
+	}
+	return nil
+}
+
 // DrainPendingLinearWrites returns up to limit pending linear_writes rows,
 // ordered by id (oldest first), so the dispatcher processes the outbox in
 // enqueue order.

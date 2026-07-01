@@ -119,3 +119,101 @@ func TestListOpenRuns_EmptyWhenNoneRunning(t *testing.T) {
 		t.Fatalf("len(ListOpenRuns) = %d, want 0", len(open))
 	}
 }
+
+// TestGetIssue_RoundTrip asserts GetIssue fetches the same row UpsertIssue
+// wrote (the dispatcher's applyResult needs an issue's current board_status
+// without re-reading the whole snapshot).
+func TestGetIssue_RoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	issue := store.Issue{
+		ID:          "issue-1",
+		Identifier:  "CLP-1",
+		LaneLabel:   "agent:coder",
+		BoardStatus: "running",
+		Deps:        `["issue-0"]`,
+		Priority:    2,
+		BranchName:  "clp-1-do-thing",
+		UpdatedAt:   100,
+		LastSeen:    100,
+		CreatedAt:   100,
+	}
+	if err := s.UpsertIssue(ctx, issue); err != nil {
+		t.Fatalf("UpsertIssue: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.ID != issue.ID || got.Identifier != issue.Identifier || got.BoardStatus != issue.BoardStatus ||
+		got.Deps != issue.Deps || got.Priority != issue.Priority {
+		t.Errorf("GetIssue = %+v, want %+v", got, issue)
+	}
+}
+
+func TestGetIssue_NoSuchIssue(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.GetIssue(ctx, "no-such-issue"); err == nil {
+		t.Fatalf("GetIssue on nonexistent issue: err = nil, want error")
+	}
+}
+
+// TestBumpRunTurn_IncrementsAndReturnsNewValue asserts BumpRunTurn increments
+// turn_count and returns the new value, so the dispatcher can track
+// continuation turns against cfg.TurnCap without a separate read.
+func TestBumpRunTurn_IncrementsAndReturnsNewValue(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "running"}); err != nil {
+		t.Fatalf("UpsertIssue: unexpected error: %v", err)
+	}
+	if err := s.InsertRun(ctx, store.Run{
+		RunID:     "run-1",
+		IssueID:   "issue-1",
+		Lane:      "coder",
+		Status:    "running",
+		StartedAt: 100,
+		Attempt:   1,
+		TurnCount: 1,
+	}); err != nil {
+		t.Fatalf("InsertRun: unexpected error: %v", err)
+	}
+
+	newTurn, err := s.BumpRunTurn(ctx, "run-1")
+	if err != nil {
+		t.Fatalf("BumpRunTurn: unexpected error: %v", err)
+	}
+	if newTurn != 2 {
+		t.Fatalf("BumpRunTurn = %d, want 2", newTurn)
+	}
+
+	newTurn2, err := s.BumpRunTurn(ctx, "run-1")
+	if err != nil {
+		t.Fatalf("BumpRunTurn (2nd): unexpected error: %v", err)
+	}
+	if newTurn2 != 3 {
+		t.Fatalf("BumpRunTurn (2nd) = %d, want 3", newTurn2)
+	}
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	if snap.Issues[0].LatestRun == nil || snap.Issues[0].LatestRun.TurnCount != 3 {
+		t.Errorf("LatestRun.TurnCount = %+v, want 3", snap.Issues[0].LatestRun)
+	}
+}
+
+func TestBumpRunTurn_NoSuchRun(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.BumpRunTurn(ctx, "no-such-run"); err == nil {
+		t.Fatalf("BumpRunTurn on nonexistent run: err = nil, want error")
+	}
+}

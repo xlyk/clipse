@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -238,6 +239,55 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 	}
 
 	return snap, nil
+}
+
+// GetIssue fetches the single issue row for id, e.g. so the dispatcher can
+// read an issue's current board_status before computing a board.Next
+// transition without paying for a full ReadSnapshot.
+func (s *Store) GetIssue(ctx context.Context, id string) (*Issue, error) {
+	const q = `
+		SELECT id, identifier, lane_label, board_status, deps, priority,
+			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
+		FROM issues
+		WHERE id = ?
+	`
+	var issue Issue
+	err := s.db.QueryRowContext(ctx, q, id).Scan(
+		&issue.ID, &issue.Identifier, &issue.LaneLabel, &issue.BoardStatus, &issue.Deps, &issue.Priority,
+		&issue.BranchName, &issue.ClaimLock, &issue.ClaimExpires, &issue.UpdatedAt, &issue.LastSeen, &issue.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("getting issue %s: no such issue", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting issue %s: %w", id, err)
+	}
+	return &issue, nil
+}
+
+// BumpRunTurn increments runs.turn_count for runID and returns the new
+// value, so the dispatcher can advance a "continue" outcome's turn count
+// (against cfg.TurnCap) in one round-trip.
+func (s *Store) BumpRunTurn(ctx context.Context, runID string) (int, error) {
+	const q = `UPDATE runs SET turn_count = turn_count + 1 WHERE run_id = ?`
+	res, err := s.db.ExecContext(ctx, q, runID)
+	if err != nil {
+		return 0, fmt.Errorf("bumping turn for run %s: %w", runID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("bumping turn for run %s: reading rows affected: %w", runID, err)
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("bumping turn for run %s: no such run", runID)
+	}
+
+	var newTurn int
+	const selectQ = `SELECT turn_count FROM runs WHERE run_id = ?`
+	if err := s.db.QueryRowContext(ctx, selectQ, runID).Scan(&newTurn); err != nil {
+		return 0, fmt.Errorf("bumping turn for run %s: reading new turn_count: %w", runID, err)
+	}
+	return newTurn, nil
 }
 
 // latestRun returns the most recently started run for issueID, or nil if
