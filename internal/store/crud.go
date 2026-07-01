@@ -88,12 +88,12 @@ func (s *Store) ListEvents(ctx context.Context) ([]Event, error) {
 func (s *Store) InsertRun(ctx context.Context, run Run) error {
 	const q = `
 		INSERT INTO runs (
-			run_id, issue_id, lane, worker_pid, status, started_at, heartbeat_at,
+			run_id, issue_id, lane, worker_pid, proc_started_at, status, started_at, heartbeat_at,
 			attempt, turn_count, thread_id, result_json, error, tokens_in, tokens_out
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := s.db.ExecContext(ctx, q,
-		run.RunID, run.IssueID, run.Lane, run.WorkerPID, run.Status, run.StartedAt, run.HeartbeatAt,
+		run.RunID, run.IssueID, run.Lane, run.WorkerPID, run.ProcStartedAt, run.Status, run.StartedAt, run.HeartbeatAt,
 		run.Attempt, run.TurnCount, run.ThreadID, run.ResultJSON, run.Error, run.TokensIn, run.TokensOut,
 	)
 	if err != nil {
@@ -187,7 +187,7 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 // the issue has never had a run.
 func (s *Store) latestRun(ctx context.Context, issueID string) (*Run, error) {
 	const q = `
-		SELECT run_id, issue_id, lane, worker_pid, status, started_at, heartbeat_at,
+		SELECT run_id, issue_id, lane, worker_pid, proc_started_at, status, started_at, heartbeat_at,
 			attempt, turn_count, thread_id, result_json, error, tokens_in, tokens_out
 		FROM runs
 		WHERE issue_id = ?
@@ -196,7 +196,7 @@ func (s *Store) latestRun(ctx context.Context, issueID string) (*Run, error) {
 	`
 	var r Run
 	err := s.db.QueryRowContext(ctx, q, issueID).Scan(
-		&r.RunID, &r.IssueID, &r.Lane, &r.WorkerPID, &r.Status, &r.StartedAt, &r.HeartbeatAt,
+		&r.RunID, &r.IssueID, &r.Lane, &r.WorkerPID, &r.ProcStartedAt, &r.Status, &r.StartedAt, &r.HeartbeatAt,
 		&r.Attempt, &r.TurnCount, &r.ThreadID, &r.ResultJSON, &r.Error, &r.TokensIn, &r.TokensOut,
 	)
 	if err == sql.ErrNoRows {

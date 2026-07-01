@@ -22,20 +22,21 @@ type Issue struct {
 
 // Run mirrors a row in the runs table: one row per dispatch attempt/turn.
 type Run struct {
-	RunID       string
-	IssueID     string
-	Lane        string
-	WorkerPID   sql.NullInt64
-	Status      string
-	StartedAt   int64
-	HeartbeatAt int64
-	Attempt     int
-	TurnCount   int
-	ThreadID    string
-	ResultJSON  sql.NullString
-	Error       sql.NullString
-	TokensIn    int
-	TokensOut   int
+	RunID         string
+	IssueID       string
+	Lane          string
+	WorkerPID     sql.NullInt64
+	ProcStartedAt sql.NullInt64
+	Status        string
+	StartedAt     int64
+	HeartbeatAt   int64
+	Attempt       int
+	TurnCount     int
+	ThreadID      string
+	ResultJSON    sql.NullString
+	Error         sql.NullString
+	TokensIn      int
+	TokensOut     int
 }
 
 // Event mirrors a row in the events table: the append-only audit stream.

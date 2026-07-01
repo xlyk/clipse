@@ -104,12 +104,12 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 	}
 	const insertRunQ = `
 		INSERT INTO runs (
-			run_id, issue_id, lane, worker_pid, status, started_at, heartbeat_at,
+			run_id, issue_id, lane, worker_pid, proc_started_at, status, started_at, heartbeat_at,
 			attempt, turn_count, thread_id, result_json, error, tokens_in, tokens_out
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	if _, err := tx.ExecContext(ctx, insertRunQ,
-		run.RunID, run.IssueID, run.Lane, run.WorkerPID, run.Status, run.StartedAt, run.HeartbeatAt,
+		run.RunID, run.IssueID, run.Lane, run.WorkerPID, run.ProcStartedAt, run.Status, run.StartedAt, run.HeartbeatAt,
 		run.Attempt, run.TurnCount, run.ThreadID, run.ResultJSON, run.Error, run.TokensIn, run.TokensOut,
 	); err != nil {
 		return nil, fmt.Errorf("claiming ready issue %s: inserting run %s: %w", issue.ID, run.RunID, err)
