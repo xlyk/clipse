@@ -125,6 +125,62 @@ func TestRenderStatus_SummaryAndPerIssueTable(t *testing.T) {
 	}
 }
 
+// TestRenderStatus_FlagsUnmirroredIssue asserts that an issue with a pending
+// Linear mirror write (A2's outbox) is flagged in its row and that the
+// summary reports the unmirrored count, so `clipse status` surfaces issues
+// whose board transitions haven't reached Linear yet.
+func TestRenderStatus_FlagsUnmirroredIssue(t *testing.T) {
+	snap := store.Snapshot{
+		CountsByStatus: map[string]int{"running": 1, "ready": 1},
+		Issues: []store.IssueSnapshot{
+			{
+				Issue:      store.Issue{ID: "issue-1", Identifier: "CLP-1", LaneLabel: "agent:coder", BoardStatus: "running"},
+				Unmirrored: true,
+			},
+			{
+				Issue: store.Issue{ID: "issue-2", Identifier: "CLP-2", LaneLabel: "agent:coder", BoardStatus: "ready"},
+			},
+		},
+		UnmirroredCount: 1,
+	}
+
+	var buf bytes.Buffer
+	if err := cli.RenderStatus(&buf, snap); err != nil {
+		t.Fatalf("RenderStatus: unexpected error: %v", err)
+	}
+	got := buf.String()
+
+	lines := strings.Split(got, "\n")
+	var clp1Line, clp2Line string
+	for _, line := range lines {
+		if strings.Contains(line, "CLP-1") {
+			clp1Line = line
+		}
+		if strings.Contains(line, "CLP-2") {
+			clp2Line = line
+		}
+	}
+	if clp1Line == "" {
+		t.Fatalf("no output line contained CLP-1, got:\n%s", got)
+	}
+	if !strings.Contains(clp1Line, "pending") {
+		t.Errorf("CLP-1 row missing 'pending' mirror indicator, got line: %q", clp1Line)
+	}
+	if clp2Line == "" {
+		t.Fatalf("no output line contained CLP-2, got:\n%s", got)
+	}
+	if strings.Contains(clp2Line, "pending") {
+		t.Errorf("CLP-2 row unexpectedly flagged pending (not unmirrored), got line: %q", clp2Line)
+	}
+
+	if !strings.Contains(got, "unmirrored") {
+		t.Errorf("output missing unmirrored summary line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "1") {
+		t.Errorf("output missing unmirrored count, got:\n%s", got)
+	}
+}
+
 func TestRenderStatus_EmptySnapshot(t *testing.T) {
 	var buf bytes.Buffer
 	err := cli.RenderStatus(&buf, store.Snapshot{CountsByStatus: map[string]int{}})

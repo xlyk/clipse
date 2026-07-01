@@ -94,16 +94,22 @@ func RenderStatus(w io.Writer, snap store.Snapshot) error {
 		}
 	}
 
+	if snap.UnmirroredCount > 0 {
+		if _, err := fmt.Fprintf(tw, "unmirrored (linear writes pending): %d\n", snap.UnmirroredCount); err != nil {
+			return fmt.Errorf("writing unmirrored summary: %w", err)
+		}
+	}
+
 	if _, err := fmt.Fprintln(tw); err != nil {
 		return fmt.Errorf("writing section separator: %w", err)
 	}
 
-	if _, err := fmt.Fprintln(tw, "IDENTIFIER\tLANE\tSTATUS\tLATEST RUN"); err != nil {
+	if _, err := fmt.Fprintln(tw, "IDENTIFIER\tLANE\tSTATUS\tLATEST RUN\tMIRROR"); err != nil {
 		return fmt.Errorf("writing issue header: %w", err)
 	}
 	for _, issue := range sortedIssues(snap.Issues) {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
-			issue.Identifier, issue.LaneLabel, issue.BoardStatus, latestRunCell(issue.LatestRun),
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			issue.Identifier, issue.LaneLabel, issue.BoardStatus, latestRunCell(issue.LatestRun), mirrorCell(issue.Unmirrored),
 		); err != nil {
 			return fmt.Errorf("writing issue row for %s: %w", issue.Identifier, err)
 		}
@@ -122,6 +128,16 @@ func latestRunCell(run *store.Run) string {
 		return "-"
 	}
 	return fmt.Sprintf("%s turn %d", run.Status, run.TurnCount)
+}
+
+// mirrorCell renders an IssueSnapshot's Unmirrored flag as a single table
+// cell: "pending" when the issue has a Linear mirror write still queued in
+// the outbox (A2), "-" otherwise.
+func mirrorCell(unmirrored bool) string {
+	if unmirrored {
+		return "pending"
+	}
+	return "-"
 }
 
 // sortedStatusKeys returns counts' keys in a deterministic (alphabetical)
