@@ -327,6 +327,51 @@ func TestReleaseStaleClaims_RequeuesExpiredLeavesFreshUntouched(t *testing.T) {
 	}
 }
 
+// TestClaimReady_AttemptIncrementsAcrossReleaseAndReclaim asserts that a
+// re-claim of the same issue (after a release back to 'ready', e.g. a stale
+// claim release or an explicit requeue) gets attempt = previous max + 1,
+// rather than resetting to 1. This is what lets the dispatcher's max_attempts
+// cap (A1) count real dispatch attempts across restarts/retries.
+func TestClaimReady_AttemptIncrementsAcrossReleaseAndReclaim(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const lane = "agent:coder"
+	seedReadyIssue(t, s, "issue-1", lane, 1, 100)
+
+	first, err := s.ClaimReady(ctx, lane, "run-1", 1000, 60)
+	if err != nil {
+		t.Fatalf("first ClaimReady: unexpected error: %v", err)
+	}
+	if first.Run.Attempt != 1 {
+		t.Fatalf("first claim Attempt = %d, want 1", first.Run.Attempt)
+	}
+
+	// Force the claim to expire, then release it back to 'ready' (as
+	// ReleaseStaleClaims would after a lost heartbeat).
+	if _, err := s.DB().ExecContext(ctx, `UPDATE issues SET claim_expires = ? WHERE id = ?`, 900, "issue-1"); err != nil {
+		t.Fatalf("forcing stale expiry: %v", err)
+	}
+	if n, err := s.ReleaseStaleClaims(ctx, 1000); err != nil || n != 1 {
+		t.Fatalf("ReleaseStaleClaims: n=%d err=%v, want n=1 err=nil", n, err)
+	}
+
+	second, err := s.ClaimReady(ctx, lane, "run-2", 2000, 60)
+	if err != nil {
+		t.Fatalf("second ClaimReady: unexpected error: %v", err)
+	}
+	if second.Run.Attempt != 2 {
+		t.Errorf("second claim Attempt = %d, want 2", second.Run.Attempt)
+	}
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	if snap.Issues[0].LatestRun == nil || snap.Issues[0].LatestRun.Attempt != 2 {
+		t.Errorf("LatestRun.Attempt = %+v, want 2", snap.Issues[0].LatestRun)
+	}
+}
+
 func TestReleaseStaleClaims_NoneStaleReturnsZero(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

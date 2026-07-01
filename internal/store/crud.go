@@ -133,6 +133,63 @@ func (s *Store) CloseRun(ctx context.Context, runID, status, resultJSON, errStr 
 	return nil
 }
 
+// SetRunProcess records the worker process identity for runID: its OS pid
+// and process start time. The dispatcher calls this immediately after
+// spawning the worker so a later restart can verify (via proc_started_at)
+// that a live PID is actually the same process it spawned, rather than an
+// unrelated process the OS reused the PID for (A1's PID-reuse guard).
+func (s *Store) SetRunProcess(ctx context.Context, runID string, pid int, procStartedAt int64) error {
+	const q = `UPDATE runs SET worker_pid = ?, proc_started_at = ? WHERE run_id = ?`
+	res, err := s.db.ExecContext(ctx, q, pid, procStartedAt, runID)
+	if err != nil {
+		return fmt.Errorf("setting run process for %s: %w", runID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("setting run process for %s: reading rows affected: %w", runID, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("setting run process for %s: no such run", runID)
+	}
+	return nil
+}
+
+// ListOpenRuns returns every run row with status='running'. On dispatcher
+// startup (A1), these are the runs that may be orphaned by a previous
+// process's death: each is checked for a live, matching worker process,
+// killed if still running, and closed/requeued before any stale-claim
+// release happens.
+func (s *Store) ListOpenRuns(ctx context.Context) ([]Run, error) {
+	const q = `
+		SELECT run_id, issue_id, lane, worker_pid, proc_started_at, status, started_at, heartbeat_at,
+			attempt, turn_count, thread_id, result_json, error, tokens_in, tokens_out
+		FROM runs
+		WHERE status = 'running'
+		ORDER BY run_id
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("listing open runs: %w", err)
+	}
+	defer rows.Close()
+
+	var runs []Run
+	for rows.Next() {
+		var r Run
+		if err := rows.Scan(
+			&r.RunID, &r.IssueID, &r.Lane, &r.WorkerPID, &r.ProcStartedAt, &r.Status, &r.StartedAt, &r.HeartbeatAt,
+			&r.Attempt, &r.TurnCount, &r.ThreadID, &r.ResultJSON, &r.Error, &r.TokensIn, &r.TokensOut,
+		); err != nil {
+			return nil, fmt.Errorf("scanning open run row: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating open run rows: %w", err)
+	}
+	return runs, nil
+}
+
 // ReadSnapshot returns every issue with its board_status and latest run
 // state, plus per-status issue counts, enough to render `clipse status` /
 // `clipse tui`.

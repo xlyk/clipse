@@ -91,6 +91,12 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 		return nil, ErrNoReady
 	}
 
+	var nextAttempt int
+	const attemptQ = `SELECT COALESCE(MAX(attempt), 0) + 1 FROM runs WHERE issue_id = ?`
+	if err := tx.QueryRowContext(ctx, attemptQ, issue.ID).Scan(&nextAttempt); err != nil {
+		return nil, fmt.Errorf("claiming ready issue %s: computing next attempt: %w", issue.ID, err)
+	}
+
 	run := Run{
 		RunID:       runID,
 		IssueID:     issue.ID,
@@ -98,7 +104,7 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 		Status:      "running",
 		StartedAt:   now,
 		HeartbeatAt: now,
-		Attempt:     1,
+		Attempt:     nextAttempt,
 		TurnCount:   1,
 		ThreadID:    "",
 	}
