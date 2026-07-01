@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xlyk/clipse/schema/board.schema.json",
+  "title": "Board",
+  "description": "Canonical enum definitions shared by the Go dispatcher/board package and the Python worker. Lane, Column, and BlockKind are defined here as the single source of truth; other schemas should $ref these $defs rather than redeclaring the enums.",
+  "$defs": {
+    "Lane": {
+      "type": "string",
+      "description": "The DAC profile a worker runs under for an issue.",
+      "enum": ["coder", "reviewer", "git_operator", "scribe"]
+    },
+    "Column": {
+      "type": "string",
+      "description": "Board column (kanban state) an issue occupies.",
+      "enum": [
+        "todo",
+        "ready",
+        "running",
+        "review",
+        "merging",
+        "documentation",
+        "done",
+        "rework",
+        "blocked"
+      ]
+    },
+    "BlockKind": {
+      "type": ["string", "null"],
+      "description": "Why a run is parked in Blocked, or null when not blocked.",
+      "enum": ["needs_input", "capability", "transient", null]
+    }
+  }
+}
