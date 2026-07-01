@@ -8,6 +8,7 @@ import (
 	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/spawn"
+	"github.com/xlyk/clipse/internal/store"
 )
 
 // zeroCapConfig returns a Config identical to testConfig but with every cap
@@ -118,5 +119,147 @@ func TestTick_RepollPreservesRunningBoardStatus(t *testing.T) {
 	}
 	if snap2.Issues[0].BoardStatus != "running" {
 		t.Errorf("after second tick (repoll), board_status = %q, want preserved running", snap2.Issues[0].BoardStatus)
+	}
+}
+
+// TestTick_PollAdoptsHumanMoveWhenUnclaimed asserts A3's adoption rule: when
+// an existing issue's SQLite board_status diverges from what Linear now
+// reports, and the issue holds no active claim, the poll adopts the human
+// move — SQLite is updated to match Linear (no run to close, since nothing
+// was in flight) — and the issue becomes claimable in that new state on the
+// very same tick (zero caps here isolate the adoption from any claim, but a
+// direct read confirms the adopted status is 'ready').
+func TestTick_PollAdoptsHumanMoveWhenUnclaimed(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// Seed issue-1 as 'blocked' with no claim, as if a prior run blocked it.
+	issue := store.Issue{
+		ID:          "issue-1",
+		Identifier:  "CLP-1",
+		LaneLabel:   "coder",
+		BoardStatus: "blocked",
+		Deps:        `[]`,
+		Priority:    1,
+		BranchName:  "issue-1-branch",
+		UpdatedAt:   100,
+		LastSeen:    100,
+		CreatedAt:   100,
+	}
+	if err := s.UpsertIssue(ctx, issue); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	// A human moved the issue back to Ready in Linear.
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			{ID: "issue-1", Identifier: "CLP-1", Status: "ready", Lane: "coder", Priority: 1, BranchName: "issue-1-branch", UpdatedAt: 200},
+		},
+	}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	// Zero caps so this tick's own selectAndClaim doesn't immediately claim
+	// the newly-adopted ready issue — we want to observe the adoption alone.
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Errorf("BoardStatus = %q, want ready (adopted human move)", got.BoardStatus)
+	}
+
+	// Adoption does not mirror back to Linear (Linear already holds this
+	// state) and does not close/open any run.
+	pending, err := s.DrainPendingLinearWrites(ctx, 100)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("pending linear writes = %d, want 0 (adoption does not mirror back)", len(pending))
+	}
+
+	// The adoption is claimable on a later tick: re-tick with real caps and
+	// confirm it gets claimed.
+	cfg := testConfig()
+	d2 := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+	if err := d2.Tick(ctx); err != nil {
+		t.Fatalf("second Tick: unexpected error: %v", err)
+	}
+	got2, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue after second tick: unexpected error: %v", err)
+	}
+	if got2.BoardStatus != "running" {
+		t.Errorf("BoardStatus after second tick = %q, want running (adopted issue was claimable)", got2.BoardStatus)
+	}
+}
+
+// TestTick_PollReassertsDispatcherOwnedStateWhenClaimed asserts A3's other
+// half: when an issue's SQLite board_status diverges from Linear's polled
+// status BUT the issue holds an active claim (the dispatcher owns it right
+// now), the dispatcher does not adopt Linear's stale view — it re-asserts
+// its own truth by enqueueing a setstate mirror back to the SQLite status,
+// and board_status itself is left untouched.
+func TestTick_PollReassertsDispatcherOwnedStateWhenClaimed(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+	claim, err := s.ClaimReady(ctx, "coder", "run-1", 100, 3600)
+	if err != nil {
+		t.Fatalf("ClaimReady: unexpected error: %v", err)
+	}
+	if claim.Issue.BoardStatus != "running" {
+		t.Fatalf("precondition: claimed issue status = %q, want running", claim.Issue.BoardStatus)
+	}
+
+	// Linear still reports the pre-claim "ready" status (its own mirror
+	// write for the claim hasn't landed/been observed yet from Linear's
+	// perspective at poll time).
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			{ID: "issue-1", Identifier: "CLP-1", Status: "ready", Lane: "coder", Priority: 1, BranchName: "issue-1-branch", UpdatedAt: 200},
+		},
+	}
+	spawner := newFakeSpawner()
+	// The inflight run must not resolve mid-test: script "continue" so
+	// nothing else changes board_status out from under this assertion.
+	spawner.Results["CLP-1"] = spawn.Result{
+		Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeContinue, ThreadId: "thread-1"},
+	}
+	ws := newStubWorkspacer(t.TempDir())
+	cfg := zeroCapConfig()
+	cfg.TurnCap = 1000
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "running" {
+		t.Errorf("BoardStatus = %q, want running (dispatcher-owned state preserved, not reset to Linear's stale ready)", got.BoardStatus)
+	}
+
+	// The reassert enqueue is drained within the same Tick (drainOutbox is
+	// the last phase), so assert on the MockClient's recorded SetState calls
+	// rather than on still-pending rows.
+	var sawRunningReassert bool
+	for _, c := range lc.SetStateCalls {
+		if c.IssueID == "issue-1" && c.TargetColumn == "running" {
+			sawRunningReassert = true
+		}
+	}
+	if !sawRunningReassert {
+		t.Errorf("SetStateCalls = %+v, want a setstate -> running reassertion", lc.SetStateCalls)
 	}
 }
