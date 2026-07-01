@@ -333,7 +333,7 @@ func TestMarkLinearWriteDone_RemovesFromPending(t *testing.T) {
 		t.Fatalf("DrainPendingLinearWrites precondition: pending=%v err=%v", pending, err)
 	}
 
-	if err := s.MarkLinearWriteDone(ctx, pending[0].ID); err != nil {
+	if err := s.MarkLinearWriteDone(ctx, pending[0].ID, 999); err != nil {
 		t.Fatalf("MarkLinearWriteDone: unexpected error: %v", err)
 	}
 
@@ -343,6 +343,50 @@ func TestMarkLinearWriteDone_RemovesFromPending(t *testing.T) {
 	}
 	if len(after) != 0 {
 		t.Errorf("len(pending after MarkDone) = %d, want 0", len(after))
+	}
+}
+
+// TestMarkLinearWriteDone_UsesCallerNow asserts updated_at is set from the
+// caller-supplied now argument, not a SQLite-side unixepoch() clock — the
+// same convention ClaimReady/Heartbeat/Transition already follow. A done row
+// no longer shows up in DrainPendingLinearWrites, so this reads updated_at
+// back via s.DB() directly (the established pattern for ad-hoc assertions
+// elsewhere in this package, e.g. claim_test.go).
+func TestMarkLinearWriteDone_UsesCallerNow(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+
+	req := store.TransitionReq{
+		IssueID:         "issue-1",
+		NewStatus:       "review",
+		EnqueueSetState: true,
+		Event:           store.Event{Ts: 1, Kind: "transitioned"},
+	}
+	if err := s.Transition(ctx, req); err != nil {
+		t.Fatalf("Transition: unexpected error: %v", err)
+	}
+
+	pending, err := s.DrainPendingLinearWrites(ctx, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("DrainPendingLinearWrites precondition: pending=%v err=%v", pending, err)
+	}
+
+	const now int64 = 424242
+	if err := s.MarkLinearWriteDone(ctx, pending[0].ID, now); err != nil {
+		t.Fatalf("MarkLinearWriteDone: unexpected error: %v", err)
+	}
+
+	var gotUpdatedAt int64
+	var gotStatus string
+	if err := s.DB().QueryRowContext(ctx, `SELECT status, updated_at FROM linear_writes WHERE id = ?`, pending[0].ID).Scan(&gotStatus, &gotUpdatedAt); err != nil {
+		t.Fatalf("querying linear_writes row: unexpected error: %v", err)
+	}
+	if gotStatus != "done" {
+		t.Errorf("status = %q, want done", gotStatus)
+	}
+	if gotUpdatedAt != now {
+		t.Errorf("updated_at = %d, want caller-supplied now (%d)", gotUpdatedAt, now)
 	}
 }
 
@@ -397,7 +441,8 @@ func TestMarkLinearWriteFailed_BumpsAttemptsAndStaysPending(t *testing.T) {
 	}
 	id := pending[0].ID
 
-	if err := s.MarkLinearWriteFailed(ctx, id, "linear api 500"); err != nil {
+	const firstNow int64 = 555
+	if err := s.MarkLinearWriteFailed(ctx, id, "linear api 500", firstNow); err != nil {
 		t.Fatalf("MarkLinearWriteFailed: unexpected error: %v", err)
 	}
 
@@ -418,9 +463,14 @@ func TestMarkLinearWriteFailed_BumpsAttemptsAndStaysPending(t *testing.T) {
 	if got.Status != "pending" {
 		t.Errorf("Status = %q, want pending", got.Status)
 	}
+	if got.UpdatedAt != firstNow {
+		t.Errorf("UpdatedAt = %d, want caller-supplied now (%d)", got.UpdatedAt, firstNow)
+	}
 
-	// A second failure bumps attempts again.
-	if err := s.MarkLinearWriteFailed(ctx, id, "linear api 500 again"); err != nil {
+	// A second failure bumps attempts again and moves updated_at to the new
+	// caller-supplied now.
+	const secondNow int64 = 777
+	if err := s.MarkLinearWriteFailed(ctx, id, "linear api 500 again", secondNow); err != nil {
 		t.Fatalf("MarkLinearWriteFailed (2nd): unexpected error: %v", err)
 	}
 	after2, err := s.DrainPendingLinearWrites(ctx, 10)
@@ -429,5 +479,8 @@ func TestMarkLinearWriteFailed_BumpsAttemptsAndStaysPending(t *testing.T) {
 	}
 	if after2[0].Attempts != 2 {
 		t.Errorf("Attempts after 2nd failure = %d, want 2", after2[0].Attempts)
+	}
+	if after2[0].UpdatedAt != secondNow {
+		t.Errorf("UpdatedAt after 2nd failure = %d, want %d", after2[0].UpdatedAt, secondNow)
 	}
 }

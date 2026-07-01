@@ -20,6 +20,7 @@ func (d *Dispatcher) drainOutbox(ctx context.Context) error {
 		return fmt.Errorf("draining pending linear writes: %w", err)
 	}
 
+	now := d.now()
 	for _, w := range writes {
 		var sendErr error
 		switch w.Kind {
@@ -32,13 +33,13 @@ func (d *Dispatcher) drainOutbox(ctx context.Context) error {
 		}
 
 		if sendErr != nil {
-			if err := d.store.MarkLinearWriteFailed(ctx, w.ID, sendErr.Error()); err != nil {
+			if err := d.store.MarkLinearWriteFailed(ctx, w.ID, sendErr.Error(), now); err != nil {
 				return fmt.Errorf("marking linear write %d failed: %w", w.ID, err)
 			}
 			d.logger.Warn("linear mirror write failed, will retry", "write_id", w.ID, "issue_id", w.IssueID, "kind", w.Kind, "error", sendErr)
 			continue
 		}
-		if err := d.store.MarkLinearWriteDone(ctx, w.ID); err != nil {
+		if err := d.store.MarkLinearWriteDone(ctx, w.ID, now); err != nil {
 			return fmt.Errorf("marking linear write %d done: %w", w.ID, err)
 		}
 	}

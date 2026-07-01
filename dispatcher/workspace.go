@@ -50,6 +50,13 @@ func (w *gitWorkspacer) Ensure(issue store.Issue) (string, error) {
 // derives it (worktreeRoot joined with branch, '/' sanitized to '-'), rather
 // than calling EnsureWorktree itself, which would create a worktree just to
 // immediately remove it.
+//
+// This is the Phase-3 terminal-cleanup primitive (design decision F: remove
+// the worktree + local branch on the 'done'/after-merge transition, or on
+// Cancelled). Phase 1 is coder-only and its issues never reach a 'done'
+// transition, so nothing calls Remove yet; wiring it into the terminal
+// transition is deferred to Phase 3 rather than added here as a speculative,
+// unreachable call site.
 func (w *gitWorkspacer) Remove(issue store.Issue) error {
 	if issue.BranchName == "" {
 		return nil

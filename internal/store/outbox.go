@@ -188,10 +188,13 @@ func (s *Store) DrainPendingLinearWrites(ctx context.Context, limit int) ([]Line
 }
 
 // MarkLinearWriteDone marks id as successfully mirrored to Linear, removing
-// it from future DrainPendingLinearWrites results.
-func (s *Store) MarkLinearWriteDone(ctx context.Context, id int64) error {
-	const q = `UPDATE linear_writes SET status = 'done', updated_at = unixepoch() WHERE id = ?`
-	res, err := s.db.ExecContext(ctx, q, id)
+// it from future DrainPendingLinearWrites results. now is the caller-supplied
+// timestamp for updated_at, matching the rest of the store's convention
+// (ClaimReady/Heartbeat/ReleaseStaleClaims/Transition all take a caller now
+// rather than relying on SQLite's unixepoch()).
+func (s *Store) MarkLinearWriteDone(ctx context.Context, id int64, now int64) error {
+	const q = `UPDATE linear_writes SET status = 'done', updated_at = ? WHERE id = ?`
+	res, err := s.db.ExecContext(ctx, q, now, id)
 	if err != nil {
 		return fmt.Errorf("marking linear write %d done: %w", id, err)
 	}
@@ -206,20 +209,19 @@ func (s *Store) MarkLinearWriteDone(ctx context.Context, id int64) error {
 }
 
 // MarkLinearWriteFailed records a failed mirror attempt: it increments
-// attempts and stores errStr + updated_at (via SQLite's unixepoch(), since
-// this call is not part of a caller-supplied-`now` transaction like
-// ClaimReady/Heartbeat), but leaves status='pending' so the dispatcher
-// retries it on a later tick.
-func (s *Store) MarkLinearWriteFailed(ctx context.Context, id int64, errStr string) error {
+// attempts and stores errStr + updated_at (using the caller-supplied now, per
+// the store's convention — see MarkLinearWriteDone), but leaves
+// status='pending' so the dispatcher retries it on a later tick.
+func (s *Store) MarkLinearWriteFailed(ctx context.Context, id int64, errStr string, now int64) error {
 	const q = `
 		UPDATE linear_writes SET
 			attempts   = attempts + 1,
 			last_error = ?,
 			status     = 'pending',
-			updated_at = unixepoch()
+			updated_at = ?
 		WHERE id = ?
 	`
-	res, err := s.db.ExecContext(ctx, q, errStr, id)
+	res, err := s.db.ExecContext(ctx, q, errStr, now, id)
 	if err != nil {
 		return fmt.Errorf("marking linear write %d failed: %w", id, err)
 	}

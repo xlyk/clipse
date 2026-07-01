@@ -25,7 +25,14 @@ type Workspacer interface {
 	// necessary.
 	Ensure(issue store.Issue) (string, error)
 
-	// Remove tears down the workspace for issue (called on terminal states).
+	// Remove tears down the workspace for issue. This is the Phase-3
+	// terminal-cleanup primitive: design decision F calls for removing the
+	// worktree + local branch when an issue reaches 'done' (or is
+	// cancelled), i.e. after merge. Phase 1 is coder-only and never drives an
+	// issue to a 'done' transition, so no caller invokes Remove yet — wiring
+	// it into the terminal transition is Phase-3 scope. It is kept (not
+	// called speculatively) because a Phase-1 call site would be unreachable
+	// and untestable.
 	Remove(issue store.Issue) error
 }
 
