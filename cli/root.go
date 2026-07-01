@@ -28,5 +28,7 @@ a deterministic state machine.`,
 	// Override the default version template so --version prints a tidy line.
 	root.SetVersionTemplate(fmt.Sprintf("clipse %s\n", Version))
 
+	root.AddCommand(newDispatchCmd())
+
 	return root
 }
