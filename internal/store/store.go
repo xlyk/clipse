@@ -18,18 +18,24 @@ type Store struct {
 // an empty database creates all tables; migrating an already-migrated
 // database is a no-op (every migration statement is idempotent).
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// journal_mode and busy_timeout are set via _pragma DSN params (rather
+	// than a one-off db.Exec after Open) because database/sql pools multiple
+	// underlying connections: an Exec'd PRAGMA only lands on whichever
+	// connection happens to run it, not on connections the pool opens later
+	// under load. _pragma is applied by the driver to every connection it
+	// opens, so all of them get WAL + the busy timeout.
+	//
+	// _txlock=immediate makes every write transaction (db.BeginTx with a
+	// non-read-only *sql.Tx, e.g. ClaimReady's CAS) issue "BEGIN IMMEDIATE"
+	// instead of SQLite's default "BEGIN DEFERRED". Deferred transactions
+	// don't take the reserved lock until their first write, so two
+	// concurrent claimers could both pass a read-only check before either
+	// writes; immediate transactions take the reserved lock up front and
+	// serialize at that point, which is what makes the CAS claim race-free.
+	dsn := path + "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite db %s: %w", path, err)
-	}
-
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("setting journal_mode=WAL: %w", err)
-	}
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("setting busy_timeout: %w", err)
 	}
 
 	if err := migrate(db); err != nil {
