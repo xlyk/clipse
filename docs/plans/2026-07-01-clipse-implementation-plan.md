@@ -42,7 +42,7 @@
 - [x] Add `configs/clipse.example.yaml`: `repo{remote,path,base_branch}`, `poll_interval_s`, `caps{global,per_lane{...}}`, `turn_cap`, `max_runtime_s`, `lane_label_prefix: "agent:"`.
 - [x] Add `.github/workflows/ci.yml`: matrix build+test Go and Python; run `make codegen` and fail on diff (drift guard).
 - [x] Add `README.md` (one-paragraph overview + link to design doc) and root `.gitignore`.
-- [ ] Rework `block_kind` to an optional string enum (`needs_input|capability|transient`), present iff `outcome == "blocked"`; regenerate both sides; add a Go test and a Pydantic test asserting round-trip of blocked and non-blocked results.
+- [x] Rework `block_kind` to an optional string enum (`needs_input|capability|transient`), present iff `outcome == "blocked"`; regenerate both sides; add a Go test and a Pydantic test asserting round-trip of blocked and non-blocked results.
 
 ### Acceptance criteria
 - [x] `git init` done; `make build` produces a `clipse` binary; `clipse --version` prints.
@@ -60,45 +60,45 @@
 **Files / components:** `internal/config`, `internal/store` (SQLite), `internal/linear` (client + mock), `internal/board` (state machine), `internal/spawn` (Spawner + local impl), `testworker/main.go`, `dispatcher/` (loop), `cli/` (`status`, `tui`), `cmd/clipse`.
 
 ### Work
-- [ ] **config** (`internal/config`): load + validate `clipse.yaml` into a typed struct; defaults; fail-fast on bad values. Test: valid/invalid/defaulted cases.
-- [ ] **store schema** (`internal/store`): migrations creating `issues`, `runs`, `events` tables (fields per design doc); open DB in WAL mode. Test: migrate-on-empty, idempotent re-migrate.
-- [ ] **store CRUD**: upsert issue (from normalized Linear), append event, insert/close run, read snapshot. Test each.
-- [ ] **CAS claim** (`store.ClaimReady`): compare-and-swap `status='ready' AND claim_lock IS NULL` → `running` + write `runs` row + `claimed` event. Test: **concurrent-claim test** (N goroutines, exactly one wins).
-- [ ] **heartbeat & TTL** (`store`): `Heartbeat(runID)` extends `claim_expires`; `ReleaseStaleClaims(now)` requeues runs past TTL. Test: stale vs fresh.
-- [ ] **Linear client** (`internal/linear`): GraphQL candidate-issue query (active states), normalize → internal `Issue` (id, identifier, status, lane label, deps/blockers, priority, branch_name, updated_at). Behind a `Client` interface. Test: normalize from recorded JSON fixtures.
-- [ ] **Linear mock**: in-memory `Client` impl for tests (scriptable issue lists + state). No network.
-- [ ] **Linear writes** (`linear.SetState`, `Comment`): mutations to move a card / post a comment. Test against mock; assert exact mutation payloads.
-- [ ] **state machine** (`internal/board`): pure `Next(outcome, current) -> (status, action)` map; `Promote(issue, deps) -> bool` (deps terminal → ready); guards reject illegal transitions. Test: table-driven over every (outcome × column).
-- [ ] **Spawner interface** (`internal/spawn`): `Spawn(ctx, WorkerSpec) -> (RunHandle, error)` with `Kill()`, `Wait() -> (Result, error)`; `WorkerSpec{issue, lane, run_id, thread_id, workspace, env}`. Local impl execs a binary, captures stdout, parses schema-valid JSON, tracks PID.
-- [ ] **local Spawner**: enforce `max_runtime` (context deadline → kill), capture exit code, redirect worker stderr to `<board>/logs/<issue>.log`. Test: success, nonzero-exit, timeout-kill, malformed-JSON output.
-- [ ] **testworker** (`testworker/main.go`): reads `--issue/--lane/--run/--scenario`; emits canned schema-valid JSON per scenario (`done|needs_review|changes|blocked|continue`); scenarios `crash` (os.Exit 1), `hang` (sleep past max_runtime). Used by spawn + dispatch tests.
-- [ ] **worktree lifecycle** (`internal/spawn` or `internal/store` helper): create worktree+branch off primary clone; reuse if exists (continuation); remove on terminal. Test with a temp git repo fixture.
-- [ ] **spawn**: record `proc_started_at` (and/or pgid) in `runs` at spawn, so a later identity check can tell a live worker from a PID reused by an unrelated process after reboot.
-- [ ] **startup recovery** (`dispatcher`): on start, before any claim release, for each open `runs` row — verify PID identity via `proc_started_at`/pgid, kill if alive, close the run with `error='orphaned'`, requeue the issue per the attempt cap. Test with a real spawned sleeper process: start "dispatcher recovery" against its recorded run row; assert the process dies and the issue returns to `ready`.
-- [ ] **attempt cap**: `max_attempts` in config; exceeding it lands `Blocked` with a comment. Test the boundary.
-- [ ] **dispatch tick** (`dispatcher`): one `Tick(ctx)` doing, in order — poll+upsert; reconcile (reap dead PIDs, `ReleaseStaleClaims`, crash detect, `max_runtime`); promote deps; select `ready` by (priority, created_at, identifier); apply global + per-lane caps; CAS claim; mirror Linear→running; spawn; on-exit map result via `board.Next` → Linear write + close run + events; `continue` re-spawn if under `turn_cap`, else Blocked. Test: **integration** with mock Linear + testworker for each outcome.
-- [ ] **caps enforcement**: global `max_in_progress` + per-lane caps honored under a many-ready-issues integration test.
-- [ ] **failure → Blocked**: crash/timeout/malformed-result/needs_input all land the card in `blocked` with a reason comment; no auto-retry. Test each path.
-- [ ] **continuation cap**: repeated `continue` results stop at `turn_cap` → `blocked`. Test the boundary.
-- [ ] **linear outbox** (`store` + `dispatcher`): enqueue the Linear mirror write in the same SQLite transaction as the transition commit (a `linear_writes` table or `pending_linear_write` column on `issues`); drain the queue each tick; retry on failure with the error logged. `SetState` is idempotent, so replays are safe. Test: mock Linear fails twice then succeeds — exactly one final `SetState`, no lost transition.
-- [ ] **divergence rule** (design doc): document that for dispatcher-owned columns, SQLite wins and the outbox re-asserts; human moves are adopted per the poll-adoption rule below. *(Design doc; see "Divergence rule" under Board & state machine.)*
-- [ ] **poll adoption** (`dispatcher`): on poll, if Linear disagrees with SQLite and the issue holds no active claim, adopt Linear's state (human move); if the issue holds an active claim, SQLite wins and the outbox re-asserts. Tests: (a) a card manually moved `blocked → ready` is adopted and claimed next tick; (b) a card manually moved while a claim is active is re-asserted to the SQLite state.
-- [ ] **singleton lock** (`dispatcher`): machine-global lock (flock on a lockfile); second `clipse dispatch` refuses to start. Test.
-- [ ] **daemon wiring** (`cmd/clipse` + `dispatcher`): `clipse dispatch` runs `Tick` on `poll_interval_s`; structured slog JSON; graceful shutdown (SIGINT drains, doesn't kill live workers abruptly). Manual smoke via testworker.
-- [ ] **`clipse status`** (`cli`): one-shot read of SQLite snapshot → table (per-lane running/ready/blocked counts + per-issue run state). Test the render function against seeded DB.
-- [ ] **`clipse tui`** (`cli/tui`): bubbletea dashboard — running / blocked / queued tables, token + runtime counters, in-place refresh polling SQLite. Manual verify; unit-test the model update fn.
+- [x] **config** (`internal/config`): load + validate `clipse.yaml` into a typed struct; defaults; fail-fast on bad values. Test: valid/invalid/defaulted cases.
+- [x] **store schema** (`internal/store`): migrations creating `issues`, `runs`, `events` tables (fields per design doc); open DB in WAL mode. Test: migrate-on-empty, idempotent re-migrate.
+- [x] **store CRUD**: upsert issue (from normalized Linear), append event, insert/close run, read snapshot. Test each.
+- [x] **CAS claim** (`store.ClaimReady`): compare-and-swap `status='ready' AND claim_lock IS NULL` → `running` + write `runs` row + `claimed` event. Test: **concurrent-claim test** (N goroutines, exactly one wins).
+- [x] **heartbeat & TTL** (`store`): `Heartbeat(runID)` extends `claim_expires`; `ReleaseStaleClaims(now)` requeues runs past TTL. Test: stale vs fresh.
+- [x] **Linear client** (`internal/linear`): GraphQL candidate-issue query (active states), normalize → internal `Issue` (id, identifier, status, lane label, deps/blockers, priority, branch_name, updated_at). Behind a `Client` interface. Test: normalize from recorded JSON fixtures.
+- [x] **Linear mock**: in-memory `Client` impl for tests (scriptable issue lists + state). No network.
+- [x] **Linear writes** (`linear.SetState`, `Comment`): mutations to move a card / post a comment. Test against mock; assert exact mutation payloads.
+- [x] **state machine** (`internal/board`): pure `Next(outcome, current) -> (status, action)` map; `Promote(issue, deps) -> bool` (deps terminal → ready); guards reject illegal transitions. Test: table-driven over every (outcome × column).
+- [x] **Spawner interface** (`internal/spawn`): `Spawn(ctx, WorkerSpec) -> (RunHandle, error)` with `Kill()`, `Wait() -> (Result, error)`; `WorkerSpec{issue, lane, run_id, thread_id, workspace, env}`. Local impl execs a binary, captures stdout, parses schema-valid JSON, tracks PID.
+- [x] **local Spawner**: enforce `max_runtime` (context deadline → kill), capture exit code, redirect worker stderr to `<board>/logs/<issue>.log`. Test: success, nonzero-exit, timeout-kill, malformed-JSON output.
+- [x] **testworker** (`testworker/main.go`): reads `--issue/--lane/--run/--scenario`; emits canned schema-valid JSON per scenario (`done|needs_review|changes|blocked|continue`); scenarios `crash` (os.Exit 1), `hang` (sleep past max_runtime). Used by spawn + dispatch tests.
+- [x] **worktree lifecycle** (`internal/spawn` or `internal/store` helper): create worktree+branch off primary clone; reuse if exists (continuation); remove on terminal. Test with a temp git repo fixture.
+- [x] **spawn**: record `proc_started_at` (and/or pgid) in `runs` at spawn, so a later identity check can tell a live worker from a PID reused by an unrelated process after reboot.
+- [x] **startup recovery** (`dispatcher`): on start, before any claim release, for each open `runs` row — verify PID identity via `proc_started_at`/pgid, kill if alive, close the run with `error='orphaned'`, requeue the issue per the attempt cap. Test with a real spawned sleeper process: start "dispatcher recovery" against its recorded run row; assert the process dies and the issue returns to `ready`.
+- [x] **attempt cap**: `max_attempts` in config; exceeding it lands `Blocked` with a comment. Test the boundary.
+- [x] **dispatch tick** (`dispatcher`): one `Tick(ctx)` doing, in order — poll+upsert; reconcile (reap dead PIDs, `ReleaseStaleClaims`, crash detect, `max_runtime`); promote deps; select `ready` by (priority, created_at, identifier); apply global + per-lane caps; CAS claim; mirror Linear→running; spawn; on-exit map result via `board.Next` → Linear write + close run + events; `continue` re-spawn if under `turn_cap`, else Blocked. Test: **integration** with mock Linear + testworker for each outcome.
+- [x] **caps enforcement**: global `max_in_progress` + per-lane caps honored under a many-ready-issues integration test.
+- [x] **failure → Blocked**: crash/timeout/malformed-result/needs_input all land the card in `blocked` with a reason comment; no auto-retry. Test each path.
+- [x] **continuation cap**: repeated `continue` results stop at `turn_cap` → `blocked`. Test the boundary.
+- [x] **linear outbox** (`store` + `dispatcher`): enqueue the Linear mirror write in the same SQLite transaction as the transition commit (a `linear_writes` table or `pending_linear_write` column on `issues`); drain the queue each tick; retry on failure with the error logged. `SetState` is idempotent, so replays are safe. Test: mock Linear fails twice then succeeds — exactly one final `SetState`, no lost transition.
+- [x] **divergence rule** (design doc): document that for dispatcher-owned columns, SQLite wins and the outbox re-asserts; human moves are adopted per the poll-adoption rule below. *(Design doc; see "Divergence rule" under Board & state machine.)*
+- [x] **poll adoption** (`dispatcher`): on poll, if Linear disagrees with SQLite and the issue holds no active claim, adopt Linear's state (human move); if the issue holds an active claim, SQLite wins and the outbox re-asserts. Tests: (a) a card manually moved `blocked → ready` is adopted and claimed next tick; (b) a card manually moved while a claim is active is re-asserted to the SQLite state.
+- [x] **singleton lock** (`dispatcher`): machine-global lock (flock on a lockfile); second `clipse dispatch` refuses to start. Test.
+- [x] **daemon wiring** (`cmd/clipse` + `dispatcher`): `clipse dispatch` runs `Tick` on `poll_interval_s`; structured slog JSON; graceful shutdown (SIGINT drains, doesn't kill live workers abruptly). Manual smoke via testworker.
+- [x] **`clipse status`** (`cli`): one-shot read of SQLite snapshot → table (per-lane running/ready/blocked counts + per-issue run state). Test the render function against seeded DB.
+- [x] **`clipse tui`** (`cli/tui`): bubbletea dashboard — running / blocked / queued tables, token + runtime counters, in-place refresh polling SQLite. Manual verify; unit-test the model update fn.
 
 ### Acceptance criteria
-- [ ] End-to-end against mock Linear + `testworker`: a `ready` `agent:coder` issue is claimed, spawned, and transitioned exactly per the canned outcome — with **no real LLM or Linear network**.
-- [ ] **No double-claim**: concurrent-claim test passes repeatedly (race detector clean, `go test -race`).
-- [ ] **Caps** hold: with many ready issues, in-flight never exceeds global or per-lane caps.
-- [ ] **Recovery**: `crash` scenario → PID-death detected → card Blocked; `hang` → `max_runtime` kill → Blocked; stale heartbeat → claim released/requeued.
-- [ ] **Failure policy**: every failure path lands `Blocked` with a comment; zero auto-retry; `continue` bounded by `turn_cap`.
-- [ ] **Restart safety**: kill the dispatcher mid-run with a live worker; restart it; the orphan is killed before any claim release, the issue is requeued exactly once, and no duplicate PR or branch results.
-- [ ] With Linear down for N ticks, transitions keep committing locally and mirror correctly once Linear recovers; `clipse status` flags unmirrored issues.
-- [ ] **Singleton**: a second dispatcher instance refuses to start.
-- [ ] `clipse status` and `clipse tui` reflect live SQLite state.
-- [ ] `make test` green including `go test -race ./...`; coverage on `internal/{store,board,spawn,dispatcher}` is meaningful (state machine + claim paths fully covered).
+- [x] End-to-end against mock Linear + `testworker`: a `ready` `agent:coder` issue is claimed, spawned, and transitioned exactly per the canned outcome — with **no real LLM or Linear network**.
+- [x] **No double-claim**: concurrent-claim test passes repeatedly (race detector clean, `go test -race`).
+- [x] **Caps** hold: with many ready issues, in-flight never exceeds global or per-lane caps.
+- [x] **Recovery**: `crash` scenario → PID-death detected → card Blocked; `hang` → `max_runtime` kill → Blocked; stale heartbeat → claim released/requeued.
+- [x] **Failure policy**: every failure path lands `Blocked` with a comment; zero auto-retry; `continue` bounded by `turn_cap`.
+- [x] **Restart safety**: kill the dispatcher mid-run with a live worker; restart it; the orphan is killed before any claim release, the issue is requeued exactly once, and no duplicate PR or branch results.
+- [x] With Linear down for N ticks, transitions keep committing locally and mirror correctly once Linear recovers; `clipse status` flags unmirrored issues.
+- [x] **Singleton**: a second dispatcher instance refuses to start.
+- [x] `clipse status` and `clipse tui` reflect live SQLite state.
+- [x] `make test` green including `go test -race ./...`; coverage on `internal/{store,board,spawn,dispatcher}` is meaningful (state machine + claim paths fully covered).
 
 ---
 
