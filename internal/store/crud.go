@@ -9,18 +9,18 @@ import (
 // UpsertIssue inserts or updates the cache row for a normalized Linear
 // issue.
 //
-// Conflict behavior (on a matching id): only the Linear-sourced columns
-// (identifier, lane_label, board_status, deps, priority, branch_name,
-// updated_at) plus last_seen are overwritten. claim_lock and claim_expires
-// are dispatcher-owned (set by the CAS claim path added in a later task) and
-// are never touched here, so a re-poll of Linear can never clobber an
-// in-flight claim. created_at is preserved from the original insert.
+// Conflict behavior (on a matching id): only the Linear-sourced intent
+// columns (identifier, lane_label, deps, priority, branch_name, updated_at)
+// plus last_seen are overwritten. board_status, claim_lock, and claim_expires
+// are dispatcher-owned runtime state: they are set on the initial insert and
+// never touched on conflict, so a re-poll of Linear can neither clobber an
+// in-flight claim nor reset a dispatcher-driven status (e.g. running/review).
+// created_at is preserved from the original insert.
 //
-// board_status is updated straight from the Linear-sourced value on every
-// call, including conflicts. That's intentionally permissive for this task:
-// CAS/ownership of board_status transitions (e.g. refusing to overwrite a
-// dispatcher-driven Running/Review/etc. status from a stale poll) is
-// enforced by the state machine added in a later task, not here.
+// board_status transitions after insert are made only by dispatcher-owned
+// paths (the CAS claim + the state machine, added in later tasks). Reflecting
+// an out-of-band human requeue in Linear (Blocked -> Ready) is a separate
+// reconciliation concern, deferred beyond Phase 1.
 func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 	const q = `
 		INSERT INTO issues (
@@ -30,7 +30,6 @@ func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 		ON CONFLICT (id) DO UPDATE SET
 			identifier   = excluded.identifier,
 			lane_label   = excluded.lane_label,
-			board_status = excluded.board_status,
 			deps         = excluded.deps,
 			priority     = excluded.priority,
 			branch_name  = excluded.branch_name,

@@ -134,15 +134,17 @@ func TestUpsertIssue_InsertThenReadBack(t *testing.T) {
 	}
 }
 
-func TestUpsertIssue_ConflictPreservesClaimLock(t *testing.T) {
+func TestUpsertIssue_ConflictPreservesDispatcherState(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
+	// A dispatcher-claimed, running issue: board_status/claim fields are
+	// runtime state the dispatcher owns.
 	seeded := store.Issue{
 		ID:           "issue-1",
 		Identifier:   "CLP-1",
 		LaneLabel:    "agent:coder",
-		BoardStatus:  "ready",
+		BoardStatus:  "running",
 		Deps:         `[]`,
 		Priority:     1,
 		BranchName:   "clp-1-do-thing",
@@ -156,14 +158,15 @@ func TestUpsertIssue_ConflictPreservesClaimLock(t *testing.T) {
 		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
 	}
 
-	// Simulate a fresh Linear poll: fresh Linear-sourced fields, but the
-	// dispatcher-owned claim fields are not what the poller knows about, so a
-	// naive caller passes them zero-valued.
+	// Simulate a fresh Linear poll: Linear still shows the card in its old
+	// column ("ready") and the poller passes the dispatcher-owned fields
+	// zero-valued. Neither the stale status nor the zero claim fields may
+	// overwrite the live runtime state.
 	fresh := store.Issue{
 		ID:          "issue-1",
 		Identifier:  "CLP-1",
 		LaneLabel:   "agent:coder",
-		BoardStatus: "running",
+		BoardStatus: "ready",
 		Deps:        `["issue-0"]`,
 		Priority:    2,
 		BranchName:  "clp-1-do-thing",
@@ -183,6 +186,7 @@ func TestUpsertIssue_ConflictPreservesClaimLock(t *testing.T) {
 		t.Fatalf("len(snap.Issues) = %d, want 1", len(snap.Issues))
 	}
 	got := snap.Issues[0]
+	// Dispatcher-owned runtime state must survive a re-poll.
 	if !got.ClaimLock.Valid || got.ClaimLock.String != "worker-abc" {
 		t.Errorf("ClaimLock = %+v, want preserved %q", got.ClaimLock, "worker-abc")
 	}
@@ -190,8 +194,9 @@ func TestUpsertIssue_ConflictPreservesClaimLock(t *testing.T) {
 		t.Errorf("ClaimExpires = %+v, want preserved 12345", got.ClaimExpires)
 	}
 	if got.BoardStatus != "running" {
-		t.Errorf("BoardStatus = %q, want %q (Linear-sourced field must update)", got.BoardStatus, "running")
+		t.Errorf("BoardStatus = %q, want preserved %q (dispatcher-owned; a poll must not reset it)", got.BoardStatus, "running")
 	}
+	// Linear-sourced intent fields must update.
 	if got.Deps != `["issue-0"]` {
 		t.Errorf("Deps = %q, want updated value", got.Deps)
 	}
