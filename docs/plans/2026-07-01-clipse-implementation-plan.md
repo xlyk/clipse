@@ -30,23 +30,23 @@
 **Files / components:** `go.mod`, `cmd/clipse/main.go`, `schema/*.json`, `agent/pyproject.toml`, `Makefile`, `.github/workflows/ci.yml`, `configs/clipse.example.yaml`, dir skeleton per design doc.
 
 ### Work
-- [ ] Init single Go module `github.com/xlyk/clipse` (Go 1.23+); create `cmd/clipse/main.go` with a cobra root command printing version.
-- [ ] Create the folder skeleton: `dispatcher/`, `cli/` (+`cli/tui/`), `internal/{linear,store,board,spawn,contract,config}/`, `agent/`, `testworker/`, `schema/`, `configs/`.
-- [ ] Author `schema/worker-result.schema.json` — fields: `run_id`, `issue_id`, `lane`, `outcome` (enum `done|needs_review|changes_requested|blocked|continue`), `block_kind` (enum `needs_input|capability|transient|null`), `summary`, `artifacts[]`, `pr_url?`, `thread_id`, `turn_count`, `tokens{in,out}`. Include `$id`, `required`, `additionalProperties:false`.
-- [ ] Author `schema/board.schema.json` — enums for lanes (`coder|reviewer|git_operator|scribe`), columns (`todo|ready|running|review|merging|documentation|done|rework|blocked`), block kinds.
-- [ ] Wire `make codegen`: `go-jsonschema` → `internal/contract/*.go`; `datamodel-code-generator` → `agent/src/clipse_agent/contract.py`. Generated files marked do-not-edit.
-- [ ] Add `agent/pyproject.toml` (uv), Python 3.13, deps `langgraph`, `deepagents_code`, `pydantic>=2`; `clipse-worker` console entrypoint stub that echoes a valid empty result.
-- [ ] Add `Makefile` targets: `build`, `test` (Go + Python), `codegen`, `lint` (`go vet`/`ruff`), `run`.
-- [ ] Add `configs/clipse.example.yaml`: `repo{remote,path,base_branch}`, `poll_interval_s`, `caps{global,per_lane{...}}`, `turn_cap`, `max_runtime_s`, `lane_label_prefix: "agent:"`.
-- [ ] Add `.github/workflows/ci.yml`: matrix build+test Go and Python; run `make codegen` and fail on diff (drift guard).
-- [ ] Add `README.md` (one-paragraph overview + link to design doc) and root `.gitignore`.
+- [x] Init single Go module `github.com/xlyk/clipse` (Go 1.23+); create `cmd/clipse/main.go` with a cobra root command printing version.
+- [x] Create the folder skeleton: `dispatcher/`, `cli/` (+`cli/tui/`), `internal/{linear,store,board,spawn,contract,config}/`, `agent/`, `testworker/`, `schema/`, `configs/`.
+- [x] Author `schema/worker-result.schema.json` — fields: `run_id`, `issue_id`, `lane`, `outcome` (enum `done|needs_review|changes_requested|blocked|continue`), `block_kind` (enum `needs_input|capability|transient|null`), `summary`, `artifacts[]`, `pr_url?`, `thread_id`, `turn_count`, `tokens{in,out}`. Include `$id`, `required`, `additionalProperties:false`.
+- [x] Author `schema/board.schema.json` — enums for lanes (`coder|reviewer|git_operator|scribe`), columns (`todo|ready|running|review|merging|documentation|done|rework|blocked`), block kinds.
+- [x] Wire `make codegen`: `go-jsonschema` → `internal/contract/*.go`; `datamodel-code-generator` → `agent/src/clipse_agent/contract.py`. Generated files marked do-not-edit.
+- [x] Add `agent/pyproject.toml` (uv), Python 3.13, deps `langgraph`, `deepagents_code`, `pydantic>=2`; `clipse-worker` console entrypoint stub that echoes a valid empty result.
+- [x] Add `Makefile` targets: `build`, `test` (Go + Python), `codegen`, `lint` (`go vet`/`ruff`), `run`.
+- [x] Add `configs/clipse.example.yaml`: `repo{remote,path,base_branch}`, `poll_interval_s`, `caps{global,per_lane{...}}`, `turn_cap`, `max_runtime_s`, `lane_label_prefix: "agent:"`.
+- [x] Add `.github/workflows/ci.yml`: matrix build+test Go and Python; run `make codegen` and fail on diff (drift guard).
+- [x] Add `README.md` (one-paragraph overview + link to design doc) and root `.gitignore`.
 
 ### Acceptance criteria
-- [ ] `git init` done; `make build` produces a `clipse` binary; `clipse --version` prints.
-- [ ] `make codegen` generates Go + Pydantic types from `schema/`; re-running is a no-op (idempotent).
-- [ ] CI fails if generated code is stale vs `schema/` (drift guard proven by a deliberate dirty commit in a scratch branch).
-- [ ] `make test` runs (green, even if only trivial tests) across both languages.
-- [ ] `uv run clipse-worker` emits a schema-valid JSON result on stdout.
+- [x] `git init` done; `make build` produces a `clipse` binary; `clipse --version` prints.
+- [x] `make codegen` generates Go + Pydantic types from `schema/`; re-running is a no-op (idempotent).
+- [x] CI fails if generated code is stale vs `schema/` (drift guard proven by a deliberate dirty commit in a scratch branch).
+- [x] `make test` runs (green, even if only trivial tests) across both languages.
+- [x] `uv run clipse-worker` emits a schema-valid JSON result on stdout.
 
 ---
 
