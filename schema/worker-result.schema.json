@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xlyk/clipse/schema/worker-result.schema.json",
+  "title": "WorkerResult",
+  "description": "Typed result a clipse-worker subprocess writes to stdout after each turn. The dispatcher is the only consumer; it drives every board transition off this contract. See board.schema.json for the canonical Lane/BlockKind enums this schema references.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "issue_id",
+    "lane",
+    "outcome",
+    "summary",
+    "artifacts",
+    "thread_id",
+    "turn_count",
+    "tokens"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "Dispatcher-assigned identifier for this run/attempt."
+    },
+    "issue_id": {
+      "type": "string",
+      "description": "Linear issue identifier this run is working."
+    },
+    "lane": {
+      "$ref": "board.schema.json#/$defs/Lane"
+    },
+    "outcome": {
+      "type": "string",
+      "description": "Terminal state of this worker turn, interpreted by the dispatcher's state machine.",
+      "enum": ["done", "needs_review", "changes_requested", "blocked", "continue"]
+    },
+    "block_kind": {
+      "$ref": "board.schema.json#/$defs/BlockKind",
+      "description": "Present iff outcome == \"blocked\"; omitted otherwise."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Human-readable summary of what happened this turn."
+    },
+    "artifacts": {
+      "type": "array",
+      "description": "Paths or references produced this turn (files touched, logs, etc).",
+      "items": { "type": "string" }
+    },
+    "pr_url": {
+      "type": "string",
+      "description": "URL of the PR opened/updated this turn, if any. Optional."
+    },
+    "thread_id": {
+      "type": "string",
+      "description": "LangGraph checkpointer thread id, for resuming continuation turns."
+    },
+    "turn_count": {
+      "type": "integer",
+      "description": "Number of turns run so far for this issue, including this one."
+    },
+    "tokens": {
+      "type": "object",
+      "description": "Token usage for this turn.",
+      "additionalProperties": false,
+      "required": ["in", "out"],
+      "properties": {
+        "in": { "type": "integer" },
+        "out": { "type": "integer" }
+      }
+    }
+  }
+}

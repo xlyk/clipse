@@ -84,6 +84,15 @@ flowchart LR
 Linear holds task **intent**; the dispatcher owns every **transition** off the
 worker's typed result. The LLM never moves a card.
 
+**Divergence rule:** the dispatcher is the only **automated** writer of board
+state; a human may still move a card in Linear directly. On each poll, if
+Linear disagrees with SQLite: when the issue holds no active claim, adopt
+Linear's state (it's a human move); when the issue holds an active claim,
+SQLite wins and the outbox re-asserts it to Linear (it's drift, not intent).
+This is also how Linear-write failures self-heal (A2): the transition commits
+to SQLite first, and a pending-write outbox drains and retries the mirror each
+tick, so SQLite and Linear reconverge without a human in the loop.
+
 Columns: `Todo → Ready → Running → Review → Merging → Documentation → Done`,
 plus `Rework` and `Blocked`.
 
@@ -126,6 +135,10 @@ stronger or distinct model to reduce correlated blind spots.
 ## Components
 
 ### Dispatcher / kernel (Go)
+
+Go version per `go.mod` — currently a 1.25 floor, forced by `modernc.org/sqlite`.
+`go.mod` is the single source of truth; don't restate a version here or in the
+plan.
 
 A single long-running daemon (`clipse dispatch`). Holds a machine-global
 singleton lock so only one dispatcher runs. Heavy logic lives in `internal/`
@@ -198,11 +211,15 @@ generates Go structs (`internal/contract`) and Pydantic models
 {
   "run_id": "…", "issue_id": "…", "lane": "coder",
   "outcome": "done | needs_review | changes_requested | blocked | continue",
-  "block_kind": "needs_input | capability | transient | null",
+  "block_kind": "needs_input | capability | transient",
   "summary": "…", "artifacts": ["…"], "pr_url": "…",
   "thread_id": "…", "turn_count": 3, "tokens": { "in": 0, "out": 0 }
 }
 ```
+
+`block_kind` is an optional string enum, never a `null` enum member: it is
+**present iff `outcome == "blocked"`**, and absent otherwise. Both Go and
+Pydantic sides test this invariant on round-trip.
 
 `schema/board.schema.json` defines the lane / column / block-kind enums shared
 by both planes.
@@ -263,6 +280,34 @@ Derived from Hermes:
   classification. A stuck/failed/needs-input run moves to `Blocked` with a
   reason comment; you requeue. The per-issue turn cap bounds continuation, so
   clean-but-incomplete runs can't churn forever.
+- **Dispatcher-restart orphans are requeued, not Blocked.** H governs *worker*
+  failures (stuck/failed/needs-input); a dispatcher restart is infrastructure,
+  not a worker failure. On startup, before any claim release, the dispatcher
+  kills every process recorded in an open `runs` row (verifying process
+  identity via a recorded start time / pgid, since a bare PID can name an
+  unrelated process after reboot), closes those runs, and requeues their
+  issues to `ready` with an incremented `attempt` — bounded by `max_attempts`
+  (exceeding it lands `Blocked`). This runs strictly before `ReleaseStaleClaims`
+  so a live orphan can never keep pushing after its issue is requeued (the
+  double-run the CAS claim exists to prevent).
+
+## Threat model
+
+Linear issue content is **untrusted input** to a shell-enabled agent running
+`auto_approve=True`. A crafted issue body can steer a worker into any command
+its lane allow-lists.
+
+- **Mitigations**: per-lane shell allow-lists (a lane can only run the
+  commands its job requires); the worker env carries only the secrets that
+  lane needs (`ANTHROPIC_API_KEY`, a scoped `gh` token) — never
+  `LINEAR_API_KEY`, which is kernel-only and never passed to a worker; merge is
+  gated by CI + branch protection, so injected code cannot land without
+  passing required checks; the board is private and single-tenant.
+- **Non-goals (v1)**: full sandboxing (containers/VMs). Revisit in Phase 4 if
+  the board ever accepts external (non-owner) input.
+- **Accepted residual risk**: for a personal tool on a private, single-tenant
+  board, the above mitigations are judged sufficient; this is a stated
+  trade-off, not an oversight.
 
 ## Observability
 
@@ -306,6 +351,7 @@ clipse/
 │   ├── store/                     #   SQLite kernel: issues/runs/events, WAL, migrations
 │   ├── board/                     #   state machine + transitions
 │   ├── spawn/                     #   Spawner iface + local impl
+│   ├── gitops/                    #   merge/tag/cleanup as deterministic Go (Git-operator lane executor)
 │   ├── contract/                  #   Go structs generated from schema/
 │   └── config/
 │
@@ -316,7 +362,7 @@ clipse/
 │   │   ├── dac.py                 #   create_cli_agent wiring
 │   │   ├── contract.py            #   Pydantic models (from schema/)
 │   │   ├── profiles/              #   per-lane DAC config (prompt/tools/skills/model)
-│   │   └── graphs/{coder,reviewer,git_operator,scribe}.py
+│   │   └── graphs/{coder,reviewer,scribe}.py   # git_operator runs as internal/gitops, not a graph
 │   └── tests/
 │
 ├── testworker/                   # Go fake worker for v1 kernel tests (canned JSON)
@@ -376,9 +422,10 @@ Notes:
 | G | Poll Linear on interval |
 | H | Everything parks in Blocked (no failure auto-retry) |
 | I | Dependencies only for v1 (orchestrator/decompose = v2) |
-| J | 4 lanes: Coder (edit+commit+push+PR), Reviewer, Git-operator (merge+tags), Scribe; merge gated by branch protection + CI |
+| J | 4 lanes: Coder (edit+commit+push+PR), Reviewer, Git-operator (merge+tags), Scribe; merge gated by branch protection + CI. **Amended:** the Git-operator lane's *executor* is deterministic kernel code (`internal/gitops`), not a DAC worker — merge/tag/cleanup is pure CLI/API work with exact success criteria, and running it through an LLM adds cost, latency, and nondeterminism at the single most dangerous transition in the pipeline. The `git_operator` lane label remains board semantics only. |
 | K | Linear board + Symphony-style terminal TUI |
 | L | Go dispatcher/CLI/TUI + Python LangGraph worker |
 | M | v1 = kernel-first, tested against a fake worker |
 | N | Secrets via `op`/env (`LINEAR_API_KEY` v1; `ANTHROPIC_API_KEY` + `gh` phase 2) |
+| O | Dispatcher-restart orphans are requeued to `ready` with an incremented `attempt` (bounded by `max_attempts`), not parked in `Blocked` by default — refines H, which governs worker failures; a dispatcher restart is infrastructure |
 | Repo | Single Go module; one `clipse` binary (subcommands); JSON Schema → codegen both sides |

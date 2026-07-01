@@ -1,0 +1,57 @@
+// Package linear provides the GraphQL client and issue normalization for Linear.
+package linear
+
+import "context"
+
+// Issue is Clipse's normalized view of a Linear issue: the subset of Linear
+// fields the dispatcher needs, mapped onto our own vocabulary (see
+// status.go for the Status/Lane mapping rules).
+type Issue struct {
+	// ID is the Linear issue id (UUID).
+	ID string
+
+	// Identifier is the human-facing key, e.g. "CLP-12".
+	Identifier string
+
+	// Status is the Linear workflow-state name mapped to our board
+	// Column enum (contract.Column), e.g. "todo", "review".
+	Status string
+
+	// Lane is the bare agent lane (contract.Lane, e.g. "coder"), parsed
+	// from an "agent:<lane>" label with the "agent:" prefix stripped.
+	// Empty when no agent:<lane> label is present.
+	Lane string
+
+	// Deps holds the ids of issues this issue depends on (both "blocks"
+	// and "blocked-by" relations are folded into this single blocker list).
+	Deps []string
+
+	// Priority is Linear's priority: 0=none, 1=urgent, 2=high, 3=medium,
+	// 4=low, passed through unmodified.
+	Priority int
+
+	// BranchName is Linear's suggested git branch name, which auto-links
+	// a PR pushed to it back to this issue.
+	BranchName string
+
+	// UpdatedAt is the issue's last-updated time, as a Unix timestamp
+	// (seconds).
+	UpdatedAt int64
+}
+
+// Client is the seam the dispatcher depends on for all Linear interaction.
+// The real implementation (HTTPClient) talks GraphQL over HTTP; tests use
+// MockClient so Phase-1 dispatch logic never touches the network.
+type Client interface {
+	// CandidateIssues returns active-state issues the dispatcher should
+	// consider for scheduling this tick.
+	CandidateIssues(ctx context.Context) ([]Issue, error)
+
+	// SetState moves the issue identified by issueID to the Linear
+	// workflow state matching targetColumn (a contract.Column value).
+	SetState(ctx context.Context, issueID, targetColumn string) error
+
+	// Comment posts body as a comment on the issue identified by issueID
+	// (used, for example, to record a Blocked reason).
+	Comment(ctx context.Context, issueID, body string) error
+}

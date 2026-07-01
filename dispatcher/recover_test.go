@@ -1,0 +1,281 @@
+package dispatcher_test
+
+import (
+	"context"
+	"os"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/xlyk/clipse/internal/contract"
+	"github.com/xlyk/clipse/internal/linear"
+	"github.com/xlyk/clipse/internal/spawn"
+	"github.com/xlyk/clipse/internal/store"
+)
+
+// spawnRealOrphan spawns a real hanging testworker subprocess (a
+// group-leader, exactly as the production LocalSpawner spawns workers). It
+// returns the live handle so the caller can read its pid/proc_started_at and
+// later reap the zombie left behind once the process has been killed.
+func spawnRealOrphan(t *testing.T, boardDir, issueID, lane string) spawn.RunHandle {
+	t.Helper()
+	ctx := context.Background()
+
+	bin := buildTestworker(t)
+	spawner := spawn.NewLocalSpawner(bin, boardDir)
+	spec := spawn.WorkerSpec{
+		Issue:     issueID,
+		Lane:      lane,
+		RunID:     "orphan-run",
+		Workspace: t.TempDir(),
+		Env:       append(os.Environ(), "TESTWORKER_SCENARIO=hang"),
+	}
+
+	spawnCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	t.Cleanup(cancel)
+
+	h, err := spawner.Spawn(spawnCtx, spec)
+	if err != nil {
+		t.Fatalf("spawning real orphan worker: unexpected error: %v", err)
+	}
+	// Give the process group leader a moment to fully establish before any
+	// caller reads its identity or tries to signal it.
+	time.Sleep(100 * time.Millisecond)
+
+	return h
+}
+
+// seedOrphanRun seeds issueID as 'running' with an active claim held by
+// runID, and a runs row at status='running' carrying pid/procStartedAt and
+// attempt, mirroring exactly what a real dispatcher leaves behind mid-run.
+func seedOrphanRun(t *testing.T, s *store.Store, issueID, lane, runID string, pid int, procStartedAt int64, attempt int, now int64) {
+	t.Helper()
+	ctx := context.Background()
+	seedReadyIssue(t, s, issueID, lane, 1, now)
+
+	claim, err := s.ClaimReady(ctx, lane, runID, now, 3600)
+	if err != nil {
+		t.Fatalf("ClaimReady: unexpected error: %v", err)
+	}
+	if claim.Issue.ID != issueID {
+		t.Fatalf("ClaimReady claimed %q, want %q", claim.Issue.ID, issueID)
+	}
+
+	if err := s.SetRunProcess(ctx, runID, pid, procStartedAt); err != nil {
+		t.Fatalf("SetRunProcess: unexpected error: %v", err)
+	}
+
+	// ClaimReady always inserts attempt = prior_max+1 (starting at 1); bump
+	// the run's attempt directly for tests that need attempt >= MaxAttempts,
+	// since ClaimReady itself has no way to seed an arbitrary attempt.
+	if attempt != 1 {
+		if _, err := s.DB().ExecContext(ctx, `UPDATE runs SET attempt = ? WHERE run_id = ?`, attempt, runID); err != nil {
+			t.Fatalf("bumping seeded run attempt: unexpected error: %v", err)
+		}
+	}
+}
+
+// TestRecoverOrphans_KillsLiveOrphanAndRequeues asserts that a running issue
+// left behind by a dead dispatcher, with attempt below MaxAttempts, has its
+// orphaned worker process killed and the issue requeued to ready (claim
+// cleared, run closed 'orphaned', a setstate mirror enqueued) so the next
+// tick can re-claim it.
+func TestRecoverOrphans_KillsLiveOrphanAndRequeues(t *testing.T) {
+	s := openTestStore(t)
+	boardDir := t.TempDir()
+
+	handle := spawnRealOrphan(t, boardDir, "issue-1", "coder")
+	pid := handle.PID()
+	startedAt := handle.ProcStartedAt()
+	if startedAt <= 0 {
+		t.Fatalf("precondition: ProcStartedAt() = %d, want > 0", startedAt)
+	}
+
+	const runID = "orphan-run"
+	seedOrphanRun(t, s, "issue-1", "coder", runID, pid, startedAt, 1, 1000)
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	cfg := testConfig()
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(context.Background()); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+
+	// Reap the zombie left by the SIGKILL (mirrors what a real Wait-goroutine
+	// would do); without this the pid stays a zombie and still answers
+	// kill(pid, 0), which would make the liveness assertion below unreliable.
+	_, _ = handle.Wait()
+
+	if !isProcessGone(t, pid) {
+		t.Errorf("orphaned process %d still alive after RecoverOrphans", pid)
+	}
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnReady) {
+		t.Errorf("BoardStatus = %q, want ready (requeued)", issue.BoardStatus)
+	}
+	if issue.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+
+	run := getRunStatus(t, s, runID)
+	if run != "orphaned" {
+		t.Errorf("run status = %q, want orphaned", run)
+	}
+
+	pending, err := s.DrainPendingLinearWrites(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending linear writes = %d, want exactly 1 (ready setstate)", len(pending))
+	}
+	if pending[0].Kind != "setstate" || pending[0].Target != string(contract.ColumnReady) {
+		t.Errorf("pending write = %+v, want setstate -> ready", pending[0])
+	}
+
+	// Exactly one requeue: no duplicate close/requeue for the same run.
+	events, err := s.ListEvents(context.Background())
+	if err != nil {
+		t.Fatalf("ListEvents: unexpected error: %v", err)
+	}
+	var requeueCount int
+	for _, e := range events {
+		if e.Kind == "orphan_requeue" {
+			requeueCount++
+		}
+	}
+	if requeueCount != 1 {
+		t.Errorf("orphan_requeue events = %d, want exactly 1", requeueCount)
+	}
+}
+
+// TestRecoverOrphans_BlocksWhenAttemptAtMax asserts that an orphaned run at
+// attempt >= MaxAttempts is blocked (not requeued), with a comment enqueued
+// explaining why.
+func TestRecoverOrphans_BlocksWhenAttemptAtMax(t *testing.T) {
+	s := openTestStore(t)
+	boardDir := t.TempDir()
+
+	handle := spawnRealOrphan(t, boardDir, "issue-1", "coder")
+	pid := handle.PID()
+	startedAt := handle.ProcStartedAt()
+
+	cfg := testConfig()
+	cfg.MaxAttempts = 2
+	const runID = "orphan-run"
+	seedOrphanRun(t, s, "issue-1", "coder", runID, pid, startedAt, cfg.MaxAttempts, 1000)
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(context.Background()); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+	_, _ = handle.Wait()
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnBlocked) {
+		t.Errorf("BoardStatus = %q, want blocked (max attempts reached)", issue.BoardStatus)
+	}
+	if issue.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+
+	run := getRunStatus(t, s, runID)
+	if run != "orphaned" {
+		t.Errorf("run status = %q, want orphaned", run)
+	}
+
+	pending, err := s.DrainPendingLinearWrites(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	var sawComment, sawSetState bool
+	for _, w := range pending {
+		if w.Kind == "comment" {
+			sawComment = true
+		}
+		if w.Kind == "setstate" && w.Target == string(contract.ColumnBlocked) {
+			sawSetState = true
+		}
+	}
+	if !sawComment {
+		t.Errorf("pending writes = %+v, want a comment explaining the block", pending)
+	}
+	if !sawSetState {
+		t.Errorf("pending writes = %+v, want a setstate -> blocked mirror", pending)
+	}
+}
+
+// TestRecoverOrphans_AlreadyDeadPIDRequeuesWithoutError asserts that a run
+// whose worker_pid is already gone (the process exited or was never
+// recorded) is requeued (or blocked, per the attempt cap) without
+// RecoverOrphans erroring — ReapOrphan's AlreadyGone case flows through the
+// same close+requeue path as an actively-killed orphan.
+func TestRecoverOrphans_AlreadyDeadPIDRequeuesWithoutError(t *testing.T) {
+	s := openTestStore(t)
+
+	const bogusPID = 999999
+	seedOrphanRun(t, s, "issue-1", "coder", "dead-run", bogusPID, 12345, 1, 1000)
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	cfg := testConfig()
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(context.Background()); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnReady) {
+		t.Errorf("BoardStatus = %q, want ready (requeued)", issue.BoardStatus)
+	}
+
+	run := getRunStatus(t, s, "dead-run")
+	if run != "orphaned" {
+		t.Errorf("run status = %q, want orphaned", run)
+	}
+}
+
+// getRunStatus fetches a single run's status by id via the store's raw DB
+// handle (there is no dedicated GetRun accessor for a single row).
+func getRunStatus(t *testing.T, s *store.Store, runID string) string {
+	t.Helper()
+	var status string
+	row := s.DB().QueryRowContext(context.Background(), `SELECT status FROM runs WHERE run_id = ?`, runID)
+	if err := row.Scan(&status); err != nil {
+		t.Fatalf("querying run %s status: %v", runID, err)
+	}
+	return status
+}
+
+// isProcessGone reports whether pid no longer exists (signal 0 fails),
+// polling briefly since SIGKILL delivery is not instantaneous.
+func isProcessGone(t *testing.T, pid int) bool {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}

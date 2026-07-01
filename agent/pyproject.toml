@@ -1,0 +1,26 @@
+[project]
+name = "clipse-agent"
+version = "0.1.0"
+description = "Clipse per-issue worker: LangGraph graph wrapping Deep Agents Code, emitting a typed WorkerResult"
+readme = "README.md"
+authors = [
+    { name = "Kyle Hanks", email = "kylehanks@pm.me" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "deepagents-code>=0.1.22",
+    "langgraph>=1.2.7",
+    "pydantic>=2",
+]
+
+[project.scripts]
+clipse-worker = "clipse_agent.worker:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

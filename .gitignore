@@ -1,0 +1,28 @@
+# build output
+/bin/
+/clipse
+
+# databases
+*.db
+*.db-wal
+*.db-shm
+
+# superpowers ledger (never commit)
+.superpowers/
+
+# go
+*.test
+*.out
+
+# python
+__pycache__/
+.venv/
+agent/.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# os
+.DS_Store
