@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from enum import Enum, StrEnum
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -59,15 +59,14 @@ class Column(StrEnum):
     blocked = 'blocked'
 
 
-class BlockKind(Enum):
+class BlockKind(StrEnum):
     """
-    Why a run is parked in Blocked, or null when not blocked.
+    The reason a run is blocked; present on a worker result iff outcome=="blocked".
     """
 
     needs_input = 'needs_input'
     capability = 'capability'
     transient = 'transient'
-    NoneType_None = None
 
 
 class WorkerResult(BaseModel):
@@ -89,7 +88,9 @@ class WorkerResult(BaseModel):
         ...,
         description="Terminal state of this worker turn, interpreted by the dispatcher's state machine.",
     )
-    block_kind: BlockKind | None = None
+    block_kind: BlockKind | None = Field(
+        None, description='Present iff outcome == "blocked"; omitted otherwise.'
+    )
     summary: str = Field(
         ..., description='Human-readable summary of what happened this turn.'
     )

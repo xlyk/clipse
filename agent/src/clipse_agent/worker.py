@@ -32,7 +32,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         issue_id=args.issue,
         lane=args.lane,
         outcome="blocked",
-        block_kind=None,
+        block_kind="transient",
         summary="clipse-worker stub",
         artifacts=[],
         thread_id=args.thread,
@@ -40,7 +40,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokens=Tokens(**{"in": 0, "out": 0}),
     )
 
-    print(result.model_dump_json(by_alias=True))
+    # exclude_none: optional fields (block_kind, pr_url) must be OMITTED when
+    # unset, never emitted as null — see amendment X2's "present iff" invariant.
+    print(result.model_dump_json(by_alias=True, exclude_none=True))
     return 0
 
 
