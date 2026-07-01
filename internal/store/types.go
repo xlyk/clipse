@@ -49,6 +49,23 @@ type Event struct {
 	Detail  string
 }
 
+// LinearWrite mirrors a row in the linear_writes table: a pending or
+// completed outbound mirror write to Linear (A2's at-least-once outbox).
+// Kind is "setstate" (mirror a board_status change via Target) or "comment"
+// (post Body as an issue comment).
+type LinearWrite struct {
+	ID        int64
+	IssueID   string
+	Kind      string
+	Target    string
+	Body      string
+	Status    string
+	Attempts  int
+	LastError sql.NullString
+	CreatedAt int64
+	UpdatedAt int64
+}
+
 // IssueSnapshot pairs an Issue with its most recent Run, if any.
 type IssueSnapshot struct {
 	Issue
