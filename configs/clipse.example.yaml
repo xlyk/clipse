@@ -1,0 +1,39 @@
+# Clipse configuration example.
+# Copy to configs/clipse.yaml (or point CLIPSE_CONFIG at it) and fill in your values.
+# All durations are in seconds unless noted.
+
+# repo: the single repository clipse manages.
+repo:
+  # remote is the GitHub remote URL (HTTPS or SSH).
+  remote: "https://github.com/yourorg/yourrepo.git"
+  # path is the local absolute path to the primary clone.
+  path: "/home/you/code/yourrepo"
+  # base_branch is the branch workers branch off and PRs target.
+  base_branch: "main"
+
+# poll_interval_s: how often the dispatcher polls Linear for issue updates.
+poll_interval_s: 30
+
+# caps: concurrency limits for the dispatch loop.
+caps:
+  # global: maximum total workers running at once (all lanes combined).
+  global: 8
+
+  # per_lane: maximum concurrent workers per lane.
+  per_lane:
+    coder: 4
+    reviewer: 2
+    git_operator: 1
+    scribe: 1
+
+# turn_cap: maximum continuation turns a single issue may consume before the
+# dispatcher parks it in Blocked. Bounds token spend on stuck issues.
+turn_cap: 5
+
+# max_runtime_s: wall-clock seconds before a running worker is killed and
+# the issue is parked in Blocked (stale/hung detection).
+max_runtime_s: 3600
+
+# lane_label_prefix: Linear label prefix used to select a lane for an issue.
+# e.g. the label "agent:coder" selects the coder lane.
+lane_label_prefix: "agent:"
