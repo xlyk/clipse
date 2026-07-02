@@ -2,6 +2,7 @@ package linear_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/xlyk/clipse/internal/linear"
@@ -26,6 +27,12 @@ func TestBuildCandidateIssuesRequest(t *testing.T) {
 
 	if req.Query != linear.CandidateIssuesQuery {
 		t.Errorf("Query = %q, want the exact candidate-issues query", req.Query)
+	}
+	// Deps must come from inverseRelations (the issues that block this one),
+	// not the source-side `relations` (the issues this one blocks) — reading
+	// the latter inverts the dependency graph on the live board.
+	if !strings.Contains(linear.CandidateIssuesQuery, "inverseRelations") {
+		t.Errorf("candidate query must fetch inverseRelations for dependency edges")
 	}
 	wantVars := map[string]any{"teamKey": "CLI"}
 	if len(req.Variables) != len(wantVars) || req.Variables["teamKey"] != wantVars["teamKey"] {

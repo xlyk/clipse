@@ -18,11 +18,11 @@
               { "name": "agent:coder" }
             ]
           },
-          "relations": {
+          "inverseRelations": {
             "nodes": [
               {
                 "type": "blocks",
-                "relatedIssue": { "id": "22222222-2222-2222-2222-222222222222" }
+                "issue": { "id": "22222222-2222-2222-2222-222222222222" }
               }
             ]
           }
@@ -43,7 +43,7 @@
               { "name": "agent:reviewer" }
             ]
           },
-          "relations": {
+          "inverseRelations": {
             "nodes": []
           }
         },
@@ -61,11 +61,11 @@
           "labels": {
             "nodes": []
           },
-          "relations": {
+          "inverseRelations": {
             "nodes": [
               {
-                "type": "blocked-by",
-                "relatedIssue": { "id": "11111111-1111-1111-1111-111111111111" }
+                "type": "blocks",
+                "issue": { "id": "11111111-1111-1111-1111-111111111111" }
               }
             ]
           }
@@ -86,8 +86,13 @@
               { "name": "agent:git_operator" }
             ]
           },
-          "relations": {
-            "nodes": []
+          "inverseRelations": {
+            "nodes": [
+              {
+                "type": "related",
+                "issue": { "id": "11111111-1111-1111-1111-111111111111" }
+              }
+            ]
           }
         }
       ]
