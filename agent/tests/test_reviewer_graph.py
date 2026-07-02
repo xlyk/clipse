@@ -292,7 +292,7 @@ def test_load_diff_degrades_gracefully_when_git_diff_fails(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_changes_requested_posts_inline_comments_and_requests_changes(tmp_path):
+def test_changes_requested_posts_inline_comments_and_a_summary_comment(tmp_path):
     runner = _base_runner(pr_number=7, commit_sha="deadbeef", pr_url="https://github.com/acme/widgets/pull/7")
     final_text = (
         "Found a couple of issues.\n\n"
@@ -331,14 +331,18 @@ def test_changes_requested_posts_inline_comments_and_requests_changes(tmp_path):
     assert any("line=30" in c.argv for c in api_calls)
     assert all(any("commit_id=deadbeef" in a for a in c.argv) for c in api_calls)
 
-    review_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "review"]]
-    assert len(review_calls) == 1
-    assert "--request-changes" in review_calls[0].argv
+    # No FORMAL gh review: the coder and reviewer share one gh identity, and
+    # GitHub forbids approving/requesting-changes on your own PR. The verdict
+    # flows via the JSON result (drives merging->rework); the summary is posted
+    # as a plain PR comment, which IS allowed on your own PR.
+    assert not [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "review"]]
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
 
 
-def test_changes_requested_still_requests_changes_when_no_structured_comments_found(tmp_path):
-    # The model gave a verdict but no machine-parseable bullet lines -- the
-    # PR must still show a changes-requested review; it just has no inline
+def test_changes_requested_posts_summary_comment_when_no_structured_comments_found(tmp_path):
+    # The model gave a verdict but no machine-parseable bullet lines -- the PR
+    # must still get the summary as a plain comment; it just has no inline
     # per-line comments attached.
     runner = _base_runner()
     turn_result = DacTurnResult(
@@ -368,8 +372,9 @@ def test_changes_requested_still_requests_changes_when_no_structured_comments_fo
 
     api_calls = [c for c in runner.calls if c.argv[:2] == ["gh", "api"]]
     assert api_calls == []
-    review_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "review"]]
-    assert len(review_calls) == 1
+    assert not [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "review"]]
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -393,11 +393,20 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
 
     One inline `gh api` review comment per parsed `InlineComment` (GitHub's
     "create a review comment for a pull request" endpoint, which needs the
-    PR's head commit + a file path + a line), plus a single `gh pr review
-    --request-changes` carrying the overall summary. The summary review
-    always runs -- even when the model gave no machine-parseable per-line
-    findings, `review_comments` is simply empty and no inline comments are
-    posted, but the PR must still show a changes-requested review.
+    PR's head commit + a file path + a line), plus a single plain `gh pr
+    comment` carrying the overall summary. The summary comment always runs --
+    even when the model gave no machine-parseable per-line findings,
+    `review_comments` is simply empty and no inline comments are posted, but
+    the PR still gets the summary.
+
+    NOT a formal `gh pr review --request-changes`: the Coder and Reviewer lanes
+    share one `gh` identity, and GitHub forbids approving or requesting changes
+    on a PR you authored ("Can not request changes on your own pull request").
+    A formal review is also redundant -- the changes_requested verdict reaches
+    the kernel via this run's typed JSON result (emit_result), which is what
+    drives the merging->rework transition; nothing consumes a GitHub review
+    state. Inline review COMMENTS and a plain PR comment are both allowed on
+    your own PR, so the findings still land visibly on the PR.
     """
 
     def _node(state: ReviewerState) -> dict[str, Any]:
@@ -433,7 +442,7 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
 
         _run(
             run_command,
-            ["gh", "pr", "review", branch, "--request-changes", "--body", _changes_summary(state)],
+            ["gh", "pr", "comment", branch, "--body", _changes_summary(state)],
             cwd,
         )
 
