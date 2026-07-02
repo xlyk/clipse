@@ -30,7 +30,14 @@ const (
 	// worker (as --max-tokens) when max_tokens_per_run is absent from the
 	// YAML document. The worker aborts over budget with
 	// outcome=blocked/block_kind=capability (Phase 2 plan item B2).
-	defaultMaxTokensPerRun = 200_000
+	//
+	// This is a cumulative sum over every model call in a DAC turn, and each
+	// call re-sends the growing message history, so a real coding turn with a
+	// few dozen tool calls easily accumulates hundreds of thousands of INPUT
+	// tokens (against a tiny output count). 200k blocked even trivial tasks
+	// live, so the default is 1M — a safety backstop against a runaway loop,
+	// not a working budget. Override per-repo via max_tokens_per_run.
+	defaultMaxTokensPerRun = 1_000_000
 	// defaultCheckpointsDir mirrors defaultBoardDir's default board
 	// directory ("./.clipse"): the design doc's checkpointer-path
 	// convention is "<board>/checkpoints/<issue_id>.db". This is a plain

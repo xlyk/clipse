@@ -186,8 +186,8 @@ worker:
 	if !slices.Equal(cfg.EnvAllowlist, wantDefaultAllowlist) {
 		t.Errorf("EnvAllowlist = %v, want default %v", cfg.EnvAllowlist, wantDefaultAllowlist)
 	}
-	if cfg.MaxTokensPerRun != 200000 {
-		t.Errorf("MaxTokensPerRun = %d, want default 200000", cfg.MaxTokensPerRun)
+	if cfg.MaxTokensPerRun != 1000000 {
+		t.Errorf("MaxTokensPerRun = %d, want default 1000000", cfg.MaxTokensPerRun)
 	}
 	if cfg.CheckpointsDir != "./.clipse/checkpoints" {
 		t.Errorf("CheckpointsDir = %q, want default %q", cfg.CheckpointsDir, "./.clipse/checkpoints")
