@@ -24,8 +24,17 @@ import (
 // spawn.RemoveWorktree; tests substitute a stub that returns a t.TempDir.
 type Workspacer interface {
 	// Ensure returns the workspace directory for issue, creating it if
-	// necessary.
+	// necessary. Used by the Coder/Reviewer lanes and by the inline
+	// Git-operator: all three operate on the issue's own (coder) branch.
 	Ensure(issue store.Issue) (string, error)
+
+	// EnsureDocs returns a workspace for the Scribe lane: a fresh worktree on
+	// a dedicated docs branch, cut from origin/<base> (the just-merged state),
+	// NOT the issue's own already-merged Coder branch. Reusing the Coder
+	// branch here fails non-fast-forward on push once gitops has advanced that
+	// branch's remote tip (update-branch / squash-merge), so the Scribe needs
+	// its own branch with no remote counterpart yet.
+	EnsureDocs(issue store.Issue) (string, error)
 
 	// Remove tears down the workspace for issue. This is the Phase-3
 	// terminal-cleanup primitive: design decision F calls for removing the

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
 )
@@ -21,7 +22,15 @@ import (
 // process to Wait on, so this can't flow through the normal
 // applyResult/runResult path.
 func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID, lane, threadID string, turn int) error {
-	workspace, err := d.ws.Ensure(issue)
+	// The Scribe lane needs its own docs worktree cut from origin/<base>, not
+	// the issue's already-merged Coder branch (which fails non-fast-forward on
+	// push once gitops has advanced its remote tip). Every other spawned lane
+	// (coder/reviewer) operates on the issue's own branch via Ensure.
+	ensure := d.ws.Ensure
+	if lane == string(contract.LaneScribe) {
+		ensure = d.ws.EnsureDocs
+	}
+	workspace, err := ensure(issue)
 	if err != nil {
 		return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, fmt.Errorf("preparing workspace: %w", err))
 	}

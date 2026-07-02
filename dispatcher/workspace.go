@@ -45,6 +45,30 @@ func (w *gitWorkspacer) Ensure(issue store.Issue) (string, error) {
 	return path, nil
 }
 
+// docsBranchName derives the Scribe lane's dedicated documentation branch
+// from the issue's Coder branch: the Coder branch plus a "-docs" suffix. It
+// stays associated with the issue (easy to trace) while being a distinct ref
+// the Coder never pushes to, so the Scribe's docs PR is cleanly separate and
+// its push never collides with the merged Coder branch.
+func docsBranchName(coderBranch string) string {
+	return coderBranch + "-docs"
+}
+
+// EnsureDocs creates (or reuses) the Scribe lane's docs worktree: a fresh
+// worktree on docsBranchName(issue.BranchName), cut from origin/<base> (see
+// spawn.EnsureDocsWorktree for why the remote base, not the issue's own merged
+// Coder branch).
+func (w *gitWorkspacer) EnsureDocs(issue store.Issue) (string, error) {
+	if issue.BranchName == "" {
+		return "", fmt.Errorf("ensuring docs workspace for issue %s: no branch name set", issue.ID)
+	}
+	path, err := spawn.EnsureDocsWorktree(context.Background(), w.primaryClonePath, docsBranchName(issue.BranchName), w.baseBranch, w.worktreeRoot)
+	if err != nil {
+		return "", fmt.Errorf("ensuring docs workspace for issue %s: %w", issue.ID, err)
+	}
+	return path, nil
+}
+
 // Remove tears down the worktree and local branch for issue.BranchName. The
 // worktree path is derived the same deterministic way spawn.EnsureWorktree
 // derives it (worktreeRoot joined with branch, '/' sanitized to '-'), rather

@@ -111,6 +111,39 @@ func TestTick_DocumentationColumnClaim_DispatchesScribeLane(t *testing.T) {
 	}
 }
 
+// TestTick_ScribeClaim_UsesDocsWorkspace asserts the Scribe lane is spawned
+// against a fresh docs worktree (Workspacer.EnsureDocs), NOT the Coder's
+// already-merged branch worktree (Ensure). Regression guard for the scribe
+// non-fast-forward push bug: committing docs onto the merged Coder branch is
+// rejected on push once gitops has advanced that branch's remote tip.
+func TestTick_ScribeClaim_UsesDocsWorkspace(t *testing.T) {
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", "documentation", 1, 100)
+
+	spawner := newFakeSpawner()
+	spawner.Results["issue-1"] = spawn.Result{
+		Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeDone, Summary: "docs"},
+	}
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: unexpected error: %v", err)
+	}
+
+	if got := ws.DocsEnsured(); len(got) != 1 || got[0] != "issue-1" {
+		t.Errorf("EnsureDocs calls = %v, want [issue-1] (scribe must use a docs worktree)", got)
+	}
+	specs := spawner.Specs()
+	if len(specs) != 1 {
+		t.Fatalf("SpawnCount = %d, want 1", len(specs))
+	}
+	if want := ws.root + "/docs/issue-1"; specs[0].Workspace != want {
+		t.Errorf("scribe Workspace = %q, want docs path %q", specs[0].Workspace, want)
+	}
+}
+
 // TestTick_ColumnClaim_DoesNotMirrorLinearForTheClaimItself asserts R5: a
 // downstream column claim (review/rework/documentation) never enqueues a
 // Linear mirror write on its own — only a later Transition (once the
