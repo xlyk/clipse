@@ -299,6 +299,10 @@ def test_open_pr_creates_when_gh_pr_view_finds_nothing(tmp_path):
     assert "--head" in create_calls[0].argv
     assert "clipse/spac-1" in create_calls[0].argv
     assert "--base" in create_calls[0].argv
+    # Coder-authored PRs always open as drafts -- the Coder lane's own turn
+    # ending doesn't mean the work is reviewed/ready; only the Reviewer lane
+    # should take a PR out of draft.
+    assert "--draft" in create_calls[0].argv
 
 
 # ---------------------------------------------------------------------------

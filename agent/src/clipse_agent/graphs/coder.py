@@ -395,6 +395,12 @@ def make_open_pr(run_command: CommandRunner) -> Callable[[CoderState], dict[str,
     after a previous turn's push-but-before-record, or an auto-continuation
     turn, appends commits to the existing branch/PR instead of opening a
     second one.
+
+    Created PRs always pass `--draft`: a Coder-lane turn ending cleanly means
+    DAC finished its turn, not that the change has been reviewed -- the
+    Reviewer lane (Phase 3) is what should take a PR out of draft once it
+    actually is ready, so a coder-authored PR never implies "ready to merge"
+    on its own.
     """
 
     def _node(state: CoderState) -> dict[str, Any]:
@@ -412,6 +418,7 @@ def make_open_pr(run_command: CommandRunner) -> Callable[[CoderState], dict[str,
                 "gh",
                 "pr",
                 "create",
+                "--draft",
                 "--head",
                 branch,
                 "--base",
