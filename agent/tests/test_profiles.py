@@ -64,6 +64,22 @@ def test_system_prompt_covers_worktree_commits_and_stop_conditions():
     assert "blocked" in prompt
 
 
+def test_system_prompt_defers_git_and_pr_to_the_platform():
+    # The coder graph commits/pushes/opens the PR deterministically after the
+    # DAC turn. If the prompt also tells DAC to open the PR itself, DAC runs a
+    # `gh pr create` that the shell allow-list rejects (compound `cd && gh`)
+    # and then LOOPS retrying variants until it burns the whole token budget
+    # and blocks (observed live). So the prompt must hand git/gh (commit, push,
+    # open PR) to the platform, leaving DAC to do file work only.
+    profile = get_coder_profile()
+    prompt = profile.system_prompt.lower()
+
+    assert "platform" in prompt
+    assert "pull request" in prompt
+    # It must NOT instruct DAC to push/open the PR itself.
+    assert "push your branch and open a pull request" not in prompt
+
+
 def test_shell_allow_list_is_minimal_but_sufficient():
     profile = get_coder_profile()
 
