@@ -44,9 +44,10 @@ type Row struct {
 // live store handle — so Update stays pure and unit-testable without a DB
 // or TTY.
 type Model struct {
-	running []Row
-	blocked []Row
-	queued  []Row // ready + todo, in that order
+	running  []Row
+	blocked  []Row
+	queued   []Row // ready + todo, in that order
+	inFlight []Row // review + rework + merging + documentation, in that order
 
 	tokensIn  int
 	tokensOut int
@@ -81,12 +82,16 @@ func NewModel(opts ...Option) Model {
 	return m
 }
 
-// Running, Blocked, and Queued expose the current display-ready rows for
-// each dashboard section. Queued folds "ready" and "todo" issues together,
-// per the dashboard's three-section layout (RUNNING / BLOCKED / QUEUED).
-func (m Model) Running() []Row { return m.running }
-func (m Model) Blocked() []Row { return m.blocked }
-func (m Model) Queued() []Row  { return m.queued }
+// Running, Blocked, Queued, and InFlight expose the current display-ready
+// rows for each dashboard section. Queued folds "ready" and "todo" issues
+// together; InFlight folds every active downstream lane-entry column
+// (review/rework/merging/documentation) together, labeled per-row by its
+// own column (Row.Status) since — unlike the other three sections — it
+// spans more than one board_status value.
+func (m Model) Running() []Row  { return m.running }
+func (m Model) Blocked() []Row  { return m.blocked }
+func (m Model) Queued() []Row   { return m.queued }
+func (m Model) InFlight() []Row { return m.inFlight }
 
 // TotalTokensIn and TotalTokensOut sum LatestRun token counts across every
 // issue in the snapshot, for the dashboard's header line.
@@ -162,6 +167,7 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.running = m.running[:0]
 	m.blocked = m.blocked[:0]
 	m.queued = m.queued[:0]
+	m.inFlight = m.inFlight[:0]
 	m.tokensIn = 0
 	m.tokensOut = 0
 
@@ -184,6 +190,16 @@ func (m *Model) fold(snap store.Snapshot) {
 			m.blocked = append(m.blocked, row)
 		case "ready", "todo":
 			m.queued = append(m.queued, row)
+		case "review", "rework", "merging", "documentation":
+			// Active downstream lane-entry columns: a card here is either
+			// currently claimed (a Reviewer/Git-operator/Scribe run in
+			// flight) or waiting its turn to be claimed — either way it is
+			// still "in play", not invisible the way an unhandled
+			// board_status previously left it. "done" deliberately has no
+			// case here (and this is why the switch stays an explicit list
+			// rather than a catch-all default): it's terminal, with
+			// nothing left to watch.
+			m.inFlight = append(m.inFlight, row)
 		}
 	}
 }

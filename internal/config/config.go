@@ -19,6 +19,13 @@ const (
 	defaultMaxRuntimeS       = 3600
 	defaultLaneLabelPrefix   = "agent:"
 	defaultMaxAttempts       = 3
+	// defaultReworkCap is the default amendment-C1 rework_cap: how many
+	// times a single issue may cycle review/merging -> rework (the
+	// Reviewer lane's changes_requested, or the Git-operator lane's
+	// stale-base-conflict route) before the dispatcher parks it in Blocked
+	// instead of routing it to rework again, breaking what would otherwise
+	// be a possible infinite Coder<->Reviewer loop.
+	defaultReworkCap = 3
 	// defaultMaxTokensPerRun is the per-run token ceiling passed to the
 	// worker (as --max-tokens) when max_tokens_per_run is absent from the
 	// YAML document. The worker aborts over budget with
@@ -105,6 +112,13 @@ type Config struct {
 	MaxRuntimeS     int    `yaml:"max_runtime_s"`
 	LaneLabelPrefix string `yaml:"lane_label_prefix"`
 	MaxAttempts     int    `yaml:"max_attempts"`
+	// ReworkCap bounds how many times a single issue may cycle into rework
+	// (amendment C1) — see issues.rework_count (internal/store) and
+	// dispatcher.blockIfReworkCapExceeded, which parks the issue in
+	// Blocked instead of transitioning to rework once incrementing
+	// rework_count would exceed this. Defaults to defaultReworkCap when
+	// absent from the YAML document.
+	ReworkCap int `yaml:"rework_cap"`
 	// Worker configures the clipse-worker subprocess invocation. Required —
 	// see Worker.Command's doc comment.
 	Worker Worker `yaml:"worker"`
@@ -173,6 +187,7 @@ type rawConfig struct {
 	MaxRuntimeS     *int     `yaml:"max_runtime_s"`
 	LaneLabelPrefix *string  `yaml:"lane_label_prefix"`
 	MaxAttempts     *int     `yaml:"max_attempts"`
+	ReworkCap       *int     `yaml:"rework_cap"`
 	MaxTokensPerRun *int     `yaml:"max_tokens_per_run"`
 	CheckpointsDir  *string  `yaml:"checkpoints_dir"`
 	BoardDir        *string  `yaml:"board_dir"`
@@ -203,6 +218,7 @@ func Load(path string) (*Config, error) {
 		MaxRuntimeS:     intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),
 		LaneLabelPrefix: stringOrDefault(raw.LaneLabelPrefix, defaultLaneLabelPrefix),
 		MaxAttempts:     intOrDefault(raw.MaxAttempts, defaultMaxAttempts),
+		ReworkCap:       intOrDefault(raw.ReworkCap, defaultReworkCap),
 		MaxTokensPerRun: intOrDefault(raw.MaxTokensPerRun, defaultMaxTokensPerRun),
 		CheckpointsDir:  stringOrDefault(raw.CheckpointsDir, defaultCheckpointsDir),
 		BoardDir:        stringOrDefault(raw.BoardDir, defaultBoardDir),
@@ -271,6 +287,9 @@ func validate(cfg *Config) error {
 	}
 	if cfg.MaxAttempts < 1 {
 		return fmt.Errorf("max_attempts must be at least 1, got %d", cfg.MaxAttempts)
+	}
+	if cfg.ReworkCap < 1 {
+		return fmt.Errorf("rework_cap must be at least 1, got %d", cfg.ReworkCap)
 	}
 	if cfg.Caps.Global < 1 {
 		return fmt.Errorf("caps.global must be at least 1, got %d", cfg.Caps.Global)

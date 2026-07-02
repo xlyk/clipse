@@ -241,6 +241,185 @@ func TestTransition_EmptyErrorAndResultStoredAsNull(t *testing.T) {
 	}
 }
 
+// TestTransition_ReworkCount_IncrementsOnReworkAndResetsOnDone asserts that
+// Transition bumps issues.rework_count every time a card lands in the
+// rework column (amendment C1: the Reviewer lane's changes_requested from
+// review, and the Git-operator lane's stale-base-conflict route from
+// merging both land on NewStatus="rework", and both mean "the Coder lane
+// gets another attempt") and resets it to zero once the card reaches done --
+// all inside the same atomic transition, so no separate dispatcher-side
+// bookkeeping call can fall out of sync with the board move itself. A
+// Linear re-poll landing mid-cycle (UpsertIssue's conflict path) must not
+// reset it either, since it is dispatcher-owned runtime state like
+// board_status/claim_lock.
+func TestTransition_ReworkCount_IncrementsOnReworkAndResetsOnDone(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+
+	reworkReq := func(ts int64) store.TransitionReq {
+		return store.TransitionReq{
+			IssueID:   "issue-1",
+			NewStatus: "rework",
+			Event:     store.Event{Ts: ts, Kind: "transitioned"},
+		}
+	}
+
+	if err := s.Transition(ctx, reworkReq(1)); err != nil {
+		t.Fatalf("Transition (1st rework): unexpected error: %v", err)
+	}
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.ReworkCount != 1 {
+		t.Fatalf("ReworkCount after 1st rework = %d, want 1", got.ReworkCount)
+	}
+
+	// A Linear re-poll mid-cycle must not reset the count.
+	if err := s.UpsertIssue(ctx, store.Issue{
+		ID:          "issue-1",
+		Identifier:  "issue-1",
+		LaneLabel:   "coder",
+		BoardStatus: "todo", // stale/irrelevant to this assertion; UpsertIssue never writes board_status/rework_count on conflict
+		Deps:        `[]`,
+		BranchName:  "issue-1-branch",
+		UpdatedAt:   50,
+		LastSeen:    50,
+		CreatedAt:   100,
+	}); err != nil {
+		t.Fatalf("re-poll UpsertIssue: unexpected error: %v", err)
+	}
+	got, err = s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue after re-poll: unexpected error: %v", err)
+	}
+	if got.ReworkCount != 1 {
+		t.Fatalf("ReworkCount after re-poll = %d, want preserved 1", got.ReworkCount)
+	}
+
+	if err := s.Transition(ctx, reworkReq(2)); err != nil {
+		t.Fatalf("Transition (2nd rework): unexpected error: %v", err)
+	}
+	got, err = s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.ReworkCount != 2 {
+		t.Fatalf("ReworkCount after 2nd rework = %d, want 2", got.ReworkCount)
+	}
+
+	if err := s.Transition(ctx, store.TransitionReq{
+		IssueID:   "issue-1",
+		NewStatus: "done",
+		Event:     store.Event{Ts: 3, Kind: "transitioned"},
+	}); err != nil {
+		t.Fatalf("Transition (done): unexpected error: %v", err)
+	}
+	got, err = s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue after done: unexpected error: %v", err)
+	}
+	if got.ReworkCount != 0 {
+		t.Errorf("ReworkCount after done = %d, want reset to 0", got.ReworkCount)
+	}
+
+	// ReadSnapshot must agree with GetIssue.
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	if snap.Issues[0].ReworkCount != 0 {
+		t.Errorf("ReadSnapshot ReworkCount = %d, want reset to 0", snap.Issues[0].ReworkCount)
+	}
+}
+
+// TestTransition_SkipReworkBump_ReassertingReworkDoesNotDoubleCount asserts
+// the fix for the requeueOrphan/rework_count interaction
+// (dispatcher.requeueOrphan): a Transition to NewStatus="rework" with
+// SkipReworkBump set must NOT increment rework_count. SkipReworkBump exists
+// specifically for a claim-release re-assert of a column the issue was
+// ALREADY sitting in (store.ReleaseTargetColumn never changes a downstream
+// column), never a genuine review/merging->rework edge — so it must not be
+// double-counted against amendment C1's rework_cap.
+func TestTransition_SkipReworkBump_ReassertingReworkDoesNotDoubleCount(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+
+	// A genuine edge into rework bumps the count normally.
+	if err := s.Transition(ctx, store.TransitionReq{
+		IssueID:   "issue-1",
+		NewStatus: "rework",
+		Event:     store.Event{Ts: 1, Kind: "transitioned"},
+	}); err != nil {
+		t.Fatalf("Transition (genuine rework edge): unexpected error: %v", err)
+	}
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.ReworkCount != 1 {
+		t.Fatalf("ReworkCount after genuine edge = %d, want 1", got.ReworkCount)
+	}
+
+	// A re-assert of the SAME column (SkipReworkBump) must not bump it again.
+	if err := s.Transition(ctx, store.TransitionReq{
+		IssueID:        "issue-1",
+		NewStatus:      "rework",
+		SkipReworkBump: true,
+		Event:          store.Event{Ts: 2, Kind: "transitioned"},
+	}); err != nil {
+		t.Fatalf("Transition (SkipReworkBump re-assert): unexpected error: %v", err)
+	}
+	got, err = s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.ReworkCount != 1 {
+		t.Errorf("ReworkCount after SkipReworkBump re-assert = %d, want unchanged 1", got.ReworkCount)
+	}
+}
+
+// TestTransition_ResetReworkCount_ForcesZeroRegardlessOfNewStatus asserts
+// the fix for a stale rework_count surviving a human-driven blocked->ready
+// requeue (dispatcher.adoptLinearMove): a Transition with ResetReworkCount
+// set resets rework_count to 0 even though NewStatus is neither "rework"
+// nor "done".
+func TestTransition_ResetReworkCount_ForcesZeroRegardlessOfNewStatus(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+
+	if err := s.Transition(ctx, store.TransitionReq{
+		IssueID:   "issue-1",
+		NewStatus: "rework",
+		Event:     store.Event{Ts: 1, Kind: "transitioned"},
+	}); err != nil {
+		t.Fatalf("Transition (seed rework_count=1): unexpected error: %v", err)
+	}
+
+	if err := s.Transition(ctx, store.TransitionReq{
+		IssueID:          "issue-1",
+		NewStatus:        "ready",
+		ResetReworkCount: true,
+		Event:            store.Event{Ts: 2, Kind: "transitioned"},
+	}); err != nil {
+		t.Fatalf("Transition (ResetReworkCount to ready): unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Errorf("BoardStatus = %q, want ready", got.BoardStatus)
+	}
+	if got.ReworkCount != 0 {
+		t.Errorf("ReworkCount = %d, want reset to 0", got.ReworkCount)
+	}
+}
+
 // TestDrainPendingLinearWrites_OrderedByID asserts drained rows come back in
 // enqueue order (ascending id), so retries process in FIFO order.
 func TestDrainPendingLinearWrites_OrderedByID(t *testing.T) {

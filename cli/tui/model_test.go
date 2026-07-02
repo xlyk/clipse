@@ -100,6 +100,57 @@ func TestUpdate_SnapshotMsg_FoldsGroupsAndTotals(t *testing.T) {
 	}
 }
 
+// TestFold_DownstreamColumnsAppearInInFlightBucket asserts that issues
+// sitting in review/rework/merging/documentation — active downstream
+// columns a spawned worker or gitops is (or will be) working through — are
+// visible in the TUI via a dedicated in-flight bucket, rather than silently
+// dropped the way fold's original running/blocked/queued-only switch left
+// them (none of those three cases match any of the four). A "done" issue
+// (terminal, nothing left to watch) still shows up nowhere, exactly as
+// before — this must be an explicit set of active columns, not a catch-all
+// default that would also sweep in "done".
+func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			{Issue: store.Issue{ID: "i-review", Identifier: "CLP-10", LaneLabel: "agent:reviewer", BoardStatus: "review"}},
+			{Issue: store.Issue{ID: "i-rework", Identifier: "CLP-11", LaneLabel: "agent:coder", BoardStatus: "rework"}},
+			{Issue: store.Issue{ID: "i-merging", Identifier: "CLP-12", LaneLabel: "agent:git_operator", BoardStatus: "merging"}},
+			{Issue: store.Issue{ID: "i-docs", Identifier: "CLP-13", LaneLabel: "agent:scribe", BoardStatus: "documentation"}},
+			{Issue: store.Issue{ID: "i-done", Identifier: "CLP-14", LaneLabel: "agent:coder", BoardStatus: "done"}},
+		},
+	}
+
+	m := tui.NewModel()
+	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
+
+	inFlight := updated.InFlight()
+	if got, want := len(inFlight), 4; got != want {
+		t.Fatalf("InFlight() len = %d, want %d (review/rework/merging/documentation); got %+v", got, want, inFlight)
+	}
+	gotIDs := make(map[string]bool, len(inFlight))
+	for _, row := range inFlight {
+		gotIDs[row.Identifier] = true
+	}
+	for _, want := range []string{"CLP-10", "CLP-11", "CLP-12", "CLP-13"} {
+		if !gotIDs[want] {
+			t.Errorf("InFlight() missing %q, got %+v", want, inFlight)
+		}
+	}
+	if gotIDs["CLP-14"] {
+		t.Errorf("done issue CLP-14 leaked into InFlight(), want it to stay invisible (terminal)")
+	}
+
+	if got := len(updated.Running()); got != 0 {
+		t.Errorf("Running() len = %d, want 0", got)
+	}
+	if got := len(updated.Blocked()); got != 0 {
+		t.Errorf("Blocked() len = %d, want 0", got)
+	}
+	if got := len(updated.Queued()); got != 0 {
+		t.Errorf("Queued() len = %d, want 0", got)
+	}
+}
+
 // TestUpdate_SnapshotMsg_ClearsPriorError asserts that a fresh snapshotMsg
 // clears any error recorded by a prior errMsg: a successful refresh should
 // supersede a transient failure rather than sticking forever.

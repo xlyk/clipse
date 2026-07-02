@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/store"
 )
 
@@ -90,7 +91,7 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 	}
 
 	if !issue.ClaimLock.Valid {
-		return d.adoptLinearMove(ctx, issueID, linearStatus, now)
+		return d.adoptLinearMove(ctx, issueID, issue.BoardStatus, linearStatus, now)
 	}
 	return d.reassertOwnedState(ctx, issueID, issue.BoardStatus, now)
 }
@@ -98,10 +99,22 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 // adoptLinearMove folds a human's out-of-band Linear move into SQLite: a
 // plain status update, no claim change, no run to close, and (deliberately)
 // no outbox mirror, since Linear is already the source of this state.
-func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, linearStatus string, now int64) error {
+//
+// A blocked->{ready,todo} move additionally resets issues.rework_count
+// (TransitionReq.ResetReworkCount): once a human pulls an issue back out of
+// Blocked, whatever rework_count it accumulated on its prior review/rework
+// cycle no longer bounds anything relevant. Without this, an issue blocked
+// after tripping amendment C1's rework_cap would keep that stale count
+// forever, and a human's very next requeue could immediately re-trip
+// blockIfReworkCapExceeded on the first subsequent changes_requested —
+// defeating the point of requeuing it by hand. Scoped specifically to a
+// requeue FROM blocked (priorStatus) so an ordinary human move that never
+// touched Blocked at all doesn't reset a count it has no bearing on.
+func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, priorStatus, linearStatus string, now int64) error {
 	req := store.TransitionReq{
-		IssueID:   issueID,
-		NewStatus: linearStatus,
+		IssueID:          issueID,
+		NewStatus:        linearStatus,
+		ResetReworkCount: priorStatus == string(contract.ColumnBlocked) && isHumanRequeueTarget(linearStatus),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),
@@ -113,6 +126,13 @@ func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, linearStatus 
 		return fmt.Errorf("adopting linear move for issue %s: %w", issueID, err)
 	}
 	return nil
+}
+
+// isHumanRequeueTarget reports whether linearStatus is one of the columns a
+// human-driven Blocked requeue can land on: back into the active pipeline,
+// either immediately claimable (ready) or pending its dependencies (todo).
+func isHumanRequeueTarget(linearStatus string) bool {
+	return linearStatus == string(contract.ColumnReady) || linearStatus == string(contract.ColumnTodo)
 }
 
 // reassertOwnedState pushes the dispatcher's current board_status back to

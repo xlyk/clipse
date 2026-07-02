@@ -201,6 +201,88 @@ func TestOpen_AddsTitleDescriptionToPreExistingIssuesTable(t *testing.T) {
 	}
 }
 
+// TestOpen_MigratesEmptyDB_IssuesHasReworkCount asserts that a fresh issues
+// table includes the rework_count column amendment C1's rework_cap compares
+// against (Phase-3 cross-lane claiming).
+func TestOpen_MigratesEmptyDB_IssuesHasReworkCount(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clipse.db")
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("Open: unexpected error: %v", err)
+	}
+	defer s.Close()
+
+	if !hasColumn(t, s.DB(), "issues", "rework_count") {
+		t.Errorf("issues table missing rework_count column after migrating an empty db")
+	}
+}
+
+// TestOpen_AddsReworkCountToPreExistingIssuesTable simulates a database that
+// was migrated before rework_count existed on the issues table. Open must add
+// it additively without erroring, and re-running Open again must remain a
+// no-op.
+func TestOpen_AddsReworkCountToPreExistingIssuesTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clipse.db")
+
+	// Build a "legacy" issues table missing rework_count, bypassing the
+	// store package's own migrations entirely.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: unexpected error: %v", err)
+	}
+	const legacyIssuesTable = `CREATE TABLE issues (
+		id            TEXT PRIMARY KEY,
+		identifier    TEXT NOT NULL,
+		title         TEXT NOT NULL DEFAULT '',
+		description   TEXT NOT NULL DEFAULT '',
+		lane_label    TEXT NOT NULL DEFAULT '',
+		board_status  TEXT NOT NULL DEFAULT '',
+		deps          TEXT NOT NULL DEFAULT '[]',
+		priority      INTEGER NOT NULL DEFAULT 0,
+		branch_name   TEXT NOT NULL DEFAULT '',
+		claim_lock    TEXT,
+		claim_expires INTEGER,
+		updated_at    INTEGER NOT NULL DEFAULT 0,
+		last_seen     INTEGER NOT NULL DEFAULT 0,
+		created_at    INTEGER NOT NULL DEFAULT 0
+	)`
+	if _, err := db.Exec(legacyIssuesTable); err != nil {
+		t.Fatalf("creating legacy issues table: %v", err)
+	}
+	if hasColumn(t, db, "issues", "rework_count") {
+		t.Fatalf("legacy issues table unexpectedly already has rework_count")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing legacy db: %v", err)
+	}
+
+	// Opening through the store package must add the missing column.
+	s1, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("first Open: unexpected error: %v", err)
+	}
+	if !hasColumn(t, s1.DB(), "issues", "rework_count") {
+		t.Fatalf("issues table still missing rework_count after Open")
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("first Close: unexpected error: %v", err)
+	}
+
+	// Re-opening (re-migrating) an already-patched database must be a no-op:
+	// no error, column still present exactly once.
+	s2, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("second Open: unexpected error: %v", err)
+	}
+	defer s2.Close()
+	if !hasColumn(t, s2.DB(), "issues", "rework_count") {
+		t.Errorf("issues table missing rework_count after re-Open")
+	}
+}
+
 // hasColumn reports whether table has a column named col, using
 // PRAGMA table_info.
 func hasColumn(t *testing.T, db *sql.DB, table, col string) bool {

@@ -43,6 +43,7 @@ func testConfig() config.Config {
 		MaxRuntimeS:     3600,
 		LaneLabelPrefix: "agent:",
 		MaxAttempts:     3,
+		ReworkCap:       3,
 		Caps: config.Caps{
 			Global: 8,
 			PerLane: config.PerLaneCaps{
@@ -104,6 +105,33 @@ func seedReadyIssue(t *testing.T, s *store.Store, id, lane string, priority int,
 		Identifier:  id,
 		LaneLabel:   lane,
 		BoardStatus: "ready",
+		Deps:        `[]`,
+		Priority:    priority,
+		BranchName:  id + "-branch",
+		UpdatedAt:   createdAt,
+		LastSeen:    createdAt,
+		CreatedAt:   createdAt,
+	}
+	if err := s.UpsertIssue(ctx, issue); err != nil {
+		t.Fatalf("seed UpsertIssue(%s): unexpected error: %v", id, err)
+	}
+}
+
+// seedColumnIssue inserts a single issue already sitting in column (e.g.
+// "review"), unclaimed, ready to be claimed by ClaimColumn — the downstream
+// analogue of seedReadyIssue (Phase 3 cross-lane claiming). LaneLabel is
+// always the bare "coder": per the kernel invariant, an issue's own
+// lane_label never changes as it moves through downstream columns —
+// ClaimColumn dispatches whichever lane the COLUMN implies, not the issue's
+// label.
+func seedColumnIssue(t *testing.T, s *store.Store, id, column string, priority int, createdAt int64) {
+	t.Helper()
+	ctx := context.Background()
+	issue := store.Issue{
+		ID:          id,
+		Identifier:  id,
+		LaneLabel:   "coder",
+		BoardStatus: column,
 		Deps:        `[]`,
 		Priority:    priority,
 		BranchName:  id + "-branch",

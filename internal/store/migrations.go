@@ -16,6 +16,7 @@ var migrations = []string{
 		description   TEXT NOT NULL DEFAULT '',
 		lane_label    TEXT NOT NULL DEFAULT '',
 		board_status  TEXT NOT NULL DEFAULT '',
+		rework_count  INTEGER NOT NULL DEFAULT 0,
 		deps          TEXT NOT NULL DEFAULT '[]',
 		priority      INTEGER NOT NULL DEFAULT 0,
 		branch_name   TEXT NOT NULL DEFAULT '',
@@ -90,6 +91,13 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("applying migration: %w", err)
 	}
 	if err := addColumnIfMissing(db, "issues", "description", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	// rework_count (Phase-3 cross-lane claiming, amendment C1): the CREATE
+	// TABLE above already carries it for a fresh database; this retrofits a
+	// database migrated before it existed. Existing rows default to 0, same
+	// as a freshly inserted issue.
+	if err := addColumnIfMissing(db, "issues", "rework_count", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("applying migration: %w", err)
 	}
 	return nil

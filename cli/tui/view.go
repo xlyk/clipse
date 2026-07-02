@@ -14,9 +14,10 @@ var (
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 
 	sectionStyles = map[string]lipgloss.Style{
-		"RUNNING": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10")), // green
-		"BLOCKED": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")),  // red
-		"QUEUED":  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")), // yellow
+		"RUNNING":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10")), // green
+		"IN FLIGHT": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14")), // cyan
+		"BLOCKED":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")),  // red
+		"QUEUED":    lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")), // yellow
 	}
 
 	rowStyle   = lipgloss.NewStyle().PaddingLeft(2)
@@ -25,9 +26,10 @@ var (
 	footerHint = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
 )
 
-// View renders the dashboard: a header line with token totals, three
-// sections (RUNNING / BLOCKED / QUEUED), and a quit hint. Rendering is pure
-// formatting over the Model's already-folded state — no store access.
+// View renders the dashboard: a header line with token totals, four
+// sections (RUNNING / IN FLIGHT / BLOCKED / QUEUED), and a quit hint.
+// Rendering is pure formatting over the Model's already-folded state — no
+// store access.
 func (m Model) View() string {
 	var b strings.Builder
 
@@ -42,6 +44,8 @@ func (m Model) View() string {
 	}
 
 	b.WriteString(renderSection("RUNNING", m.running, true))
+	b.WriteString("\n")
+	b.WriteString(renderSection("IN FLIGHT", m.inFlight, false))
 	b.WriteString("\n")
 	b.WriteString(renderSection("BLOCKED", m.blocked, false))
 	b.WriteString("\n")
@@ -79,8 +83,13 @@ func renderSection(title string, rows []Row, showRuntime bool) string {
 	return b.String()
 }
 
-// renderRow formats a single issue line: identifier, lane, and latest-run
-// info (or a "-" placeholder if the issue has never run).
+// renderRow formats a single issue line: identifier, lane, board column,
+// and latest-run info (or a "-" placeholder if the issue has never run).
+// The column is included for every section (not just IN FLIGHT) for a
+// consistent row shape, but it earns its place there specifically: IN
+// FLIGHT is the one section whose rows span more than one board_status
+// value (review/rework/merging/documentation), so it is the only section
+// where this field actually disambiguates anything.
 func renderRow(row Row, showRuntime bool) string {
 	runInfo := "-"
 	if row.Run != nil {
@@ -90,7 +99,7 @@ func renderRow(row Row, showRuntime bool) string {
 			runInfo += fmt.Sprintf(" running %s", formatElapsed(row.Run))
 		}
 	}
-	return fmt.Sprintf("%-10s  %-16s  %s", row.Identifier, row.LaneLabel, runInfo)
+	return fmt.Sprintf("%-10s  %-16s  %-14s  %s", row.Identifier, row.LaneLabel, row.Status, runInfo)
 }
 
 // formatElapsed renders how long run has been running, based on

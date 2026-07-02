@@ -39,6 +39,7 @@ caps:
     scribe: 2
 turn_cap: 7
 max_runtime_s: 1800
+rework_cap: 6
 max_tokens_per_run: 250000
 lane_label_prefix: "lane:"
 max_attempts: 4
@@ -101,6 +102,9 @@ board_dir: "/abs/path/board"
 	}
 	if cfg.MaxRuntimeS != 1800 {
 		t.Errorf("MaxRuntimeS = %d, want 1800", cfg.MaxRuntimeS)
+	}
+	if cfg.ReworkCap != 6 {
+		t.Errorf("ReworkCap = %d, want 6", cfg.ReworkCap)
 	}
 	if cfg.LaneLabelPrefix != "lane:" {
 		t.Errorf("LaneLabelPrefix = %q, want %q", cfg.LaneLabelPrefix, "lane:")
@@ -168,6 +172,9 @@ worker:
 	}
 	if cfg.MaxRuntimeS != 3600 {
 		t.Errorf("MaxRuntimeS = %d, want default 3600", cfg.MaxRuntimeS)
+	}
+	if cfg.ReworkCap != 3 {
+		t.Errorf("ReworkCap = %d, want default 3", cfg.ReworkCap)
 	}
 	if cfg.LaneLabelPrefix != "agent:" {
 		t.Errorf("LaneLabelPrefix = %q, want default %q", cfg.LaneLabelPrefix, "agent:")
@@ -303,6 +310,17 @@ repo:
 max_attempts: 0
 `,
 			wantErrSubstr: "max_attempts",
+		},
+		{
+			name: "non-positive rework_cap",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+rework_cap: 0
+`,
+			wantErrSubstr: "rework_cap",
 		},
 		{
 			name: "missing team_key",

@@ -55,6 +55,13 @@ lane_label_prefix: "agent:"
 # requeued again.
 max_attempts: 3
 
+# rework_cap: maximum number of times a single issue may cycle into Rework
+# (the Reviewer lane's changes_requested, or the Git-operator lane's
+# stale-base-conflict route) before the dispatcher parks it in Blocked
+# instead, with a comment linking the PR and the last review — breaking
+# what would otherwise be a possible infinite Coder<->Reviewer loop.
+rework_cap: 3
+
 # worker: how the dispatcher execs the clipse-worker subprocess. command is
 # the argv PREFIX the Spawner execs for every worker invocation; the
 # dispatcher appends the per-run flags (--issue/--lane/--run/--thread/

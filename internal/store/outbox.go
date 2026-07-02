@@ -15,6 +15,26 @@ type TransitionReq struct {
 	NewStatus  string // target board column
 	ClearClaim bool   // null out claim_lock/claim_expires (terminal/blocked/requeue)
 
+	// SkipReworkBump suppresses the automatic rework_count increment that
+	// NewStatus=="rework" would otherwise apply (see applyIssueTransition).
+	// Set only by dispatcher.requeueOrphan: an orphaned claim's release
+	// re-asserts whatever column the card was ALREADY sitting in
+	// (store.ReleaseTargetColumn never changes a downstream column), which
+	// for a card orphaned mid-rework means NewStatus=="rework" again — but
+	// that is the SAME column, not a fresh review/merging->rework edge, so
+	// it must not double-count against amendment C1's rework_cap.
+	SkipReworkBump bool
+
+	// ResetReworkCount forces rework_count back to 0 regardless of
+	// NewStatus, taking priority over the "rework"/"done" NewStatus-keyed
+	// rules in applyIssueTransition. Set only by dispatcher.adoptLinearMove's
+	// blocked->{ready,todo} human-requeue path: once a human has put a
+	// Blocked issue back into play, whatever rework_count it accumulated on
+	// its prior review/rework cycle no longer bounds anything relevant —
+	// amendment C1's cap is meant to catch a live Reviewer<->Coder (or
+	// gitops<->Coder) loop, not to follow the issue around forever.
+	ResetReworkCount bool
+
 	CloseRunID string // if non-empty, close this run
 	RunStatus  string // status to set on the closed run (e.g. "done","blocked","stale","orphaned")
 	RunError   string // optional; stored NULL if empty
@@ -74,6 +94,30 @@ func applyIssueTransition(ctx context.Context, tx *sql.Tx, req TransitionReq) er
 	args := []any{req.NewStatus}
 	if req.ClearClaim {
 		q += `, claim_lock = NULL, claim_expires = NULL`
+	}
+	switch {
+	case req.ResetReworkCount:
+		// A genuine human-driven requeue out of Blocked (see
+		// TransitionReq.ResetReworkCount) — takes priority over the
+		// NewStatus-keyed rules below since it can fire on a target column
+		// ("ready"/"todo") neither of them matches at all.
+		q += `, rework_count = 0`
+	case req.NewStatus == "rework":
+		// Every genuine path into rework -- the Reviewer lane's
+		// changes_requested from review, and the Git-operator lane's
+		// stale-base-conflict route from merging -- means "the Coder lane
+		// gets another attempt", so amendment C1's rework_cap can bound the
+		// count regardless of which lane routed it here. SkipReworkBump
+		// opts out for a claim-release re-assert of a column the issue was
+		// already sitting in (see its own doc comment) -- never a fresh
+		// edge into rework.
+		if !req.SkipReworkBump {
+			q += `, rework_count = rework_count + 1`
+		}
+	case req.NewStatus == "done":
+		// The count is scoped to one review<->rework cycle, not the
+		// issue's lifetime.
+		q += `, rework_count = 0`
 	}
 	q += ` WHERE id = ?`
 	args = append(args, req.IssueID)

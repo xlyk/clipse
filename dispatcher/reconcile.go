@@ -80,7 +80,7 @@ func (d *Dispatcher) applyResult(ctx context.Context, rr runResult) error {
 	}
 
 	delete(d.inflight, rr.runID)
-	return d.applyTerminalOutcome(ctx, *issue, rr, inf, outcome)
+	return d.applyTerminalWorkerOutcome(ctx, *issue, rr.runID, inf.lane, rr.res.Worker)
 }
 
 // blockReasonFor renders a human-readable reason for a Spawner/RunHandle
@@ -149,51 +149,159 @@ func (d *Dispatcher) applyContinue(ctx context.Context, issue store.Issue, rr ru
 	return nil
 }
 
-// applyTerminalOutcome handles every non-"continue" outcome
+// applyTerminalWorkerOutcome handles every non-"continue" outcome
 // (needs_review/changes_requested/blocked/done): computes the next column
 // via board.Next and applies the resulting transition, or blocks defensively
-// if board.Next reports the transition as illegal.
-func (d *Dispatcher) applyTerminalOutcome(ctx context.Context, issue store.Issue, rr runResult, inf inflightRun, outcome string) error {
+// if board.Next reports the transition as illegal. It is the single path
+// shared by a spawned worker's finished run (applyResult, above) and an
+// inline gitops pass over a claimed "merging" card (applyGitopsResult, in
+// gitops.go) — both a Reviewer lane's changes_requested from review and a
+// Git-operator lane's stale-base-conflict route from merging land here
+// identically, so both go through the exact same rework-cap check (amendment
+// C1), Linear-mirror enqueue, and event trail.
+func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store.Issue, runID, lane string, result contract.WorkerResult) error {
+	outcome := string(result.Outcome)
 	next, action, err := board.Next(outcome, issue.BoardStatus)
 	if err != nil {
 		reason := fmt.Sprintf("illegal transition: outcome %q from column %q: %s", outcome, issue.BoardStatus, err.Error())
-		return d.blockRun(ctx, issue, rr.runID, inf.lane, reason)
+		return d.blockRun(ctx, issue, runID, lane, reason)
 	}
 
-	resultJSON, err := marshalWorkerResult(rr.res.Worker)
+	if next == string(contract.ColumnRework) {
+		blocked, err := d.blockIfReworkCapExceeded(ctx, issue, runID, lane, result)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			return nil
+		}
+	}
+
+	resultJSON, err := marshalWorkerResult(result)
 	if err != nil {
-		return fmt.Errorf("marshaling result for run %s: %w", rr.runID, err)
+		return fmt.Errorf("marshaling result for run %s: %w", runID, err)
 	}
 
 	now := d.now()
-	comment := ""
-	if outcome == string(contract.WorkerResultOutcomeBlocked) {
-		comment = blockCommentFor(rr.res.Worker)
-	}
+	comment := commentFor(outcome, lane, result)
 
 	req := store.TransitionReq{
 		IssueID:         issue.ID,
 		NewStatus:       next,
 		ClearClaim:      true,
-		CloseRunID:      rr.runID,
+		CloseRunID:      runID,
 		RunStatus:       outcome,
 		ResultJSON:      resultJSON,
-		TokensIn:        rr.res.Worker.Tokens.In,
-		TokensOut:       rr.res.Worker.Tokens.Out,
+		TokensIn:        result.Tokens.In,
+		TokensOut:       result.Tokens.Out,
 		EnqueueSetState: true,
 		Comment:         comment,
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),
-			RunID:   nullString(rr.runID),
+			RunID:   nullString(runID),
 			Kind:    action,
-			Detail:  rr.res.Worker.Summary,
+			Detail:  result.Summary,
 		},
 	}
 	if err := d.store.Transition(ctx, req); err != nil {
 		return fmt.Errorf("transitioning issue %s: %w", issue.ID, err)
 	}
 	return nil
+}
+
+// blockIfReworkCapExceeded intercepts a would-be transition to rework once
+// issue has already cycled through rework cfg.ReworkCap times (amendment
+// C1): store.Transition increments issues.rework_count unconditionally on
+// any transition to "rework" (see internal/store/outbox.go), so this check
+// must run BEFORE that transition is applied. Once incrementing would push
+// rework_count past the cap, it parks the issue in Blocked instead — with a
+// comment naming the cap, the PR (if any), and the last review/conflict
+// reason — rather than ever calling Transition with NewStatus="rework"
+// again, so rework_count never ticks past the cap and a permanently
+// disagreeing Reviewer (or a repeatedly-conflicting stale base) can't loop
+// the issue between Coder and Reviewer forever.
+//
+// This applies identically regardless of which lane routed the card to
+// rework: the Reviewer lane's changes_requested from review, or the
+// Git-operator lane's stale-base-conflict route from merging (R1) — both
+// increment the SAME issues.rework_count counter.
+func (d *Dispatcher) blockIfReworkCapExceeded(ctx context.Context, issue store.Issue, runID, lane string, result contract.WorkerResult) (blocked bool, err error) {
+	if issue.ReworkCount+1 <= d.cfg.ReworkCap {
+		return false, nil
+	}
+
+	resultJSON, err := marshalWorkerResult(result)
+	if err != nil {
+		return false, fmt.Errorf("marshaling result for run %s: %w", runID, err)
+	}
+
+	now := d.now()
+	reason := reworkCapExceededReason(d.cfg.ReworkCap, result)
+	req := store.TransitionReq{
+		IssueID:         issue.ID,
+		NewStatus:       string(contract.ColumnBlocked),
+		ClearClaim:      true,
+		CloseRunID:      runID,
+		RunStatus:       string(result.Outcome),
+		ResultJSON:      resultJSON,
+		TokensIn:        result.Tokens.In,
+		TokensOut:       result.Tokens.Out,
+		EnqueueSetState: true,
+		Comment:         reason,
+		Event: store.Event{
+			Ts:      now,
+			IssueID: nullString(issue.ID),
+			RunID:   nullString(runID),
+			Kind:    "rework_cap_exceeded",
+			Detail:  reason,
+		},
+	}
+	if err := d.store.Transition(ctx, req); err != nil {
+		return false, fmt.Errorf("blocking issue %s at rework cap: %w", issue.ID, err)
+	}
+	d.logger.Warn("rework cap exceeded, issue blocked", "issue_id", issue.ID, "run_id", runID, "lane", lane, "rework_cap", d.cfg.ReworkCap)
+	return true, nil
+}
+
+// reworkCapExceededReason renders the Linear comment body for a rework-cap
+// block: the cap itself, the PR under review (if the result carries one),
+// and the last review/conflict summary that tipped it over — so a human
+// looking at the Blocked column doesn't need to open the store to see why.
+func reworkCapExceededReason(cap int, result contract.WorkerResult) string {
+	reason := fmt.Sprintf("rework cap (%d) exceeded", cap)
+	if result.PrUrl != nil && *result.PrUrl != "" {
+		reason += fmt.Sprintf("; PR: %s", *result.PrUrl)
+	}
+	if result.Summary != "" {
+		reason += fmt.Sprintf("; last review: %s", result.Summary)
+	}
+	return reason
+}
+
+// commentFor decides whether a terminal transition gets a Linear comment,
+// and what it says. "blocked" always gets one (blockCommentFor). A
+// changes_requested from the Git-operator lane also gets one: unlike the
+// Reviewer lane (which posts its own inline PR review comments — see
+// graphs/reviewer.py's post_comments — before ever emitting
+// changes_requested), internal/gitops's stale-base-conflict route never
+// posts anything to the PR itself, so this comment (naming the conflicting
+// files, folded into result.Summary by staleBaseConflictSummary) is the
+// only place a human sees why the card landed back in Rework. Every other
+// outcome (done, needs_review, and a Reviewer's own changes_requested) gets
+// no dispatcher-authored comment.
+func commentFor(outcome, lane string, result contract.WorkerResult) string {
+	switch {
+	case outcome == string(contract.WorkerResultOutcomeBlocked):
+		return blockCommentFor(result)
+	case outcome == string(contract.WorkerResultOutcomeChangesRequested) && lane == string(contract.LaneGitOperator):
+		if result.Summary != "" {
+			return fmt.Sprintf("rework: %s", result.Summary)
+		}
+		return "rework: stale base conflict"
+	default:
+		return ""
+	}
 }
 
 // blockCommentFor renders the Linear comment body for a "blocked" outcome

@@ -13,7 +13,6 @@ import (
 	"unicode"
 
 	"github.com/xlyk/clipse/internal/config"
-	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
@@ -80,6 +79,14 @@ type Dispatcher struct {
 	newRunID func() string
 	envFor   func(issue store.Issue) []string
 
+	// gitOps runs the deterministic Git-operator lane inline for a claimed
+	// "merging" card (design decision J amendment / O: the lane's executor
+	// is kernel code, never a spawned DAC worker). Defaults to
+	// defaultGitOpsRunner (a real gitops.Run call); tests substitute a fake
+	// via WithGitOpsRunner so the merging path never touches a real gh/git
+	// subprocess.
+	gitOps GitOpsRunner
+
 	logger *slog.Logger
 
 	// pollInterval overrides the Tick interval Run uses when set (via
@@ -122,6 +129,13 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(d *Dispatcher) { d.logger = logger }
 }
 
+// WithGitOpsRunner overrides the default Git-operator lane executor (see
+// Dispatcher.gitOps). Tests use this to substitute a fake that returns
+// scripted gitops.Result values instead of running gh/git for real.
+func WithGitOpsRunner(fn GitOpsRunner) Option {
+	return func(d *Dispatcher) { d.gitOps = fn }
+}
+
 // WithResultsBuffer overrides the default results channel buffer size.
 func WithResultsBuffer(n int) Option {
 	return func(d *Dispatcher) { d.results = make(chan runResult, n) }
@@ -147,6 +161,7 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 		now:      func() int64 { return time.Now().Unix() },
 		newRunID: newRandomRunID,
 		envFor:   defaultEnvFor(cfg.EnvAllowlist),
+		gitOps:   defaultGitOpsRunner,
 		logger:   slog.Default(),
 		results:  make(chan runResult, defaultResultsBuffer),
 		inflight: make(map[string]inflightRun),
@@ -240,24 +255,6 @@ func (d *Dispatcher) Tick(ctx context.Context) error {
 		return fmt.Errorf("tick: drain outbox: %w", err)
 	}
 	return nil
-}
-
-// laneCaps returns the ordered set of lanes the dispatcher schedules, paired
-// with each lane's configured per-lane cap. The bare lane values (e.g.
-// "coder") are what issues.lane_label / runs.lane store, per the store
-// package's documented convention — NOT the "agent:coder" Linear label.
-func (d *Dispatcher) laneCaps() []laneCap {
-	return []laneCap{
-		{lane: string(contract.LaneCoder), cap: d.cfg.Caps.PerLane.Coder},
-		{lane: string(contract.LaneReviewer), cap: d.cfg.Caps.PerLane.Reviewer},
-		{lane: string(contract.LaneGitOperator), cap: d.cfg.Caps.PerLane.GitOperator},
-		{lane: string(contract.LaneScribe), cap: d.cfg.Caps.PerLane.Scribe},
-	}
-}
-
-type laneCap struct {
-	lane string
-	cap  int
 }
 
 // inflightLaneCounts returns the current in-flight run count, both globally

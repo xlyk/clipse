@@ -6,12 +6,27 @@ import "database/sql"
 // plus dispatcher-owned claim fields. Deps is a JSON array (of issue ids)
 // encoded as TEXT.
 type Issue struct {
-	ID           string
-	Identifier   string
-	Title        string
-	Description  string
-	LaneLabel    string
-	BoardStatus  string
+	ID          string
+	Identifier  string
+	Title       string
+	Description string
+	LaneLabel   string
+	BoardStatus string
+
+	// ReworkCount is dispatcher-owned runtime state, like BoardStatus and the
+	// claim fields: it counts how many times this issue has landed in the
+	// rework column (amendment C1) -- the Reviewer lane's changes_requested
+	// from review, and the Git-operator lane's stale-base-conflict route from
+	// merging both count, since both mean "the Coder lane gets another
+	// attempt". It resets to 0 once the issue reaches done, or once a human
+	// requeues it out of Blocked back to ready/todo (see
+	// dispatcher.adoptLinearMove / TransitionReq.ResetReworkCount). A claim
+	// released without a genuine rework edge (dispatcher.requeueOrphan's
+	// re-assert of a column the card was already in — see
+	// TransitionReq.SkipReworkBump) never bumps it either way. A Linear
+	// re-poll (UpsertIssue's conflict path) never touches it.
+	ReworkCount int
+
 	Deps         string
 	Priority     int
 	BranchName   string
