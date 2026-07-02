@@ -184,8 +184,8 @@ worker:
 	if cfg.ReworkCap != 3 {
 		t.Errorf("ReworkCap = %d, want default 3", cfg.ReworkCap)
 	}
-	if cfg.RecoverCap != 2 {
-		t.Errorf("RecoverCap = %d, want default 2", cfg.RecoverCap)
+	if cfg.RecoverCap != 5 {
+		t.Errorf("RecoverCap = %d, want default 5", cfg.RecoverCap)
 	}
 	// recover_backoff_s defaults to the resolved poll_interval_s (30 here,
 	// since poll_interval_s is also absent from this minimal config).

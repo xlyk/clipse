@@ -71,7 +71,7 @@ rework_cap: 3
 # rework-cap exhaustion, illegal transitions, and orphan max_attempts always
 # park immediately. recover_cap: 0 disables auto-recovery. recover_backoff_s
 # defaults to poll_interval_s when omitted.
-recover_cap: 2
+recover_cap: 5
 recover_backoff_s: 30
 
 # worker: how the dispatcher execs the clipse-worker subprocess. command is

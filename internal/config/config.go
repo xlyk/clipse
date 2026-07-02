@@ -36,7 +36,7 @@ const (
 	// (capability/needs_input), rework-cap exhaustion, illegal transitions,
 	// and orphan max_attempts are NOT covered: those park immediately. A cap
 	// of 0 disables auto-recovery entirely (every failure parks).
-	defaultRecoverCap = 2
+	defaultRecoverCap = 5
 	// defaultMaxTokensPerRun is the per-run token ceiling passed to the
 	// worker (as --max-tokens) when max_tokens_per_run is absent from the
 	// YAML document. The worker aborts over budget with
