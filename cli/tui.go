@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/xlyk/clipse/cli/tui"
+	"github.com/xlyk/clipse/dispatcher"
 	"github.com/xlyk/clipse/internal/store"
 )
 
@@ -63,12 +64,15 @@ func runTUI(cmd *cobra.Command, boardDir string) error {
 		}
 	}()
 
+	lockPath := filepath.Join(boardDir, "clipse.lock")
 	refresh := func() tea.Msg {
 		snap, err := st.ReadSnapshot(context.Background())
 		if err != nil {
 			return tui.ErrMsg{Err: fmt.Errorf("reading snapshot: %w", err)}
 		}
-		return tui.SnapshotMsg{Snap: snap}
+		// Liveness is I/O (a lock probe), so it lives here in the refresh
+		// command rather than in the pure Update.
+		return tui.SnapshotMsg{Snap: snap, Live: dispatcherLive(lockPath)}
 	}
 
 	model := tui.NewModel(tui.WithRefreshCmd(refresh))
@@ -78,6 +82,26 @@ func runTUI(cmd *cobra.Command, boardDir string) error {
 		return fmt.Errorf("running tui: %w", err)
 	}
 	return nil
+}
+
+// dispatcherLive reports whether a clipse dispatcher is currently holding the
+// board's singleton lock, which is the authoritative "the pipeline is running"
+// signal. It probes non-destructively by trying to acquire the same flock the
+// dispatcher takes: if the lock is already held, acquisition fails with
+// ErrAlreadyRunning (⇒ live); if it succeeds, no dispatcher is running and the
+// probe immediately releases so the TUI never becomes the singleton itself and
+// blocks a real dispatcher from starting. Any other error is treated as "can't
+// tell" (not live).
+func dispatcherLive(lockPath string) bool {
+	release, err := dispatcher.AcquireSingleton(lockPath)
+	if errors.Is(err, dispatcher.ErrAlreadyRunning) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	_ = release()
+	return false
 }
 
 // programModel adapts tui.Model to the tea.Model interface. tea.Model.Update

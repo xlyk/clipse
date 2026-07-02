@@ -250,6 +250,142 @@ func TestUpdate_QuitKey_ReturnsTeaQuit(t *testing.T) {
 	}
 }
 
+// down/up/enter/esc/tab/help are keystroke constructors for the navigation
+// tests, mirroring how bubbletea delivers them.
+var (
+	keyDown  = tea.KeyMsg{Type: tea.KeyDown}
+	keyUp    = tea.KeyMsg{Type: tea.KeyUp}
+	keyEnter = tea.KeyMsg{Type: tea.KeyEnter}
+	keyEsc   = tea.KeyMsg{Type: tea.KeyEsc}
+	keyTab   = tea.KeyMsg{Type: tea.KeyTab}
+	keyHelp  = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")}
+)
+
+// TestSelectionNavigation_Clamps asserts j/k (down/up) walk the flattened
+// ordered rows — running → in flight → blocked → queued — clamping at both
+// ends rather than wrapping, and that the initial selection is the first row.
+func TestSelectionNavigation_Clamps(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+
+	// ordered = [CLP-1 (running), CLP-2 (blocked), CLP-3 (ready), CLP-4 (todo)].
+	if got, want := m.Selected(), "CLP-1"; got != want {
+		t.Fatalf("initial Selected() = %q, want %q", got, want)
+	}
+
+	wantDownSeq := []string{"CLP-2", "CLP-3", "CLP-4", "CLP-4"} // last press clamps
+	for i, want := range wantDownSeq {
+		m, _ = m.Update(keyDown)
+		if got := m.Selected(); got != want {
+			t.Errorf("after %d down presses Selected() = %q, want %q", i+1, got, want)
+		}
+	}
+
+	wantUpSeq := []string{"CLP-3", "CLP-2", "CLP-1", "CLP-1"} // last press clamps
+	for i, want := range wantUpSeq {
+		m, _ = m.Update(keyUp)
+		if got := m.Selected(); got != want {
+			t.Errorf("after %d up presses Selected() = %q, want %q", i+1, got, want)
+		}
+	}
+}
+
+// TestSelectionSurvivesRefresh asserts the cursor stays pinned to the same
+// issue identifier across a re-fold (a fresh SnapshotMsg), not to a slice
+// index that reordering could shift out from under it.
+func TestSelectionSurvivesRefresh(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+	m, _ = m.Update(keyDown) // -> CLP-2
+	if got, want := m.Selected(), "CLP-2"; got != want {
+		t.Fatalf("Selected() = %q, want %q", got, want)
+	}
+
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+	if got, want := m.Selected(), "CLP-2"; got != want {
+		t.Errorf("after refresh Selected() = %q, want preserved %q", got, want)
+	}
+}
+
+// TestViewModeToggling drives the mode/help transitions through Update key
+// messages: tab flips dashboard↔kanban, enter opens detail and esc leaves it,
+// ? toggles the help overlay, and esc closes help before backing out a view.
+func TestViewModeToggling(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+
+	if got, want := m.ViewMode(), "dashboard"; got != want {
+		t.Fatalf("initial ViewMode() = %q, want %q", got, want)
+	}
+
+	// dashboard -> kanban -> dashboard
+	m, _ = m.Update(keyTab)
+	if got, want := m.ViewMode(), "kanban"; got != want {
+		t.Errorf("after tab ViewMode() = %q, want %q", got, want)
+	}
+	m, _ = m.Update(keyTab)
+	if got, want := m.ViewMode(), "dashboard"; got != want {
+		t.Errorf("after 2nd tab ViewMode() = %q, want %q", got, want)
+	}
+
+	// dashboard -> detail -> (esc) dashboard
+	m, _ = m.Update(keyEnter)
+	if got, want := m.ViewMode(), "detail"; got != want {
+		t.Errorf("after enter ViewMode() = %q, want %q", got, want)
+	}
+	m, _ = m.Update(keyEsc)
+	if got, want := m.ViewMode(), "dashboard"; got != want {
+		t.Errorf("after esc ViewMode() = %q, want %q", got, want)
+	}
+
+	// help overlay toggles independently of mode
+	m, _ = m.Update(keyHelp)
+	if !m.HelpVisible() {
+		t.Error("after ? HelpVisible() = false, want true")
+	}
+	m, _ = m.Update(keyHelp)
+	if m.HelpVisible() {
+		t.Error("after 2nd ? HelpVisible() = true, want false")
+	}
+
+	// esc closes the help overlay first, without also leaving the view
+	m, _ = m.Update(keyTab) // -> kanban
+	m, _ = m.Update(keyHelp)
+	if !m.HelpVisible() || m.ViewMode() != "kanban" {
+		t.Fatalf("setup: HelpVisible=%v ViewMode=%q, want true/kanban", m.HelpVisible(), m.ViewMode())
+	}
+	m, _ = m.Update(keyEsc)
+	if m.HelpVisible() {
+		t.Error("esc did not close help overlay")
+	}
+	if got, want := m.ViewMode(), "kanban"; got != want {
+		t.Errorf("esc closing help also changed ViewMode() to %q, want %q (unchanged)", got, want)
+	}
+}
+
+// TestView_RendersWithoutPanicAcrossModes is a smoke test: View must produce
+// non-empty output in every mode without panicking, including before any
+// snapshot (empty board) and after one.
+func TestView_RendersWithoutPanicAcrossModes(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
+
+	// empty board (no snapshot yet)
+	if m.View() == "" {
+		t.Error("View() on empty model returned empty string")
+	}
+
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot(), Live: true})
+	for _, msg := range []tea.KeyMsg{keyEnter, keyEsc, keyTab, keyHelp} {
+		m, _ = m.Update(msg)
+		if m.View() == "" {
+			t.Errorf("View() returned empty after key %v", msg)
+		}
+	}
+}
+
 // assertErr is a minimal error implementation for tests that need a
 // specific, comparable error value without importing errors.New into every
 // call site.

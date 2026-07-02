@@ -56,7 +56,7 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 
 - **TDD**: failing test first, then the minimal implementation. `make test` is the gate.
 - **Go**: check and wrap every error (`fmt.Errorf("...: %w", err)`); no swallowed errors. Runtime/daemon logs use `log/slog` JSON only — no `fmt.Println` (a CLI command *result*, e.g. a `status` table, is fine on stdout). Table-driven tests; standard-library `testing` only (no testify). Interfaces at the consumption site.
-- **Dependencies** (ask before adding anything else): Go — `spf13/cobra`, `charmbracelet/bubbletea` + `lipgloss`, `modernc.org/sqlite` (pure-Go, WAL, `_txlock=immediate`), `gopkg.in/yaml.v3`; otherwise stdlib. Python — `pydantic>=2`, `langgraph`, `deepagents-code`; dev `pytest` + `ruff`.
+- **Dependencies** (ask before adding anything else): Go — `spf13/cobra`, `charmbracelet/bubbletea` + `lipgloss` + `bubbles` (TUI widgets: viewport/progress/help/key), `modernc.org/sqlite` (pure-Go, WAL, `_txlock=immediate`), `gopkg.in/yaml.v3`; otherwise stdlib. Python — `pydantic>=2`, `langgraph`, `deepagents-code`; dev `pytest` + `ruff`.
 - **Commits**: Conventional Commits, casual/lowercase, no trailing period, no AI/Claude signature. One concern per commit. Never `git add -A`/`git add .` (an untracked `.superpowers/` SDD ledger must never be committed). Open PRs as drafts; push with `--force-with-lease`, never `--no-verify`.
 - **Testing philosophy**: the kernel is proven against `testworker` (drive scenarios via the `TESTWORKER_SCENARIO` env in `WorkerSpec.Env`) + `linear.MockClient`. Zero LLM, zero real network (only `httptest` loopback). Detect worker timeout via `errors.Is(res.Err, context.DeadlineExceeded)`, not exit code.
 
