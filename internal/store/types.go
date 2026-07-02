@@ -88,6 +88,14 @@ type IssueSnapshot struct {
 	Issue
 	LatestRun *Run
 
+	// TokensInTotal / TokensOutTotal sum tokens across ALL of this issue's
+	// runs (every lane it has passed through — coder, reviewer, scribe, ...),
+	// not just LatestRun. Displaying LatestRun's tokens alone dropped every
+	// earlier lane's usage the moment a card advanced, which read as the
+	// counters "not updating".
+	TokensInTotal  int
+	TokensOutTotal int
+
 	// Unmirrored is true iff this issue has at least one linear_writes row
 	// with status='pending' (A2's outbox) — i.e. a board transition
 	// committed locally but hasn't yet been mirrored to Linear, typically
@@ -100,6 +108,11 @@ type IssueSnapshot struct {
 type Snapshot struct {
 	Issues         []IssueSnapshot
 	CountsByStatus map[string]int
+
+	// TotalTokensIn / TotalTokensOut sum tokens across every run of every
+	// issue — the board-wide cumulative spend the dashboard header shows.
+	TotalTokensIn  int
+	TotalTokensOut int
 
 	// UnmirroredCount is the number of issues with Unmirrored=true, i.e. how
 	// many issues currently have a pending Linear mirror write outstanding.

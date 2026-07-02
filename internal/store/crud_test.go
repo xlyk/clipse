@@ -7,6 +7,59 @@ import (
 	"github.com/xlyk/clipse/internal/store"
 )
 
+// TestReadSnapshot_CumulativeTokensAcrossRuns asserts token totals sum EVERY
+// run of an issue, not just its latest. An issue accrues one run per lane
+// (coder, then reviewer, then scribe), so counting only LatestRun (as the TUI
+// header used to) silently dropped every earlier lane's tokens — which read
+// as "token counts not updating" once a card moved past its coder run.
+func TestReadSnapshot_CumulativeTokensAcrossRuns(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "documentation"}); err != nil {
+		t.Fatalf("UpsertIssue issue-1: %v", err)
+	}
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-2", Identifier: "CLP-2", BoardStatus: "running"}); err != nil {
+		t.Fatalf("UpsertIssue issue-2: %v", err)
+	}
+	// issue-1: three completed lane runs.
+	for _, r := range []store.Run{
+		{RunID: "r1", IssueID: "issue-1", Lane: "coder", Status: "needs_review", StartedAt: 10, Attempt: 1, TokensIn: 100, TokensOut: 200},
+		{RunID: "r2", IssueID: "issue-1", Lane: "reviewer", Status: "done", StartedAt: 20, Attempt: 1, TokensIn: 50, TokensOut: 60},
+		{RunID: "r3", IssueID: "issue-1", Lane: "scribe", Status: "done", StartedAt: 30, Attempt: 1, TokensIn: 30, TokensOut: 40},
+	} {
+		if err := s.InsertRun(ctx, r); err != nil {
+			t.Fatalf("InsertRun %s: %v", r.RunID, err)
+		}
+	}
+	// issue-2: one run.
+	if err := s.InsertRun(ctx, store.Run{RunID: "r4", IssueID: "issue-2", Lane: "coder", Status: "running", StartedAt: 40, Attempt: 1, TokensIn: 7, TokensOut: 3}); err != nil {
+		t.Fatalf("InsertRun r4: %v", err)
+	}
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+
+	byID := map[string]store.IssueSnapshot{}
+	for _, is := range snap.Issues {
+		byID[is.ID] = is
+	}
+	if got := byID["issue-1"].TokensInTotal; got != 180 {
+		t.Errorf("issue-1 TokensInTotal = %d, want 180 (100+50+30, all runs)", got)
+	}
+	if got := byID["issue-1"].TokensOutTotal; got != 300 {
+		t.Errorf("issue-1 TokensOutTotal = %d, want 300 (200+60+40)", got)
+	}
+	if snap.TotalTokensIn != 187 {
+		t.Errorf("Snapshot.TotalTokensIn = %d, want 187 (180+7, board-wide)", snap.TotalTokensIn)
+	}
+	if snap.TotalTokensOut != 303 {
+		t.Errorf("Snapshot.TotalTokensOut = %d, want 303 (300+3)", snap.TotalTokensOut)
+	}
+}
+
 // TestSetRunProcess_RoundTrip asserts that SetRunProcess writes worker_pid
 // and proc_started_at for a run, visible via the run row (through
 // ReadSnapshot's LatestRun and via ListOpenRuns).

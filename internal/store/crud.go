@@ -248,6 +248,18 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		snap.Issues[i].LatestRun = latest
 	}
 
+	tokensIn, tokensOut, err := s.tokenTotalsByIssue(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	for i := range snap.Issues {
+		id := snap.Issues[i].ID
+		snap.Issues[i].TokensInTotal = tokensIn[id]
+		snap.Issues[i].TokensOutTotal = tokensOut[id]
+		snap.TotalTokensIn += tokensIn[id]
+		snap.TotalTokensOut += tokensOut[id]
+	}
+
 	unmirrored, err := s.unmirroredIssueIDs(ctx)
 	if err != nil {
 		return Snapshot{}, err
@@ -285,6 +297,35 @@ func (s *Store) unmirroredIssueIDs(ctx context.Context) (map[string]bool, error)
 		return nil, fmt.Errorf("iterating unmirrored issue id rows: %w", err)
 	}
 	return ids, nil
+}
+
+// tokenTotalsByIssue returns per-issue cumulative token sums across ALL runs
+// (every lane the issue has passed through), keyed by issue id, via one
+// grouped query rather than a per-issue lookup in ReadSnapshot's loop. A card
+// with no runs yet is simply absent from both maps (zero on lookup).
+func (s *Store) tokenTotalsByIssue(ctx context.Context) (in, out map[string]int, err error) {
+	const q = `SELECT issue_id, COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0) FROM runs GROUP BY issue_id`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading token totals: %w", err)
+	}
+	defer rows.Close()
+
+	in = make(map[string]int)
+	out = make(map[string]int)
+	for rows.Next() {
+		var id string
+		var ti, to int
+		if err := rows.Scan(&id, &ti, &to); err != nil {
+			return nil, nil, fmt.Errorf("scanning token totals row: %w", err)
+		}
+		in[id] = ti
+		out[id] = to
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterating token totals rows: %w", err)
+	}
+	return in, out, nil
 }
 
 // GetIssue fetches the single issue row for id, e.g. so the dispatcher can
