@@ -22,6 +22,10 @@ func buildSnapshot() store.Snapshot {
 			"ready":   1,
 			"todo":    1,
 		},
+		// Board-wide cumulative token totals (store.ReadSnapshot's SUM over all
+		// runs); the TUI header reads these directly.
+		TotalTokensIn:  15,
+		TotalTokensOut: 27,
 		Issues: []store.IssueSnapshot{
 			{
 				Issue: store.Issue{ID: "issue-1", Identifier: "CLP-1", LaneLabel: "agent:coder", BoardStatus: "running"},
@@ -29,6 +33,7 @@ func buildSnapshot() store.Snapshot {
 					RunID: "run-1", IssueID: "issue-1", Status: "running",
 					StartedAt: 100, TurnCount: 2, Attempt: 1, TokensIn: 10, TokensOut: 20,
 				},
+				TokensInTotal: 10, TokensOutTotal: 20,
 			},
 			{
 				Issue: store.Issue{ID: "issue-2", Identifier: "CLP-2", LaneLabel: "agent:reviewer", BoardStatus: "blocked"},
@@ -36,6 +41,7 @@ func buildSnapshot() store.Snapshot {
 					RunID: "run-2", IssueID: "issue-2", Status: "blocked",
 					StartedAt: 50, TurnCount: 1, Attempt: 1, TokensIn: 5, TokensOut: 7,
 				},
+				TokensInTotal: 5, TokensOutTotal: 7,
 			},
 			{
 				Issue:     store.Issue{ID: "issue-3", Identifier: "CLP-3", LaneLabel: "agent:coder", BoardStatus: "ready"},

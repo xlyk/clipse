@@ -30,13 +30,18 @@ type ErrMsg struct {
 }
 
 // Row is one issue's display-ready state: identifier/lane plus its latest
-// run info, flattened out of store.IssueSnapshot so View doesn't need to
-// know about sql.Null* field wrangling.
+// run info and cumulative token usage, flattened out of store.IssueSnapshot so
+// View doesn't need to know about sql.Null* field wrangling.
 type Row struct {
 	Identifier string
 	LaneLabel  string
 	Status     string
 	Run        *store.Run
+
+	// TokensIn/TokensOut are cumulative across every run of this issue (not
+	// just Run, the latest) — the honest per-card usage.
+	TokensIn  int
+	TokensOut int
 }
 
 // Model is the bubbletea model for `clipse tui`. It holds only
@@ -51,6 +56,19 @@ type Model struct {
 
 	tokensIn  int
 	tokensOut int
+
+	// counts is the board-wide status histogram (every board_status, incl.
+	// terminal "done"), for the header's stat chips — not just the four
+	// displayed sections.
+	counts map[string]int
+
+	// width/height track the terminal size (tea.WindowSizeMsg) so View can
+	// size panels responsively; frame drives the running-row spinner
+	// animation, advanced by a fast spinner tick independent of the slower
+	// snapshot refresh.
+	width  int
+	height int
+	frame  int
 
 	lastErr error
 
@@ -102,9 +120,21 @@ func (m Model) TotalTokensOut() int { return m.tokensOut }
 // SnapshotMsg clears it.
 func (m Model) Err() error { return m.lastErr }
 
-// Init starts the refresh loop by scheduling the first tick.
+// spinnerInterval is how often the running-row spinner advances. It is much
+// faster than tickInterval (the snapshot refresh) so the animation is smooth
+// without hammering the store: a spinnerTickMsg only bumps a frame counter, it
+// never reads the DB.
+const spinnerInterval = 120 * time.Millisecond
+
+// spinnerTickMsg advances the spinner animation frame. Distinct from TickMsg
+// (which triggers a snapshot refresh) so animation and data refresh run at
+// independent cadences.
+type spinnerTickMsg struct{}
+
+// Init starts both loops: the snapshot refresh tick and the faster spinner
+// animation tick.
 func (m Model) Init() tea.Cmd {
-	return scheduleTick()
+	return tea.Batch(scheduleTick(), scheduleSpinner())
 }
 
 // Update is the bubbletea state transition: pure and deterministic, no DB
@@ -121,6 +151,15 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	case TickMsg:
 		return m, tea.Batch(m.refresh(), scheduleTick())
+
+	case spinnerTickMsg:
+		m.frame++
+		return m, scheduleSpinner()
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
 
 	case ErrMsg:
 		m.lastErr = msg.Err
@@ -160,6 +199,14 @@ func scheduleTick() tea.Cmd {
 	})
 }
 
+// scheduleSpinner returns a tea.Cmd that fires a spinnerTickMsg after
+// spinnerInterval, driving the running-row spinner animation.
+func scheduleSpinner() tea.Cmd {
+	return tea.Tick(spinnerInterval, func(time.Time) tea.Msg {
+		return spinnerTickMsg{}
+	})
+}
+
 // fold recomputes the Model's grouped rows and token totals from snap. It
 // is deterministic: same snapshot in, same grouping/totals out, regardless
 // of the snapshot's underlying slice/map iteration order.
@@ -168,8 +215,13 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.blocked = m.blocked[:0]
 	m.queued = m.queued[:0]
 	m.inFlight = m.inFlight[:0]
-	m.tokensIn = 0
-	m.tokensOut = 0
+
+	// Board-wide cumulative token spend comes straight from the snapshot's
+	// SUM over every run (see store.ReadSnapshot); it is NOT re-derived from
+	// LatestRun here, which would drop every non-latest lane's usage.
+	m.tokensIn = snap.TotalTokensIn
+	m.tokensOut = snap.TotalTokensOut
+	m.counts = snap.CountsByStatus
 
 	for _, is := range sortedIssueSnapshots(snap.Issues) {
 		row := Row{
@@ -177,10 +229,8 @@ func (m *Model) fold(snap store.Snapshot) {
 			LaneLabel:  is.LaneLabel,
 			Status:     is.BoardStatus,
 			Run:        is.LatestRun,
-		}
-		if is.LatestRun != nil {
-			m.tokensIn += is.LatestRun.TokensIn
-			m.tokensOut += is.LatestRun.TokensOut
+			TokensIn:   is.TokensInTotal,
+			TokensOut:  is.TokensOutTotal,
 		}
 
 		switch is.BoardStatus {
