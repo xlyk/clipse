@@ -1,6 +1,6 @@
 # Clipse — session handoff
 
-**Date:** 2026-07-01 · **Phase:** 0 + 1 complete (on draft PR #1); resuming at **Phase 2** (prerequisite-gated — DAC spike done, target repo = this repo; Linear board pending).
+**Date:** 2026-07-01 · **Phase:** 0 + 1 complete (on draft PR #1); **Phase 2 gate CLEARED** — implementing the DAC coder worker on `feat/phase-2-coder` (draft PR #2).
 
 Resume brief for a fresh Claude Code session (terminal). Read this, then the guide + design + plan, then execute.
 
@@ -20,16 +20,14 @@ Phase 0 (scaffold + JSON-Schema contract + cross-language codegen + CI drift gua
 
 Phase-2 work continues on branch `feat/phase-2-coder`.
 
-## Scope for this run: Phase 2 (real DAC coder worker) — GATED
+## Scope for this run: Phase 2 (real DAC coder worker) — gate CLEARED
 
-Before writing any Phase-2 code, verify these prerequisites and **STOP + report** if any is missing (do not fake or guess around them):
+All prerequisites are met (verified 2026-07-01):
 
-1. **DAC API spike** (do first, blocking) — ✅ **DONE 2026-07-01** against `deepagents_code` 0.1.22. Findings recorded in the design doc's "DAC API spike findings" subsection. Net: wrap DAC as an **in-process LangGraph graph** via `create_cli_agent(...)` (do not shell out to `dcode -n`); the kernel owns the `AsyncSqliteSaver` checkpointer + `thread_id`; **the worker must use `auto_approve=False, interrupt_shell_only=True`** or the shell allow-list is silently dropped.
-2. `ANTHROPIC_API_KEY` — ✅ available (`../agents/apps/estimator-v2/.env`; `sk-ant…`). `gh` — ✅ authenticated (`xlyk`, `repo` scope).
-3. Linear board — ⏳ **workspace `clipse-development` being created**; needs columns `Rework`/`Merging`/`Documentation` and labels `agent:coder|reviewer|git_operator|scribe`; candidate-issue query + branch auto-link verified against it. **Access it via the `linear` CLI (`linear --workspace clipse-development …`), not the MCP.**
+1. **DAC API spike** — ✅ **DONE** against `deepagents_code` 0.1.22. Findings in the design doc's "DAC API spike findings" subsection. Net: wrap DAC as an **in-process LangGraph graph** via `create_cli_agent(...)` (do not shell out to `dcode -n`); the kernel owns the `AsyncSqliteSaver` checkpointer + `thread_id`; **the worker must use `auto_approve=False, interrupt_shell_only=True`** or the shell allow-list is silently dropped.
+2. `ANTHROPIC_API_KEY` — ✅ (`../agents/apps/estimator-v2/.env`; `sk-ant…`). `gh` — ✅ (`xlyk`, `repo` scope).
+3. Linear board — ✅ **workspace `clipse-development`, team `CLI` (id `8b5b3301-8da3-4933-9b07-9efc027bc09d`)**. Workflow states created to match `internal/linear/status.go`: `Todo · Ready · Running · Review · Merging · Documentation · Done · Rework · Blocked` (+ Backlog/Canceled/Duplicate). Labels `agent:coder|reviewer|git_operator|scribe` created. **`LINEAR_API_KEY` in `~/.secrets` now → clipse-development** (old reflex key commented; backup `~/.secrets.bak.clipse`). Access via the `linear` CLI in **env-key mode** (`LINEAR_API_KEY` set ⇒ do NOT pass `--workspace`; e.g. `linear api '{ … }'`). Still TODO (non-blocking): connect Linear's **GitHub integration** to `xlyk/clipse` for PR↔issue auto-link.
 4. Target repo — ✅ **`xlyk/clipse` itself** (private, default `main`). Phase 2 only *opens* PRs (no merge), so this is fine as-is. ⚠️ `main` has **no branch protection / required checks yet** — stand these up before Phase-3 CI-gated auto-merge.
-
-If prerequisites aren't ready, do the DAC spike + any doc updates, then stop.
 
 ## How to execute
 
