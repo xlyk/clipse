@@ -8,6 +8,8 @@ import "database/sql"
 type Issue struct {
 	ID           string
 	Identifier   string
+	Title        string
+	Description  string
 	LaneLabel    string
 	BoardStatus  string
 	Deps         string

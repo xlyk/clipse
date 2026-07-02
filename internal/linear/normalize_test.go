@@ -89,6 +89,26 @@ func TestNormalizeCandidateIssues_FromFixture(t *testing.T) {
 		}
 	})
 
+	t.Run("title and description parsed", func(t *testing.T) {
+		got := byIdentifier["CLP-12"]
+		if got.Title != "Add the thing" {
+			t.Errorf("Title = %q, want %q", got.Title, "Add the thing")
+		}
+		if got.Description != "Implement the thing that does the stuff." {
+			t.Errorf("Description = %q, want %q", got.Description, "Implement the thing that does the stuff.")
+		}
+
+		// CLP-13's fixture description is an explicit empty string -- must
+		// parse as "", not be mistaken for a missing/omitted field.
+		got13 := byIdentifier["CLP-13"]
+		if got13.Title != "Review the thing" {
+			t.Errorf("CLP-13 Title = %q, want %q", got13.Title, "Review the thing")
+		}
+		if got13.Description != "" {
+			t.Errorf("CLP-13 Description = %q, want empty", got13.Description)
+		}
+	})
+
 	t.Run("no agent label leaves lane empty, not an error", func(t *testing.T) {
 		got := byIdentifier["CLP-14"]
 		if got.Lane != "" {

@@ -12,6 +12,8 @@ var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS issues (
 		id            TEXT PRIMARY KEY,
 		identifier    TEXT NOT NULL,
+		title         TEXT NOT NULL DEFAULT '',
+		description   TEXT NOT NULL DEFAULT '',
 		lane_label    TEXT NOT NULL DEFAULT '',
 		board_status  TEXT NOT NULL DEFAULT '',
 		deps          TEXT NOT NULL DEFAULT '[]',
@@ -79,6 +81,15 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	if err := addColumnIfMissing(db, "runs", "proc_started_at", "INTEGER"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	// title/description (Phase-2 issue-text plumbing): the CREATE TABLE
+	// above already carries both for a fresh database; these retrofit a
+	// database migrated before either column existed.
+	if err := addColumnIfMissing(db, "issues", "title", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	if err := addColumnIfMissing(db, "issues", "description", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("applying migration: %w", err)
 	}
 	return nil

@@ -30,7 +30,7 @@ func TestTick_PollCachesCandidatesFromLinear(t *testing.T) {
 	s := openTestStore(t)
 	lc := &linear.MockClient{
 		Issues: []linear.Issue{
-			{ID: "issue-1", Identifier: "CLP-1", Status: "ready", Lane: "coder", Priority: 1, BranchName: "clp-1", UpdatedAt: 100},
+			{ID: "issue-1", Identifier: "CLP-1", Title: "Add the thing", Description: "Implement the thing.", Status: "ready", Lane: "coder", Priority: 1, BranchName: "clp-1", UpdatedAt: 100},
 			{ID: "issue-2", Identifier: "CLP-2", Status: "todo", Lane: "", Deps: []string{"issue-1"}, Priority: 0, BranchName: "clp-2", UpdatedAt: 200},
 		},
 	}
@@ -65,6 +65,21 @@ func TestTick_PollCachesCandidatesFromLinear(t *testing.T) {
 	}
 	if byLane["issue-2"] != "" {
 		t.Errorf("issue-2 lane_label = %q, want empty", byLane["issue-2"])
+	}
+
+	// title/description must flow from Linear into the store (Phase-2
+	// issue-text plumbing): this is what lets a later claim carry them into
+	// the worker's CLIPSE_ISSUE_TEXT. ReadSnapshot's Issue projection
+	// doesn't select these columns, so read back via GetIssue instead.
+	got1, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue(issue-1): unexpected error: %v", err)
+	}
+	if got1.Title != "Add the thing" {
+		t.Errorf("issue-1 Title = %q, want %q", got1.Title, "Add the thing")
+	}
+	if got1.Description != "Implement the thing." {
+		t.Errorf("issue-1 Description = %q, want %q", got1.Description, "Implement the thing.")
 	}
 }
 

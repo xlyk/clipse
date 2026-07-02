@@ -7,16 +7,19 @@ import (
 
 	"github.com/xlyk/clipse/dispatcher"
 	"github.com/xlyk/clipse/internal/linear"
+	"github.com/xlyk/clipse/internal/store"
 )
 
 // TestSpawnAttempt_DefaultEnvFor_FiltersToConfiguredAllowlist proves the
 // production gap this task closes: constructed exactly the way
 // cli/dispatch.go's runDispatch wires the real Dispatcher (no WithEnvFor
-// override), a claimed issue's spawned worker gets an environment built
-// ONLY from cfg.EnvAllowlist. A real LINEAR_API_KEY the dispatcher process
-// holds (as production always does, per the design doc) must never reach
-// the worker, while an allow-listed secret and the TESTWORKER_SCENARIO
-// passthrough kernel tests rely on both still do.
+// override), a claimed issue's spawned worker gets an environment built from
+// cfg.EnvAllowlist PLUS a dispatcher-computed CLIPSE_ISSUE_TEXT (the claimed
+// issue's title/description -- see defaultEnvFor/issueText). A real
+// LINEAR_API_KEY the dispatcher process holds (as production always does,
+// per the design doc) must never reach the worker, while an allow-listed
+// secret, the TESTWORKER_SCENARIO passthrough kernel tests rely on, and
+// CLIPSE_ISSUE_TEXT itself all still do.
 func TestSpawnAttempt_DefaultEnvFor_FiltersToConfiguredAllowlist(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "kernel-only-secret")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-worker-secret")
@@ -24,7 +27,25 @@ func TestSpawnAttempt_DefaultEnvFor_FiltersToConfiguredAllowlist(t *testing.T) {
 	t.Setenv("SOME_UNRELATED_VAR", "should-not-leak-either")
 
 	s := openTestStore(t)
-	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+	ctx := context.Background()
+	// Built directly (rather than via seedReadyIssue) so the claimed issue
+	// carries title/description -- what CLIPSE_ISSUE_TEXT is computed from.
+	if err := s.UpsertIssue(ctx, store.Issue{
+		ID:          "issue-1",
+		Identifier:  "issue-1",
+		Title:       "Add the thing",
+		Description: "Implement the thing that does the stuff.",
+		LaneLabel:   "coder",
+		BoardStatus: "ready",
+		Deps:        `[]`,
+		Priority:    1,
+		BranchName:  "issue-1-branch",
+		UpdatedAt:   100,
+		LastSeen:    100,
+		CreatedAt:   100,
+	}); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
 
 	lc := &linear.MockClient{}
 	spawner := newFakeSpawner()
@@ -39,7 +60,7 @@ func TestSpawnAttempt_DefaultEnvFor_FiltersToConfiguredAllowlist(t *testing.T) {
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 	)
 
-	if err := d.Tick(context.Background()); err != nil {
+	if err := d.Tick(ctx); err != nil {
 		t.Fatalf("Tick: unexpected error: %v", err)
 	}
 
@@ -61,7 +82,7 @@ func TestSpawnAttempt_DefaultEnvFor_FiltersToConfiguredAllowlist(t *testing.T) {
 	}
 
 	for key := range got {
-		if key != "ANTHROPIC_API_KEY" && key != "PATH" && key != "TESTWORKER_SCENARIO" {
+		if key != "ANTHROPIC_API_KEY" && key != "PATH" && key != "TESTWORKER_SCENARIO" && key != "CLIPSE_ISSUE_TEXT" {
 			t.Errorf("worker env contains non-allowlisted key %q (env=%v)", key, specs[0].Env)
 		}
 	}
@@ -79,5 +100,14 @@ func TestSpawnAttempt_DefaultEnvFor_FiltersToConfiguredAllowlist(t *testing.T) {
 	}
 	if v := got["TESTWORKER_SCENARIO"]; v != "needs_review" {
 		t.Errorf("worker env TESTWORKER_SCENARIO = %q, want needs_review (kernel-test passthrough)", v)
+	}
+
+	// The dispatcher-computed value this task adds: present regardless of
+	// the allow-list, built from the claimed issue's title/description.
+	wantIssueText := "Add the thing\n\nImplement the thing that does the stuff."
+	if v, ok := got["CLIPSE_ISSUE_TEXT"]; !ok {
+		t.Errorf("worker env missing CLIPSE_ISSUE_TEXT (env=%v)", specs[0].Env)
+	} else if v != wantIssueText {
+		t.Errorf("worker env CLIPSE_ISSUE_TEXT = %q, want %q", v, wantIssueText)
 	}
 }

@@ -39,6 +39,8 @@ func (d *Dispatcher) pollAndUpsert(ctx context.Context) error {
 		row := store.Issue{
 			ID:          li.ID,
 			Identifier:  li.Identifier,
+			Title:       li.Title,
+			Description: li.Description,
 			LaneLabel:   li.Lane,
 			BoardStatus: li.Status,
 			Deps:        string(deps),

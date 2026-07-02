@@ -11,12 +11,19 @@ import (
 // issue.
 //
 // Conflict behavior (on a matching id): only the Linear-sourced intent
-// columns (identifier, lane_label, deps, priority, branch_name, updated_at)
-// plus last_seen are overwritten. board_status, claim_lock, and claim_expires
-// are dispatcher-owned runtime state: they are set on the initial insert and
-// never touched on conflict, so a re-poll of Linear can neither clobber an
-// in-flight claim nor reset a dispatcher-driven status (e.g. running/review).
-// created_at is preserved from the original insert.
+// columns (identifier, title, description, lane_label, deps, priority,
+// branch_name, updated_at) plus last_seen are overwritten. board_status,
+// claim_lock, and claim_expires are dispatcher-owned runtime state: they are
+// set on the initial insert and never touched on conflict, so a re-poll of
+// Linear can neither clobber an in-flight claim nor reset a
+// dispatcher-driven status (e.g. running/review). created_at is preserved
+// from the original insert.
+//
+// title/description round-trip here purely as cached Linear content (the
+// dispatcher's CLIPSE_ISSUE_TEXT env injection reads them off a claimed
+// issue) -- they carry no special claim/board semantics of their own, so an
+// edited Linear title/description simply updates like identifier/priority
+// on every re-poll, even while the issue is running under an active claim.
 //
 // board_status transitions after insert are made only by dispatcher-owned
 // paths (the CAS claim + the state machine, added in later tasks). Reflecting
@@ -25,11 +32,13 @@ import (
 func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 	const q = `
 		INSERT INTO issues (
-			id, identifier, lane_label, board_status, deps, priority,
+			id, identifier, title, description, lane_label, board_status, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET
 			identifier   = excluded.identifier,
+			title        = excluded.title,
+			description  = excluded.description,
 			lane_label   = excluded.lane_label,
 			deps         = excluded.deps,
 			priority     = excluded.priority,
@@ -38,7 +47,7 @@ func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 			last_seen    = excluded.last_seen
 	`
 	_, err := s.db.ExecContext(ctx, q,
-		issue.ID, issue.Identifier, issue.LaneLabel, issue.BoardStatus, issue.Deps, issue.Priority,
+		issue.ID, issue.Identifier, issue.Title, issue.Description, issue.LaneLabel, issue.BoardStatus, issue.Deps, issue.Priority,
 		issue.BranchName, issue.ClaimLock, issue.ClaimExpires, issue.UpdatedAt, issue.LastSeen, issue.CreatedAt,
 	)
 	if err != nil {
@@ -282,14 +291,14 @@ func (s *Store) unmirroredIssueIDs(ctx context.Context) (map[string]bool, error)
 // transition without paying for a full ReadSnapshot.
 func (s *Store) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	const q = `
-		SELECT id, identifier, lane_label, board_status, deps, priority,
+		SELECT id, identifier, title, description, lane_label, board_status, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
 		FROM issues
 		WHERE id = ?
 	`
 	var issue Issue
 	err := s.db.QueryRowContext(ctx, q, id).Scan(
-		&issue.ID, &issue.Identifier, &issue.LaneLabel, &issue.BoardStatus, &issue.Deps, &issue.Priority,
+		&issue.ID, &issue.Identifier, &issue.Title, &issue.Description, &issue.LaneLabel, &issue.BoardStatus, &issue.Deps, &issue.Priority,
 		&issue.BranchName, &issue.ClaimLock, &issue.ClaimExpires, &issue.UpdatedAt, &issue.LastSeen, &issue.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {

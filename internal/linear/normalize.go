@@ -19,12 +19,14 @@ type candidateIssuesResponse struct {
 
 // issueNode mirrors one issue node as shaped by candidateIssuesQuery.
 type issueNode struct {
-	ID         string `json:"id"`
-	Identifier string `json:"identifier"`
-	Priority   int    `json:"priority"`
-	BranchName string `json:"branchName"`
-	UpdatedAt  string `json:"updatedAt"`
-	State      struct {
+	ID          string `json:"id"`
+	Identifier  string `json:"identifier"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Priority    int    `json:"priority"`
+	BranchName  string `json:"branchName"`
+	UpdatedAt   string `json:"updatedAt"`
+	State       struct {
 		Name string `json:"name"`
 	} `json:"state"`
 	Labels struct {
@@ -85,13 +87,15 @@ func normalizeIssueNode(n issueNode) (Issue, error) {
 	}
 
 	return Issue{
-		ID:         n.ID,
-		Identifier: n.Identifier,
-		Status:     statusFromWorkflowName(n.State.Name),
-		Lane:       laneFromLabels(labelNames),
-		Deps:       deps,
-		Priority:   n.Priority,
-		BranchName: n.BranchName,
-		UpdatedAt:  updatedAt.Unix(),
+		ID:          n.ID,
+		Identifier:  n.Identifier,
+		Title:       n.Title,
+		Description: n.Description,
+		Status:      statusFromWorkflowName(n.State.Name),
+		Lane:        laneFromLabels(labelNames),
+		Deps:        deps,
+		Priority:    n.Priority,
+		BranchName:  n.BranchName,
+		UpdatedAt:   updatedAt.Unix(),
 	}, nil
 }

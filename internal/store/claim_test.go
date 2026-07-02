@@ -126,6 +126,45 @@ func TestClaimReady_ExactlyOneWinnerUnderConcurrency(t *testing.T) {
 	}
 }
 
+// TestClaimReady_IncludesTitleAndDescription asserts the Issue ClaimReady
+// returns (Claim.Issue) carries title/description: this is the exact value
+// the dispatcher's spawnAttempt feeds into CLIPSE_ISSUE_TEXT, so a claim
+// that dropped these fields would silently hand the worker an empty prompt.
+func TestClaimReady_IncludesTitleAndDescription(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const lane = "agent:coder"
+
+	issue := store.Issue{
+		ID:          "issue-1",
+		Identifier:  "CLP-1",
+		Title:       "Add the thing",
+		Description: "Implement the thing that does the stuff.",
+		LaneLabel:   lane,
+		BoardStatus: "ready",
+		Deps:        `[]`,
+		Priority:    1,
+		BranchName:  "clp-1-branch",
+		UpdatedAt:   100,
+		LastSeen:    100,
+		CreatedAt:   100,
+	}
+	if err := s.UpsertIssue(ctx, issue); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	claim, err := s.ClaimReady(ctx, lane, "run-1", 1000, 60)
+	if err != nil {
+		t.Fatalf("ClaimReady: unexpected error: %v", err)
+	}
+	if claim.Issue.Title != "Add the thing" {
+		t.Errorf("claim.Issue.Title = %q, want %q", claim.Issue.Title, "Add the thing")
+	}
+	if claim.Issue.Description != "Implement the thing that does the stuff." {
+		t.Errorf("claim.Issue.Description = %q, want %q", claim.Issue.Description, "Implement the thing that does the stuff.")
+	}
+}
+
 func TestClaimReady_NoReadyIssues(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/xlyk/clipse/internal/config"
 	"github.com/xlyk/clipse/internal/contract"
@@ -156,17 +158,46 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 }
 
 // defaultEnvFor is New's default envFor, overridable via WithEnvFor: it
-// ignores the issue (Phase 2 has no per-lane secret differences yet — see
-// config.Config.EnvAllowlist) and returns the dispatcher's own environment
-// filtered down to allowlist via spawn.AllowlistedEnv. This is what keeps a
-// spawned worker from ever inheriting LINEAR_API_KEY or anything else the
-// dispatcher process holds that isn't explicitly allow-listed (design doc
-// threat model, B3) — closing the gap where an unset envFor previously left
-// WorkerSpec.Env nil, which exec.Cmd.Env treats as "inherit everything".
+// returns the dispatcher's own environment filtered down to allowlist via
+// spawn.AllowlistedEnv (config.Config.EnvAllowlist — Phase 2 has no
+// per-lane secret differences yet), plus one dispatcher-computed addition:
+// CLIPSE_ISSUE_TEXT, set from issue's own title/description (see issueText).
+// The filtered env is what keeps a spawned worker from ever inheriting
+// LINEAR_API_KEY or anything else the dispatcher process holds that isn't
+// explicitly allow-listed (design doc threat model, B3) — closing the gap
+// where an unset envFor previously left WorkerSpec.Env nil, which
+// exec.Cmd.Env treats as "inherit everything". CLIPSE_ISSUE_TEXT closes a
+// second gap: it's not copied from the dispatcher's own environment at all
+// (an allowlist entry could never produce it), so it's appended unconditionally
+// rather than run through AllowlistedEnv — otherwise the Coder lane's
+// graphs/coder.py load_context has no task text to give the DAC agent and
+// every run fails with "user messages must have non-empty content".
 func defaultEnvFor(allowlist []string) func(store.Issue) []string {
-	return func(store.Issue) []string {
-		return spawn.AllowlistedEnv(os.Environ(), allowlist)
+	return func(issue store.Issue) []string {
+		env := spawn.AllowlistedEnv(os.Environ(), allowlist)
+		return append(env, clipseIssueTextEnvVar+"="+issueText(issue))
 	}
+}
+
+// clipseIssueTextEnvVar is the environment variable the Coder lane's
+// graphs/coder.py load_context falls back to reading
+// (os.environ.get("CLIPSE_ISSUE_TEXT", "")) when the worker invocation
+// didn't pass issue_text directly — which worker.py never does, so this env
+// var is the ONLY production path that gets an issue's task text to the
+// worker.
+const clipseIssueTextEnvVar = "CLIPSE_ISSUE_TEXT"
+
+// issueText composes the worker-facing task text for issue: its title, plus
+// a blank-line-separated description when non-empty (just the title
+// otherwise). Trailing whitespace is stripped so a Linear issue with a
+// trailing newline in its description doesn't leak one into the env var's
+// value.
+func issueText(issue store.Issue) string {
+	text := issue.Title
+	if issue.Description != "" {
+		text += "\n\n" + issue.Description
+	}
+	return strings.TrimRightFunc(text, unicode.IsSpace)
 }
 
 // newRandomRunID generates a unique run id via crypto/rand: 16 random bytes

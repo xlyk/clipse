@@ -83,6 +83,27 @@ func TestHTTPClient_CandidateIssues_ParsesLoopbackResponse(t *testing.T) {
 		t.Fatalf("BuildCandidateIssuesRequest: unexpected error: %v", err)
 	}
 	assertJSONEqual(t, gotBody, want)
+
+	// title/description must round-trip end to end through the real
+	// HTTPClient (query -> loopback response -> NormalizeCandidateIssues),
+	// not just through NormalizeCandidateIssues in isolation -- this is the
+	// worker's task text (CLIPSE_ISSUE_TEXT), so a query missing these
+	// fields would silently empty it in production.
+	var got12 *linear.Issue
+	for i := range issues {
+		if issues[i].Identifier == "CLP-12" {
+			got12 = &issues[i]
+		}
+	}
+	if got12 == nil {
+		t.Fatalf("issues = %+v, want an entry for CLP-12", issues)
+	}
+	if got12.Title != "Add the thing" {
+		t.Errorf("CLP-12 Title = %q, want %q", got12.Title, "Add the thing")
+	}
+	if got12.Description != "Implement the thing that does the stuff." {
+		t.Errorf("CLP-12 Description = %q, want %q", got12.Description, "Implement the thing that does the stuff.")
+	}
 }
 
 func TestHTTPClient_Comment_SendsExactBody(t *testing.T) {

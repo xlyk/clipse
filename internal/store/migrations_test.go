@@ -111,6 +111,96 @@ func TestOpen_AddsProcStartedAtToPreExistingRunsTable(t *testing.T) {
 	}
 }
 
+// TestOpen_MigratesEmptyDB_IssuesHasTitleAndDescription asserts that a fresh
+// issues table includes the title/description columns the dispatcher needs
+// to build a claimed issue's CLIPSE_ISSUE_TEXT (Phase-2 issue-text plumbing).
+func TestOpen_MigratesEmptyDB_IssuesHasTitleAndDescription(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clipse.db")
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("Open: unexpected error: %v", err)
+	}
+	defer s.Close()
+
+	if !hasColumn(t, s.DB(), "issues", "title") {
+		t.Errorf("issues table missing title column after migrating an empty db")
+	}
+	if !hasColumn(t, s.DB(), "issues", "description") {
+		t.Errorf("issues table missing description column after migrating an empty db")
+	}
+}
+
+// TestOpen_AddsTitleDescriptionToPreExistingIssuesTable simulates a database
+// that was migrated before title/description existed on the issues table
+// (i.e. a pre-existing issues table lacking both columns). Open must add
+// them additively without erroring, and re-running Open again must remain a
+// no-op.
+func TestOpen_AddsTitleDescriptionToPreExistingIssuesTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clipse.db")
+
+	// Build a "legacy" issues table missing title/description, bypassing
+	// the store package's own migrations entirely.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: unexpected error: %v", err)
+	}
+	const legacyIssuesTable = `CREATE TABLE issues (
+		id            TEXT PRIMARY KEY,
+		identifier    TEXT NOT NULL,
+		lane_label    TEXT NOT NULL DEFAULT '',
+		board_status  TEXT NOT NULL DEFAULT '',
+		deps          TEXT NOT NULL DEFAULT '[]',
+		priority      INTEGER NOT NULL DEFAULT 0,
+		branch_name   TEXT NOT NULL DEFAULT '',
+		claim_lock    TEXT,
+		claim_expires INTEGER,
+		updated_at    INTEGER NOT NULL DEFAULT 0,
+		last_seen     INTEGER NOT NULL DEFAULT 0,
+		created_at    INTEGER NOT NULL DEFAULT 0
+	)`
+	if _, err := db.Exec(legacyIssuesTable); err != nil {
+		t.Fatalf("creating legacy issues table: %v", err)
+	}
+	if hasColumn(t, db, "issues", "title") || hasColumn(t, db, "issues", "description") {
+		t.Fatalf("legacy issues table unexpectedly already has title/description")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing legacy db: %v", err)
+	}
+
+	// Opening through the store package must add the missing columns.
+	s1, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("first Open: unexpected error: %v", err)
+	}
+	if !hasColumn(t, s1.DB(), "issues", "title") {
+		t.Fatalf("issues table still missing title after Open")
+	}
+	if !hasColumn(t, s1.DB(), "issues", "description") {
+		t.Fatalf("issues table still missing description after Open")
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("first Close: unexpected error: %v", err)
+	}
+
+	// Re-opening (re-migrating) an already-patched database must be a no-op:
+	// no error, both columns still present exactly once.
+	s2, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("second Open: unexpected error: %v", err)
+	}
+	defer s2.Close()
+	if !hasColumn(t, s2.DB(), "issues", "title") {
+		t.Errorf("issues table missing title after re-Open")
+	}
+	if !hasColumn(t, s2.DB(), "issues", "description") {
+		t.Errorf("issues table missing description after re-Open")
+	}
+}
+
 // hasColumn reports whether table has a column named col, using
 // PRAGMA table_info.
 func hasColumn(t *testing.T, db *sql.DB, table, col string) bool {

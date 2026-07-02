@@ -50,7 +50,7 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 	defer tx.Rollback() //nolint:errcheck // no-op if already committed
 
 	const selectQ = `
-		SELECT id, identifier, lane_label, board_status, deps, priority,
+		SELECT id, identifier, title, description, lane_label, board_status, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
 		FROM issues
 		WHERE board_status = 'ready' AND claim_lock IS NULL AND lane_label = ?
@@ -62,7 +62,7 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 	`
 	var issue Issue
 	err = tx.QueryRowContext(ctx, selectQ, laneLabel).Scan(
-		&issue.ID, &issue.Identifier, &issue.LaneLabel, &issue.BoardStatus, &issue.Deps, &issue.Priority,
+		&issue.ID, &issue.Identifier, &issue.Title, &issue.Description, &issue.LaneLabel, &issue.BoardStatus, &issue.Deps, &issue.Priority,
 		&issue.BranchName, &issue.ClaimLock, &issue.ClaimExpires, &issue.UpdatedAt, &issue.LastSeen, &issue.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {

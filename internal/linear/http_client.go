@@ -20,9 +20,14 @@ const apiURL = "https://api.linear.app/graphql"
 const apiKeyEnvVar = "LINEAR_API_KEY"
 
 // CandidateIssuesQuery fetches active-state issues on the configured team
-// along with the fields NormalizeCandidateIssues needs: workflow state name,
-// agent:<lane> labels, blocks/blocked-by relations, priority, branch name,
-// and updatedAt.
+// along with the fields NormalizeCandidateIssues needs: title, description,
+// workflow state name, agent:<lane> labels, blocks/blocked-by relations,
+// priority, branch name, and updatedAt.
+//
+// title/description are the task text a Coder-lane worker actually needs to
+// do the work (the dispatcher injects them into the worker's environment as
+// CLIPSE_ISSUE_TEXT) -- without them here, that env var is always empty
+// regardless of anything downstream.
 //
 // Excluding the terminal state types (Linear has no "active" type; the real
 // types are backlog/unstarted/started/completed/canceled/triage, plus
@@ -36,6 +41,8 @@ const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
     nodes {
       id
       identifier
+      title
+      description
       priority
       branchName
       updatedAt

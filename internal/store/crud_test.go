@@ -130,6 +130,8 @@ func TestGetIssue_RoundTrip(t *testing.T) {
 	issue := store.Issue{
 		ID:          "issue-1",
 		Identifier:  "CLP-1",
+		Title:       "Add the thing",
+		Description: "Implement the thing that does the stuff.",
 		LaneLabel:   "agent:coder",
 		BoardStatus: "running",
 		Deps:        `["issue-0"]`,
@@ -148,8 +150,85 @@ func TestGetIssue_RoundTrip(t *testing.T) {
 		t.Fatalf("GetIssue: unexpected error: %v", err)
 	}
 	if got.ID != issue.ID || got.Identifier != issue.Identifier || got.BoardStatus != issue.BoardStatus ||
-		got.Deps != issue.Deps || got.Priority != issue.Priority {
+		got.Deps != issue.Deps || got.Priority != issue.Priority ||
+		got.Title != issue.Title || got.Description != issue.Description {
 		t.Errorf("GetIssue = %+v, want %+v", got, issue)
+	}
+}
+
+// TestUpsertIssue_TitleDescription_InsertAndConflictUpdate asserts title and
+// description are written on the initial insert, updated on a later
+// conflicting upsert (a re-poll picking up an edited Linear issue) alongside
+// the other Linear-sourced fields, while board_status -- dispatcher-owned
+// runtime state -- stays preserved across that same conflict. Title/
+// description feed the worker's CLIPSE_ISSUE_TEXT (Phase-2 issue-text
+// plumbing), so they must behave like every other Linear-sourced field, not
+// like claim state.
+func TestUpsertIssue_TitleDescription_InsertAndConflictUpdate(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	seeded := store.Issue{
+		ID:          "issue-1",
+		Identifier:  "CLP-1",
+		Title:       "Original title",
+		Description: "Original description.",
+		LaneLabel:   "coder",
+		BoardStatus: "running",
+		Deps:        `[]`,
+		Priority:    1,
+		BranchName:  "clp-1-do-thing",
+		UpdatedAt:   100,
+		LastSeen:    100,
+		CreatedAt:   100,
+	}
+	if err := s.UpsertIssue(ctx, seeded); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.Title != "Original title" || got.Description != "Original description." {
+		t.Errorf("after insert: Title=%q Description=%q, want %q / %q",
+			got.Title, got.Description, "Original title", "Original description.")
+	}
+
+	// A re-poll of Linear: the issue was edited (new title/description) and
+	// Linear still reports its pre-claim status ("ready"), the same kind of
+	// staleness TestUpsertIssue_ConflictPreservesDispatcherState covers for
+	// the other fields.
+	edited := store.Issue{
+		ID:          "issue-1",
+		Identifier:  "CLP-1",
+		Title:       "Edited title",
+		Description: "Edited description.",
+		LaneLabel:   "coder",
+		BoardStatus: "ready",
+		Deps:        `[]`,
+		Priority:    1,
+		BranchName:  "clp-1-do-thing",
+		UpdatedAt:   200,
+		LastSeen:    200,
+		CreatedAt:   100,
+	}
+	if err := s.UpsertIssue(ctx, edited); err != nil {
+		t.Fatalf("conflict UpsertIssue: unexpected error: %v", err)
+	}
+
+	got2, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue after conflict: unexpected error: %v", err)
+	}
+	if got2.Title != "Edited title" {
+		t.Errorf("Title = %q, want updated %q", got2.Title, "Edited title")
+	}
+	if got2.Description != "Edited description." {
+		t.Errorf("Description = %q, want updated %q", got2.Description, "Edited description.")
+	}
+	if got2.BoardStatus != "running" {
+		t.Errorf("BoardStatus = %q, want preserved %q (dispatcher-owned; a poll must not reset it)", got2.BoardStatus, "running")
 	}
 }
 
