@@ -118,7 +118,7 @@ func (d *Dispatcher) blockOnSpawnFailure(ctx context.Context, issueID, runID, la
 		RunStatus:       "blocked",
 		RunError:        cause.Error(),
 		EnqueueSetState: true,
-		Comment:         fmt.Sprintf("blocked: %s", cause.Error()),
+		Comment:         blockedComment("", cause.Error()),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),

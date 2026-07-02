@@ -113,7 +113,7 @@ func (d *Dispatcher) blockRun(ctx context.Context, issue store.Issue, runID, lan
 		RunStatus:       "blocked",
 		RunError:        reason,
 		EnqueueSetState: true,
-		Comment:         fmt.Sprintf("blocked: %s", reason),
+		Comment:         blockedComment("", reason),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),
@@ -248,7 +248,7 @@ func (d *Dispatcher) blockIfReworkCapExceeded(ctx context.Context, issue store.I
 		TokensIn:        result.Tokens.In,
 		TokensOut:       result.Tokens.Out,
 		EnqueueSetState: true,
-		Comment:         reason,
+		Comment:         reworkCapComment(d.cfg.ReworkCap, result),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),
@@ -295,25 +295,20 @@ func commentFor(outcome, lane string, result contract.WorkerResult) string {
 	case outcome == string(contract.WorkerResultOutcomeBlocked):
 		return blockCommentFor(result)
 	case outcome == string(contract.WorkerResultOutcomeChangesRequested) && lane == string(contract.LaneGitOperator):
-		if result.Summary != "" {
-			return fmt.Sprintf("rework: %s", result.Summary)
-		}
-		return "rework: stale base conflict"
+		return changesRequestedComment(result.Summary)
 	default:
 		return ""
 	}
 }
 
 // blockCommentFor renders the Linear comment body for a "blocked" outcome
-// from the worker's own block_kind + summary, so a human reviewing the
-// Blocked column in Linear sees why without opening the store.
+// from the worker's own block_kind + summary (see comment.go's blockedComment
+// for the markdown shape), so a human reviewing the Blocked column in Linear
+// sees why without opening the store.
 func blockCommentFor(w contract.WorkerResult) string {
-	kind := "unknown"
+	kind := ""
 	if w.BlockKind != nil {
 		kind = string(*w.BlockKind)
 	}
-	if w.Summary != "" {
-		return fmt.Sprintf("blocked (%s): %s", kind, w.Summary)
-	}
-	return fmt.Sprintf("blocked (%s)", kind)
+	return blockedComment(kind, w.Summary)
 }

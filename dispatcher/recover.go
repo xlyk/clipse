@@ -132,7 +132,7 @@ func (d *Dispatcher) blockOrphan(ctx context.Context, issue store.Issue, run sto
 		CloseRunID:      run.RunID,
 		RunStatus:       "orphaned",
 		EnqueueSetState: true,
-		Comment:         reason,
+		Comment:         blockedComment("", reason),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),
