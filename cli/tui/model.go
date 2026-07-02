@@ -299,15 +299,11 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// pointerOverActivity reports whether (x,y) lands in the activity pane rather
-// than the pipeline pane, to route a dashboard wheel-scroll. In the two-column
-// layout the split is horizontal (past the left panel's border + gap column);
-// stacked, it is vertical (below the pipeline panel).
-func (m Model) pointerOverActivity(x, y int) bool {
+// pointerOverActivity reports whether y lands in the activity pane rather than
+// the pipeline pane, to route a dashboard wheel-scroll. The panels stack, so
+// the split is vertical: the activity band sits below the pipeline panel.
+func (m Model) pointerOverActivity(_, y int) bool {
 	d := m.dims()
-	if d.twoCol {
-		return x > d.leftW+2
-	}
 	return y >= d.headerH+d.tabsH+d.pipeH
 }
 

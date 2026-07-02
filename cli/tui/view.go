@@ -97,13 +97,11 @@ type layoutDims struct {
 	footerH        int
 	bodyH          int // rows available to the body between tabs and footer
 
-	twoCol        bool
-	leftW, rightW int // .Width() args for the pipeline / activity columns
-	pipeTextW     int
-	actTextW      int
-	pipeH, actH   int // full heights of the two panels
-	pipeVpH       int // pipeline viewport height (panel − border − title)
-	actVpH        int
+	pipeTextW   int
+	actTextW    int
+	pipeH, actH int // full heights of the stacked pipeline / activity panels
+	pipeVpH     int // pipeline viewport height (panel − border − title)
+	actVpH      int
 }
 
 // dims computes the frame geometry. It is pure (now=0 into the measured
@@ -125,20 +123,14 @@ func (m Model) dims() layoutDims {
 	d.footerH = lipgloss.Height(m.renderFooter(d.cw))
 	d.bodyH = maxInt(h-d.headerH-d.tabsH-d.footerH, 6)
 
-	// Two side-by-side panels when there's room; otherwise stack them.
-	d.twoCol = w >= 100
-	if d.twoCol {
-		avail := w - 5 // left(+2 border) + gap(1) + right(+2 border)
-		d.leftW = maxInt(avail*56/100, 30)
-		d.rightW = avail - d.leftW
-		d.pipeH, d.actH = d.bodyH, d.bodyH
-	} else {
-		d.leftW, d.rightW = d.cw, d.cw
-		d.pipeH = maxInt(d.bodyH*3/5, 4)
-		d.actH = maxInt(d.bodyH-d.pipeH, 3)
-	}
-	d.pipeTextW = maxInt(d.leftW-2, 8)
-	d.actTextW = maxInt(d.rightW-2, 8)
+	// Panels stack vertically: PIPELINE on top, the ACTIVITY feed as a
+	// full-width band below it (the feed reads better full-width under the
+	// pipeline than squeezed into a side column). Activity gets a bounded
+	// bottom band so the pipeline keeps the majority of the height.
+	d.actH = clampInt(d.bodyH*2/5, 6, 18)
+	d.pipeH = maxInt(d.bodyH-d.actH, 4)
+	d.pipeTextW = maxInt(d.cw-2, 8)
+	d.actTextW = maxInt(d.cw-2, 8)
 	d.pipeVpH = maxInt(d.pipeH-3, 1) // border(2) + title(1)
 	d.actVpH = maxInt(d.actH-3, 1)
 	return d
@@ -164,11 +156,11 @@ func (m Model) View() string {
 	}
 }
 
-// renderDashboard is the default view: a dense header, a tab bar, a two-column
-// body (the PIPELINE panel beside the ACTIVITY feed) that fills the whole
-// terminal height, and a pinned footer. On a narrow terminal the two panels
-// stack instead. Every region is sized from dims() so header+tabs+body+footer
-// sum to exactly the frame height — no dead space, footer flush to the bottom.
+// renderDashboard is the default view: a dense header, a tab bar, a stacked
+// body (the PIPELINE panel above the full-width ACTIVITY feed) that fills the
+// whole terminal height, and a pinned footer. Every region is sized from
+// dims() so header+tabs+body+footer sum to exactly the frame height — no dead
+// space, footer flush to the bottom.
 func (m Model) renderDashboard(now int64) string {
 	d := m.dims()
 
@@ -177,15 +169,9 @@ func (m Model) renderDashboard(now int64) string {
 	// the now=0 content (elapsed is inline, so the line counts match).
 	pipeVp := m.bodyVp
 	pipeVp.SetContent(m.renderBody(d.pipeTextW, now))
-	left := panelBox("PIPELINE", cText, pipeVp.View(), d.leftW, d.pipeH)
-	right := panelBox("⚡ ACTIVITY", cAmber, m.activityVp.View(), d.rightW, d.actH)
-
-	var body string
-	if d.twoCol {
-		body = lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
-	} else {
-		body = lipgloss.JoinVertical(lipgloss.Left, left, right)
-	}
+	pipe := panelBox("PIPELINE", cText, pipeVp.View(), d.cw, d.pipeH)
+	feed := panelBox("⚡ ACTIVITY", cAmber, m.activityVp.View(), d.cw, d.actH)
+	body := lipgloss.JoinVertical(lipgloss.Left, pipe, feed)
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.renderHeader(d.cw, now),
