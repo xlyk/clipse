@@ -70,7 +70,14 @@ func (d *Dispatcher) applyResult(ctx context.Context, rr runResult) error {
 
 	if rr.res.Err != nil {
 		delete(d.inflight, rr.runID)
-		return d.blockRun(ctx, *issue, rr.runID, inf.lane, blockReasonFor(rr.res.Err))
+		reason := blockReasonFor(rr.res.Err)
+		// A run-level failure (crash / malformed result / timeout) is transient
+		// by nature, so it is eligible for bounded auto-retry (auto-unblock
+		// layer 1); parkOrRetry falls back to the plain blockRun park once the
+		// budget is spent (or when RecoverCap is 0).
+		return d.parkOrRetry(ctx, *issue, rr.runID, inf.lane, reason, contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
+			return d.blockRun(ctx, *issue, rr.runID, inf.lane, reason)
+		})
 	}
 
 	outcome := string(rr.res.Worker.Outcome)
@@ -99,10 +106,105 @@ func blockReasonFor(err error) string {
 	}
 }
 
-// blockRun transitions issue to blocked after a run-level failure (crash,
-// malformed result, timeout, or turn-cap exhaustion): clears the claim,
-// closes the run, and enqueues both the Linear mirror and a comment
-// explaining why. No auto-retry: a human must requeue a blocked issue.
+// parkOrRetry is auto-unblock layer 1's single decision point. A *transient*
+// failure with retry budget left (issue.recover_attempts < cfg.RecoverCap) is
+// re-queued for a bounded, backed-off deterministic retry (scheduleRetry);
+// everything else is parked via the caller-supplied park closure — so each
+// call site keeps its exact park payload (a run-level blockRun, the terminal
+// blocked transition with tokens + block-kind comment, or blockOnSpawnFailure).
+//
+// Only transient failures are eligible. Crash/malformed/timeout/spawn callers
+// pass BlockKindTransient (they are transient by nature); a terminal worker
+// block passes its own block_kind, so capability (token ceiling — a retry just
+// burns another budget) and needs_input (needs a human answer) fall through to
+// park. A RecoverCap of 0 disables retry entirely (every failure parks — the
+// pre-layer-1 behavior). Callers that must NEVER auto-retry (turn-cap,
+// illegal-transition, rework-cap, orphan max_attempts) simply do not route
+// through here.
+func (d *Dispatcher) parkOrRetry(ctx context.Context, issue store.Issue, runID, lane, reason string, blockKind contract.BlockKind, now int64, payload retryPayload, park func() error) error {
+	if blockKind == contract.BlockKindTransient && issue.RecoverAttempts < d.cfg.RecoverCap {
+		return d.scheduleRetry(ctx, issue, runID, lane, reason, now, payload)
+	}
+	return park()
+}
+
+// retryPayload carries the run-close fields scheduleRetry records on the
+// retried run. Crash/malformed/timeout/spawn failures have no worker result and
+// pass the zero value; only a terminal worker block carries tokens + result
+// JSON worth preserving so board-wide token accounting isn't dropped when a
+// blocked turn is retried.
+type retryPayload struct {
+	tokensIn   int
+	tokensOut  int
+	resultJSON string
+}
+
+// scheduleRetry re-queues issue for a bounded, deterministic auto-retry after a
+// transient failure. It is a single store.Transition (the one Linear-mirroring
+// writer) that: returns the card to its release column
+// (store.ReleaseTargetColumn — running->ready for a coder-from-ready run, every
+// downstream/rework column staying put so the same lane re-claims it), clears
+// the claim, closes the run as "retry_scheduled", bumps recover_attempts, and
+// sets blocked_until = now + RecoverBackoffS so the card is invisible to every
+// claim/peek until the backoff passes (the anti-hot-loop half of the
+// guarantee). SkipReworkBump is set because the release column can be "rework"
+// (a coder re-run that transient-failed), which must not spend amendment C1's
+// rework budget. The column change is mirrored to Linear only when it actually
+// moves (a coder ready<-running requeue); a same-column requeue enqueues no
+// redundant setstate (R5).
+func (d *Dispatcher) scheduleRetry(ctx context.Context, issue store.Issue, runID, lane, reason string, now int64, payload retryPayload) error {
+	target := store.ReleaseTargetColumn(issue.BoardStatus)
+	attempt := issue.RecoverAttempts + 1
+	blockedUntil := now + int64(d.cfg.RecoverBackoffS)
+	req := store.TransitionReq{
+		IssueID:             issue.ID,
+		NewStatus:           target,
+		ClearClaim:          true,
+		SkipReworkBump:      true,
+		BumpRecoverAttempts: true,
+		SetBlockedUntil:     blockedUntil,
+		CloseRunID:          runID,
+		RunStatus:           "retry_scheduled",
+		RunError:            reason,
+		ResultJSON:          payload.resultJSON,
+		TokensIn:            payload.tokensIn,
+		TokensOut:           payload.tokensOut,
+		EnqueueSetState:     target != issue.BoardStatus,
+		Comment:             retryComment(attempt, d.cfg.RecoverCap, reason),
+		Event: store.Event{
+			Ts:      now,
+			IssueID: nullString(issue.ID),
+			RunID:   nullString(runID),
+			Kind:    "retry_scheduled",
+			Detail:  fmt.Sprintf("auto-retry %d/%d after transient failure: %s", attempt, d.cfg.RecoverCap, reason),
+		},
+	}
+	if err := d.store.Transition(ctx, req); err != nil {
+		return fmt.Errorf("scheduling auto-retry for issue %s: %w", issue.ID, err)
+	}
+	d.logger.Info("transient failure auto-retry scheduled",
+		"issue_id", issue.ID, "run_id", runID, "lane", lane,
+		"recover_attempt", attempt, "recover_cap", d.cfg.RecoverCap,
+		"target", target, "blocked_until", blockedUntil, "reason", reason)
+	return nil
+}
+
+// blockKindOf returns result's block_kind, or "" when absent (block_kind is
+// present iff outcome=="blocked", but "" reads as non-transient here, so an
+// unexpectedly-absent kind parks rather than retries — the safe default).
+func blockKindOf(result contract.WorkerResult) contract.BlockKind {
+	if result.BlockKind != nil {
+		return *result.BlockKind
+	}
+	return ""
+}
+
+// blockRun transitions issue to blocked after a run-level failure, clearing the
+// claim, closing the run, and enqueuing both the Linear mirror and a reason
+// comment. It is the terminal park: for turn-cap exhaustion and
+// illegal-transition it is called directly; for a crash/malformed/timeout it is
+// the park fallback parkOrRetry uses once the auto-retry budget is spent. A
+// parked issue is never auto-requeued — a human must move it.
 func (d *Dispatcher) blockRun(ctx context.Context, issue store.Issue, runID, lane, reason string) error {
 	now := d.now()
 	req := store.TransitionReq{
@@ -208,6 +310,28 @@ func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store
 			Detail:  result.Summary,
 		},
 	}
+
+	if outcome == string(contract.WorkerResultOutcomeBlocked) {
+		// A worker-emitted block is eligible for bounded auto-retry only when
+		// its block_kind is transient (capability/needs_input fall through to
+		// park). The park path is exactly the generic blocked transition built
+		// above — preserving the tokens, result JSON, and block-kind comment
+		// that a plain blockRun would drop.
+		return d.parkOrRetry(ctx, issue, runID, lane, result.Summary, blockKindOf(result), now,
+			retryPayload{tokensIn: result.Tokens.In, tokensOut: result.Tokens.Out, resultJSON: resultJSON},
+			func() error {
+				if err := d.store.Transition(ctx, req); err != nil {
+					return fmt.Errorf("transitioning issue %s: %w", issue.ID, err)
+				}
+				return nil
+			})
+	}
+
+	// A normal (non-block) advance means the worker produced a real result, so
+	// any transient-retry budget spent earlier is water under the bridge: reset
+	// recover_attempts (and clear any backoff) so a later, independent
+	// transient failure gets a full budget.
+	req.ResetRecoverAttempts = true
 	if err := d.store.Transition(ctx, req); err != nil {
 		return fmt.Errorf("transitioning issue %s: %w", issue.ID, err)
 	}

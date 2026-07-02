@@ -26,6 +26,17 @@ const (
 	// instead of routing it to rework again, breaking what would otherwise
 	// be a possible infinite Coder<->Reviewer loop.
 	defaultReworkCap = 3
+	// defaultRecoverCap is the default auto-unblock (layer 1) budget: how
+	// many times the dispatcher deterministically re-queues a single issue
+	// after a *transient* failure (a worker-emitted block_kind=transient, a
+	// run-level crash/malformed-result/timeout, or a spawn/workspace failure)
+	// before it parks the issue in Blocked for good. Bounded + backed off
+	// (see recover_backoff_s), so a genuinely stuck issue retries a fixed
+	// number of times and then stops — never a hot loop. Non-transient blocks
+	// (capability/needs_input), rework-cap exhaustion, illegal transitions,
+	// and orphan max_attempts are NOT covered: those park immediately. A cap
+	// of 0 disables auto-recovery entirely (every failure parks).
+	defaultRecoverCap = 2
 	// defaultMaxTokensPerRun is the per-run token ceiling passed to the
 	// worker (as --max-tokens) when max_tokens_per_run is absent from the
 	// YAML document. The worker aborts over budget with
@@ -126,6 +137,19 @@ type Config struct {
 	// rework_count would exceed this. Defaults to defaultReworkCap when
 	// absent from the YAML document.
 	ReworkCap int `yaml:"rework_cap"`
+	// RecoverCap bounds auto-unblock layer 1: how many times the dispatcher
+	// deterministically re-queues a single issue after a transient failure
+	// before parking it in Blocked — see issues.recover_attempts
+	// (internal/store) and dispatcher.parkOrRetry. Defaults to
+	// defaultRecoverCap when absent; a value of 0 disables auto-recovery (every
+	// failure parks immediately, the pre-layer-1 behavior).
+	RecoverCap int `yaml:"recover_cap"`
+	// RecoverBackoffS is the delay (seconds) before a re-queued issue becomes
+	// claimable again (issues.blocked_until = now + RecoverBackoffS); the
+	// backoff is what makes the retry budget a real anti-hot-loop guard rather
+	// than an immediate re-claim. Defaults to the resolved PollIntervalS when
+	// absent, so a retry lands roughly one poll later.
+	RecoverBackoffS int `yaml:"recover_backoff_s"`
 	// Worker configures the clipse-worker subprocess invocation. Required —
 	// see Worker.Command's doc comment.
 	Worker Worker `yaml:"worker"`
@@ -195,6 +219,8 @@ type rawConfig struct {
 	LaneLabelPrefix *string  `yaml:"lane_label_prefix"`
 	MaxAttempts     *int     `yaml:"max_attempts"`
 	ReworkCap       *int     `yaml:"rework_cap"`
+	RecoverCap      *int     `yaml:"recover_cap"`
+	RecoverBackoffS *int     `yaml:"recover_backoff_s"`
 	MaxTokensPerRun *int     `yaml:"max_tokens_per_run"`
 	CheckpointsDir  *string  `yaml:"checkpoints_dir"`
 	BoardDir        *string  `yaml:"board_dir"`
@@ -215,17 +241,23 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 
+	// Resolve poll_interval_s first: recover_backoff_s defaults to it (a retry
+	// lands roughly one poll later), so it must be known before defaulting.
+	pollIntervalS := intOrDefault(raw.PollIntervalS, defaultPollIntervalS)
+
 	cfg := &Config{
 		Repo:            raw.Repo,
 		TeamKey:         raw.TeamKey,
 		TeamID:          raw.TeamID,
 		Worker:          raw.Worker,
-		PollIntervalS:   intOrDefault(raw.PollIntervalS, defaultPollIntervalS),
+		PollIntervalS:   pollIntervalS,
 		TurnCap:         intOrDefault(raw.TurnCap, defaultTurnCap),
 		MaxRuntimeS:     intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),
 		LaneLabelPrefix: stringOrDefault(raw.LaneLabelPrefix, defaultLaneLabelPrefix),
 		MaxAttempts:     intOrDefault(raw.MaxAttempts, defaultMaxAttempts),
 		ReworkCap:       intOrDefault(raw.ReworkCap, defaultReworkCap),
+		RecoverCap:      intOrDefault(raw.RecoverCap, defaultRecoverCap),
+		RecoverBackoffS: intOrDefault(raw.RecoverBackoffS, pollIntervalS),
 		MaxTokensPerRun: intOrDefault(raw.MaxTokensPerRun, defaultMaxTokensPerRun),
 		CheckpointsDir:  stringOrDefault(raw.CheckpointsDir, defaultCheckpointsDir),
 		BoardDir:        stringOrDefault(raw.BoardDir, defaultBoardDir),
@@ -339,6 +371,17 @@ func validate(cfg *Config) error {
 	}
 	if cfg.MaxTokensPerRun <= 0 {
 		return fmt.Errorf("max_tokens_per_run must be positive, got %d", cfg.MaxTokensPerRun)
+	}
+	// recover_cap/recover_backoff_s bound auto-unblock layer 1. Both are
+	// non-negative (unlike max_attempts/rework_cap, which must be >= 1): a
+	// recover_cap of 0 is a valid kill switch that disables auto-recovery, and
+	// a recover_backoff_s of 0 means "re-claimable on the next tick" (no
+	// backoff). Negative values are meaningless, so reject them.
+	if cfg.RecoverCap < 0 {
+		return fmt.Errorf("recover_cap must not be negative, got %d", cfg.RecoverCap)
+	}
+	if cfg.RecoverBackoffS < 0 {
+		return fmt.Errorf("recover_backoff_s must not be negative, got %d", cfg.RecoverBackoffS)
 	}
 	// worker.command is the argv prefix the Spawner execs for every worker
 	// invocation; it's machine-specific (an absolute --project path in the

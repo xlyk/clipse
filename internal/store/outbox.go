@@ -35,6 +35,28 @@ type TransitionReq struct {
 	// gitops<->Coder) loop, not to follow the issue around forever.
 	ResetReworkCount bool
 
+	// BumpRecoverAttempts increments issues.recover_attempts by 1. Set by
+	// dispatcher.scheduleRetry (auto-unblock layer 1) when it re-queues an
+	// issue after a transient failure, so the next transient failure counts
+	// against cfg.RecoverCap. Mutually exclusive with ResetRecoverAttempts (a
+	// single UPDATE cannot both bump and reset the same column); the two are
+	// set by disjoint code paths (retry vs. normal advance).
+	BumpRecoverAttempts bool
+
+	// ResetRecoverAttempts forces recover_attempts back to 0 AND clears
+	// blocked_until to 0 (a clean recovery slate). Set on any normal
+	// (non-block) terminal advance (dispatcher.applyTerminalWorkerOutcome), so
+	// a later, independent transient failure gets a full retry budget rather
+	// than inheriting a spent one. Takes priority over BumpRecoverAttempts.
+	ResetRecoverAttempts bool
+
+	// SetBlockedUntil, when > 0, sets issues.blocked_until to this unix time:
+	// the backoff deadline before an auto-retried card is claimable again
+	// (dispatcher.scheduleRetry sets it to retry-time + RecoverBackoffS). 0
+	// leaves blocked_until untouched (ResetRecoverAttempts is how it gets
+	// cleared).
+	SetBlockedUntil int64
+
 	CloseRunID string // if non-empty, close this run
 	RunStatus  string // status to set on the closed run (e.g. "done","blocked","stale","orphaned")
 	RunError   string // optional; stored NULL if empty
@@ -118,6 +140,19 @@ func applyIssueTransition(ctx context.Context, tx *sql.Tx, req TransitionReq) er
 		// The count is scoped to one review<->rework cycle, not the
 		// issue's lifetime.
 		q += `, rework_count = 0`
+	}
+	// Auto-unblock layer 1's recover_attempts, independent of rework_count:
+	// reset (normal advance) takes priority over bump (transient re-queue);
+	// the two are never set together (see the field docs).
+	switch {
+	case req.ResetRecoverAttempts:
+		q += `, recover_attempts = 0, blocked_until = 0`
+	case req.BumpRecoverAttempts:
+		q += `, recover_attempts = recover_attempts + 1`
+	}
+	if req.SetBlockedUntil > 0 {
+		q += `, blocked_until = ?`
+		args = append(args, req.SetBlockedUntil)
 	}
 	q += ` WHERE id = ?`
 	args = append(args, req.IssueID)

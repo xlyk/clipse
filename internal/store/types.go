@@ -27,6 +27,28 @@ type Issue struct {
 	// re-poll (UpsertIssue's conflict path) never touches it.
 	ReworkCount int
 
+	// RecoverAttempts is dispatcher-owned runtime state (like ReworkCount and
+	// the claim fields): it counts how many times auto-unblock layer 1 has
+	// deterministically re-queued this issue after a *transient* failure (a
+	// worker block_kind=transient, a run-level crash/malformed/timeout, or a
+	// spawn/workspace failure -- see dispatcher.parkOrRetry). Once it reaches
+	// cfg.RecoverCap the issue parks in Blocked for good. It resets to 0 the
+	// next time the card advances on a normal (non-block) terminal transition
+	// (TransitionReq.ResetRecoverAttempts), so a fresh, independent transient
+	// failure later gets a full retry budget. A Linear re-poll (UpsertIssue's
+	// conflict path) never touches it.
+	RecoverAttempts int
+
+	// BlockedUntil is the unix time (0 = not blocked) before which this issue
+	// is NOT claimable: an auto-retry re-queue sets it to now+RecoverBackoffS
+	// so the retried card sits out a backoff window rather than being
+	// re-claimed on the very next tick. Every claim/peek candidate query
+	// filters it (blocked_until <= now), which is what makes the retry budget
+	// a real anti-hot-loop guard. Cleared back to 0 when RecoverAttempts
+	// resets. Like RecoverAttempts, dispatcher-owned and preserved across a
+	// Linear re-poll.
+	BlockedUntil int64
+
 	Deps         string
 	Priority     int
 	BranchName   string

@@ -38,7 +38,13 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	}
 	workspace, err := ensure(issue)
 	if err != nil {
-		return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, fmt.Errorf("preparing workspace: %w", err))
+		// A workspace/spawn failure is transient by nature, so it is eligible
+		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
+		// to blockOnSpawnFailure once the budget is spent (or RecoverCap is 0).
+		cause := fmt.Errorf("preparing workspace: %w", err)
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+		})
 	}
 
 	// d.envFor is always set (New defaults it to defaultEnvFor;
@@ -77,7 +83,10 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	handle, err := d.spawner.Spawn(spawnCtx, spec)
 	if err != nil {
 		cancel()
-		return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, fmt.Errorf("spawning worker: %w", err))
+		cause := fmt.Errorf("spawning worker: %w", err)
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+		})
 	}
 
 	if err := d.store.SetRunProcess(ctx, runID, handle.PID(), handle.ProcStartedAt()); err != nil {

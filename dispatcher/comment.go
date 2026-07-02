@@ -88,6 +88,18 @@ func changesRequestedComment(summary string) string {
 	return heading + "\n\n" + body
 }
 
+// retryComment renders auto-unblock layer 1's re-queue comment: an "auto-retry
+// N/M" heading naming where the issue is in its transient-failure budget, then
+// the failure reason (fenced when it looks like a raw error). It tells a human
+// watching the board that the issue is recovering on its own, not stuck.
+func retryComment(attempt, cap int, reason string) string {
+	heading := fmt.Sprintf("### 🔄 Auto-retry %d/%d — transient failure", attempt, cap)
+	if body := detailBlock(reason); body != "" {
+		return heading + "\n\n" + body
+	}
+	return heading
+}
+
 // reworkCapComment renders the rework-cap block: the cap, the PR under review,
 // and the last review summary that tipped it over, as a scannable bullet list
 // so a human triaging the Blocked column sees why without opening the store.

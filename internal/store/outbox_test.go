@@ -334,6 +334,208 @@ func TestTransition_ReworkCount_IncrementsOnReworkAndResetsOnDone(t *testing.T) 
 	}
 }
 
+// TestTransition_AutoRetryRequeue_BumpsAttemptsAndSetsBackoff asserts the
+// store side of auto-unblock layer 1's re-queue path (dispatcher.scheduleRetry):
+// one Transition atomically returns the card to its release column, clears the
+// claim, closes the run as retry_scheduled, bumps recover_attempts, sets a
+// future blocked_until, and enqueues the Linear mirror + comment — while
+// leaving rework_count untouched (SkipReworkBump), so a transient retry never
+// spends amendment C1's rework budget even when the release column is "rework".
+func TestTransition_AutoRetryRequeue_BumpsAttemptsAndSetsBackoff(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+
+	const (
+		now          = 1000
+		backoff      = 30
+		blockedUntil = now + backoff
+	)
+	req := store.TransitionReq{
+		IssueID:             "issue-1",
+		NewStatus:           "ready", // store.ReleaseTargetColumn("running")
+		ClearClaim:          true,
+		SkipReworkBump:      true, // release column may be "rework"; never double-count
+		BumpRecoverAttempts: true,
+		SetBlockedUntil:     blockedUntil,
+		CloseRunID:          "run-1",
+		RunStatus:           "retry_scheduled",
+		RunError:            "worker exited nonzero: exit code 1",
+		EnqueueSetState:     true,
+		Comment:             "auto-retry 1/2 after transient failure: worker exited nonzero",
+		Event: store.Event{
+			Ts:      now,
+			IssueID: sql.NullString{String: "issue-1", Valid: true},
+			RunID:   sql.NullString{String: "run-1", Valid: true},
+			Kind:    "retry_scheduled",
+			Detail:  "auto-retry after transient failure",
+		},
+	}
+	if err := s.Transition(ctx, req); err != nil {
+		t.Fatalf("Transition: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Errorf("BoardStatus = %q, want ready", got.BoardStatus)
+	}
+	if got.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+	if got.RecoverAttempts != 1 {
+		t.Errorf("RecoverAttempts = %d, want 1 (bumped)", got.RecoverAttempts)
+	}
+	if got.BlockedUntil != blockedUntil {
+		t.Errorf("BlockedUntil = %d, want %d", got.BlockedUntil, blockedUntil)
+	}
+	if got.ReworkCount != 0 {
+		t.Errorf("ReworkCount = %d, want 0 (SkipReworkBump: a transient retry must not spend rework budget)", got.ReworkCount)
+	}
+
+	// The run closed as retry_scheduled (not blocked), carrying the reason.
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	latest := snap.Issues[0].LatestRun
+	if latest == nil || latest.Status != "retry_scheduled" {
+		t.Fatalf("LatestRun = %+v, want status retry_scheduled", latest)
+	}
+
+	// The mirror + comment are enqueued in the same transaction.
+	pending, err := s.DrainPendingLinearWrites(ctx, 10)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	var sawSetState, sawComment bool
+	for _, w := range pending {
+		switch w.Kind {
+		case "setstate":
+			sawSetState = true
+			if w.Target != "ready" {
+				t.Errorf("setstate Target = %q, want ready", w.Target)
+			}
+		case "comment":
+			sawComment = true
+		}
+	}
+	if !sawSetState || !sawComment {
+		t.Errorf("pending writes = %+v, want both a setstate and a comment", pending)
+	}
+}
+
+// TestTransition_ResetRecoverAttempts_ClearsAttemptsAndBackoff asserts that a
+// normal advance carrying ResetRecoverAttempts wipes both recover_attempts and
+// blocked_until back to 0 (a clean recovery slate), so a later independent
+// transient failure gets a full retry budget rather than inheriting a spent
+// one. It also confirms reset takes priority over a NewStatus that would
+// otherwise be a plain move.
+func TestTransition_ResetRecoverAttempts_ClearsAttemptsAndBackoff(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	// Seed an issue mid-recovery: two prior transient retries + an active
+	// backoff window.
+	if err := s.UpsertIssue(ctx, store.Issue{
+		ID:              "issue-1",
+		Identifier:      "issue-1",
+		LaneLabel:       "coder",
+		BoardStatus:     "running",
+		RecoverAttempts: 2,
+		BlockedUntil:    500,
+		Deps:            `[]`,
+		BranchName:      "issue-1-branch",
+		UpdatedAt:       100,
+		LastSeen:        100,
+		CreatedAt:       100,
+	}); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	req := store.TransitionReq{
+		IssueID:              "issue-1",
+		NewStatus:            "review",
+		ResetRecoverAttempts: true,
+		Event: store.Event{
+			Ts:      600,
+			IssueID: sql.NullString{String: "issue-1", Valid: true},
+			Kind:    "open_review",
+			Detail:  "advanced to review",
+		},
+	}
+	if err := s.Transition(ctx, req); err != nil {
+		t.Fatalf("Transition: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "review" {
+		t.Errorf("BoardStatus = %q, want review", got.BoardStatus)
+	}
+	if got.RecoverAttempts != 0 {
+		t.Errorf("RecoverAttempts = %d, want 0 (reset on normal advance)", got.RecoverAttempts)
+	}
+	if got.BlockedUntil != 0 {
+		t.Errorf("BlockedUntil = %d, want 0 (cleared on reset)", got.BlockedUntil)
+	}
+}
+
+// TestUpsertIssue_ConflictPreservesRecoveryState asserts recover_attempts and
+// blocked_until survive a Linear re-poll (UpsertIssue's conflict path), like
+// board_status/rework_count/claim — a poll must never reset an in-flight
+// auto-retry backoff.
+func TestUpsertIssue_ConflictPreservesRecoveryState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.UpsertIssue(ctx, store.Issue{
+		ID:              "issue-1",
+		Identifier:      "issue-1",
+		LaneLabel:       "coder",
+		BoardStatus:     "ready",
+		RecoverAttempts: 1,
+		BlockedUntil:    1234,
+		Deps:            `[]`,
+		UpdatedAt:       100,
+		LastSeen:        100,
+		CreatedAt:       100,
+	}); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	// A fresh poll carries the dispatcher-owned fields zero-valued.
+	if err := s.UpsertIssue(ctx, store.Issue{
+		ID:          "issue-1",
+		Identifier:  "issue-1",
+		LaneLabel:   "coder",
+		BoardStatus: "ready",
+		Deps:        `[]`,
+		Priority:    2,
+		UpdatedAt:   200,
+		LastSeen:    200,
+		CreatedAt:   100,
+	}); err != nil {
+		t.Fatalf("conflict UpsertIssue: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.RecoverAttempts != 1 {
+		t.Errorf("RecoverAttempts = %d, want preserved 1 (poll must not reset)", got.RecoverAttempts)
+	}
+	if got.BlockedUntil != 1234 {
+		t.Errorf("BlockedUntil = %d, want preserved 1234 (poll must not reset)", got.BlockedUntil)
+	}
+	if got.Priority != 2 {
+		t.Errorf("Priority = %d, want updated 2 (Linear-sourced intent still updates)", got.Priority)
+	}
+}
+
 // TestTransition_SkipReworkBump_ReassertingReworkDoesNotDoubleCount asserts
 // the fix for the requeueOrphan/rework_count interaction
 // (dispatcher.requeueOrphan): a Transition to NewStatus="rework" with

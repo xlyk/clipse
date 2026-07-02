@@ -803,7 +803,7 @@ func TestPeekReadyCandidate_ReturnsWithoutClaiming(t *testing.T) {
 	seedReadyIssue(t, s, "issue-low", lane, 4, 50)
 	seedReadyIssue(t, s, "issue-urgent", lane, 1, 100)
 
-	issue, err := s.PeekReadyCandidate(ctx, lane)
+	issue, err := s.PeekReadyCandidate(ctx, lane, 1000)
 	if err != nil {
 		t.Fatalf("PeekReadyCandidate: unexpected error: %v", err)
 	}
@@ -847,7 +847,7 @@ func TestPeekReadyCandidate_NoneReturnsErrNoReady(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	_, err := s.PeekReadyCandidate(ctx, "coder")
+	_, err := s.PeekReadyCandidate(ctx, "coder", 1000)
 	if !errors.Is(err, store.ErrNoReady) {
 		t.Fatalf("PeekReadyCandidate on empty store: err = %v, want ErrNoReady", err)
 	}
@@ -858,7 +858,7 @@ func TestPeekReadyCandidate_IgnoresOtherLanes(t *testing.T) {
 	ctx := context.Background()
 	seedReadyIssue(t, s, "issue-1", "reviewer", 1, 100)
 
-	_, err := s.PeekReadyCandidate(ctx, "coder")
+	_, err := s.PeekReadyCandidate(ctx, "coder", 1000)
 	if !errors.Is(err, store.ErrNoReady) {
 		t.Fatalf("PeekReadyCandidate wrong lane: err = %v, want ErrNoReady", err)
 	}
@@ -875,7 +875,7 @@ func TestPeekColumnCandidate_ReturnsWithoutClaiming(t *testing.T) {
 	seedColumnIssue(t, s, "issue-low", column, 4, 50)
 	seedColumnIssue(t, s, "issue-urgent", column, 1, 100)
 
-	issue, err := s.PeekColumnCandidate(ctx, column)
+	issue, err := s.PeekColumnCandidate(ctx, column, 1000)
 	if err != nil {
 		t.Fatalf("PeekColumnCandidate: unexpected error: %v", err)
 	}
@@ -908,9 +908,107 @@ func TestPeekColumnCandidate_NoneReturnsErrNoReady(t *testing.T) {
 	ctx := context.Background()
 	seedColumnIssue(t, s, "issue-1", "ready", 1, 100)
 
-	_, err := s.PeekColumnCandidate(ctx, "rework")
+	_, err := s.PeekColumnCandidate(ctx, "rework", 1000)
 	if !errors.Is(err, store.ErrNoReady) {
 		t.Fatalf("PeekColumnCandidate wrong column: err = %v, want ErrNoReady", err)
+	}
+}
+
+// seedBackedOffIssue seeds an unclaimed issue in column carrying a future
+// blocked_until (auto-unblock layer 1's backoff window) so the claim-skip
+// tests can drive the boundary. laneLabel is always "coder" (the issue's own
+// label never changes; the column decides the lane — see seedColumnIssue).
+func seedBackedOffIssue(t *testing.T, s *store.Store, id, column string, blockedUntil int64) {
+	t.Helper()
+	issue := store.Issue{
+		ID:           id,
+		Identifier:   id,
+		LaneLabel:    "coder",
+		BoardStatus:  column,
+		BlockedUntil: blockedUntil,
+		Deps:         `[]`,
+		Priority:     1,
+		BranchName:   id + "-branch",
+		UpdatedAt:    100,
+		LastSeen:     100,
+		CreatedAt:    100,
+	}
+	if err := s.UpsertIssue(context.Background(), issue); err != nil {
+		t.Fatalf("seed UpsertIssue(%s): unexpected error: %v", id, err)
+	}
+}
+
+// TestClaimReady_SkipsBackoffWindow asserts a 'ready' issue whose blocked_until
+// lies in the future is invisible to both PeekReadyCandidate and ClaimReady
+// until now reaches that deadline (inclusive), then becomes claimable — the
+// backoff half of auto-unblock layer 1's anti-hot-loop guarantee.
+func TestClaimReady_SkipsBackoffWindow(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const blockedUntil = 200
+	seedBackedOffIssue(t, s, "issue-1", "ready", blockedUntil)
+
+	// Before the deadline: neither peek nor claim sees it.
+	if _, err := s.PeekReadyCandidate(ctx, "coder", blockedUntil-1); !errors.Is(err, store.ErrNoReady) {
+		t.Errorf("PeekReadyCandidate at now<deadline: err = %v, want ErrNoReady", err)
+	}
+	if _, err := s.ClaimReady(ctx, "coder", "run-early", blockedUntil-1, 60); !errors.Is(err, store.ErrNoReady) {
+		t.Errorf("ClaimReady at now<deadline: err = %v, want ErrNoReady", err)
+	}
+
+	// At the deadline (inclusive) it reappears to a peek...
+	peeked, err := s.PeekReadyCandidate(ctx, "coder", blockedUntil)
+	if err != nil {
+		t.Fatalf("PeekReadyCandidate at now==deadline: unexpected error: %v", err)
+	}
+	if peeked.ID != "issue-1" {
+		t.Errorf("PeekReadyCandidate = %q, want issue-1", peeked.ID)
+	}
+
+	// ...and is claimable once now is past it.
+	claim, err := s.ClaimReady(ctx, "coder", "run-1", blockedUntil+5, 60)
+	if err != nil {
+		t.Fatalf("ClaimReady at now>deadline: unexpected error: %v", err)
+	}
+	if claim.Issue.ID != "issue-1" {
+		t.Errorf("ClaimReady claimed %q, want issue-1", claim.Issue.ID)
+	}
+}
+
+// TestClaimColumn_SkipsBackoffWindow mirrors TestClaimReady_SkipsBackoffWindow
+// for the downstream column claim path (e.g. a reviewer/coder-rework re-run
+// re-queued after a transient failure): the shared selectClaimCandidate gate
+// applies identically.
+func TestClaimColumn_SkipsBackoffWindow(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	const (
+		column       = "rework"
+		blockedUntil = 200
+	)
+	seedBackedOffIssue(t, s, "issue-1", column, blockedUntil)
+
+	if _, err := s.PeekColumnCandidate(ctx, column, blockedUntil-1); !errors.Is(err, store.ErrNoReady) {
+		t.Errorf("PeekColumnCandidate at now<deadline: err = %v, want ErrNoReady", err)
+	}
+	if _, err := s.ClaimColumn(ctx, column, "coder", "run-early", blockedUntil-1, 60); !errors.Is(err, store.ErrNoReady) {
+		t.Errorf("ClaimColumn at now<deadline: err = %v, want ErrNoReady", err)
+	}
+
+	peeked, err := s.PeekColumnCandidate(ctx, column, blockedUntil)
+	if err != nil {
+		t.Fatalf("PeekColumnCandidate at now==deadline: unexpected error: %v", err)
+	}
+	if peeked.ID != "issue-1" {
+		t.Errorf("PeekColumnCandidate = %q, want issue-1", peeked.ID)
+	}
+
+	claim, err := s.ClaimColumn(ctx, column, "coder", "run-1", blockedUntil+5, 60)
+	if err != nil {
+		t.Fatalf("ClaimColumn at now>deadline: unexpected error: %v", err)
+	}
+	if claim.Issue.ID != "issue-1" {
+		t.Errorf("ClaimColumn claimed %q, want issue-1", claim.Issue.ID)
 	}
 }
 

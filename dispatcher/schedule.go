@@ -64,7 +64,7 @@ func (d *Dispatcher) claimCoderPool(ctx context.Context, now int64) error {
 			return nil
 		}
 
-		fromRework, ok, err := d.pickCoderCandidate(ctx, coderLane)
+		fromRework, ok, err := d.pickCoderCandidate(ctx, coderLane, now)
 		if err != nil {
 			return fmt.Errorf("picking coder pool candidate: %w", err)
 		}
@@ -116,12 +116,12 @@ func (d *Dispatcher) claimCoderPool(ctx context.Context, now int64) error {
 // the coder pool and reports which column the next claim should come from:
 // fromRework=true means the rework candidate sorts first (issueLess);
 // ok=false means neither column currently has a candidate.
-func (d *Dispatcher) pickCoderCandidate(ctx context.Context, coderLane string) (fromRework, ok bool, err error) {
-	readyIssue, readyErr := d.store.PeekReadyCandidate(ctx, coderLane)
+func (d *Dispatcher) pickCoderCandidate(ctx context.Context, coderLane string, now int64) (fromRework, ok bool, err error) {
+	readyIssue, readyErr := d.store.PeekReadyCandidate(ctx, coderLane, now)
 	if readyErr != nil && !errors.Is(readyErr, store.ErrNoReady) {
 		return false, false, fmt.Errorf("peeking ready candidate: %w", readyErr)
 	}
-	reworkIssue, reworkErr := d.store.PeekColumnCandidate(ctx, string(contract.ColumnRework))
+	reworkIssue, reworkErr := d.store.PeekColumnCandidate(ctx, string(contract.ColumnRework), now)
 	if reworkErr != nil && !errors.Is(reworkErr, store.ErrNoReady) {
 		return false, false, fmt.Errorf("peeking rework candidate: %w", reworkErr)
 	}

@@ -14,12 +14,13 @@ import (
 // Conflict behavior (on a matching id): only the Linear-sourced intent
 // columns (identifier, title, description, lane_label, deps, priority,
 // branch_name, updated_at) plus last_seen are overwritten. board_status,
-// rework_count, claim_lock, and claim_expires are dispatcher-owned runtime
-// state: they are set on the initial insert and never touched on conflict,
-// so a re-poll of Linear can neither clobber an in-flight claim nor reset a
-// dispatcher-driven status (e.g. running/review) or its rework_count (see
-// amendment C1 / Transition, which is the only writer). created_at is
-// preserved from the original insert.
+// rework_count, recover_attempts, blocked_until, claim_lock, and claim_expires
+// are dispatcher-owned runtime state: they are set on the initial insert and
+// never touched on conflict, so a re-poll of Linear can neither clobber an
+// in-flight claim nor reset a dispatcher-driven status (e.g. running/review),
+// its rework_count, or an active auto-retry backoff (recover_attempts /
+// blocked_until) -- see amendment C1 / Transition, the only writer. created_at
+// is preserved from the original insert.
 //
 // title/description round-trip here purely as cached Linear content (the
 // dispatcher's CLIPSE_ISSUE_TEXT env injection reads them off a claimed
@@ -34,9 +35,9 @@ import (
 func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 	const q = `
 		INSERT INTO issues (
-			id, identifier, title, description, lane_label, board_status, rework_count, deps, priority,
+			id, identifier, title, description, lane_label, board_status, rework_count, recover_attempts, blocked_until, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET
 			identifier   = excluded.identifier,
 			title        = excluded.title,
@@ -49,7 +50,7 @@ func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 			last_seen    = excluded.last_seen
 	`
 	_, err := s.db.ExecContext(ctx, q,
-		issue.ID, issue.Identifier, issue.Title, issue.Description, issue.LaneLabel, issue.BoardStatus, issue.ReworkCount, issue.Deps, issue.Priority,
+		issue.ID, issue.Identifier, issue.Title, issue.Description, issue.LaneLabel, issue.BoardStatus, issue.ReworkCount, issue.RecoverAttempts, issue.BlockedUntil, issue.Deps, issue.Priority,
 		issue.BranchName, issue.ClaimLock, issue.ClaimExpires, issue.UpdatedAt, issue.LastSeen, issue.CreatedAt,
 	)
 	if err != nil {
@@ -207,7 +208,7 @@ func (s *Store) ListOpenRuns(ctx context.Context) ([]Run, error) {
 // `clipse tui`.
 func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 	const issuesQ = `
-		SELECT id, identifier, lane_label, board_status, rework_count, deps, priority,
+		SELECT id, identifier, lane_label, board_status, rework_count, recover_attempts, blocked_until, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
 		FROM issues
 		ORDER BY id
@@ -225,7 +226,7 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		for rows.Next() {
 			var is IssueSnapshot
 			if err = rows.Scan(
-				&is.ID, &is.Identifier, &is.LaneLabel, &is.BoardStatus, &is.ReworkCount, &is.Deps, &is.Priority,
+				&is.ID, &is.Identifier, &is.LaneLabel, &is.BoardStatus, &is.ReworkCount, &is.RecoverAttempts, &is.BlockedUntil, &is.Deps, &is.Priority,
 				&is.BranchName, &is.ClaimLock, &is.ClaimExpires, &is.UpdatedAt, &is.LastSeen, &is.CreatedAt,
 			); err != nil {
 				return
@@ -423,14 +424,14 @@ func (s *Store) tokenTotalsByIssue(ctx context.Context) (in, out map[string]int,
 // transition without paying for a full ReadSnapshot.
 func (s *Store) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	const q = `
-		SELECT id, identifier, title, description, lane_label, board_status, rework_count, deps, priority,
+		SELECT id, identifier, title, description, lane_label, board_status, rework_count, recover_attempts, blocked_until, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
 		FROM issues
 		WHERE id = ?
 	`
 	var issue Issue
 	err := s.db.QueryRowContext(ctx, q, id).Scan(
-		&issue.ID, &issue.Identifier, &issue.Title, &issue.Description, &issue.LaneLabel, &issue.BoardStatus, &issue.ReworkCount, &issue.Deps, &issue.Priority,
+		&issue.ID, &issue.Identifier, &issue.Title, &issue.Description, &issue.LaneLabel, &issue.BoardStatus, &issue.ReworkCount, &issue.RecoverAttempts, &issue.BlockedUntil, &issue.Deps, &issue.Priority,
 		&issue.BranchName, &issue.ClaimLock, &issue.ClaimExpires, &issue.UpdatedAt, &issue.LastSeen, &issue.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {

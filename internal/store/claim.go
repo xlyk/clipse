@@ -23,7 +23,7 @@ type Claim struct {
 // selectClaimCandidate scans, in order, so the SELECT and the Scan
 // destinations underneath it can't drift apart.
 const claimCandidateColumns = `
-	id, identifier, title, description, lane_label, board_status, rework_count, deps, priority,
+	id, identifier, title, description, lane_label, board_status, rework_count, recover_attempts, blocked_until, deps, priority,
 	branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
 `
 
@@ -36,23 +36,29 @@ type queryRowContexter interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// selectClaimCandidate scans the single best UNCLAIMED issue row matching
-// whereExtra (a boolean SQL fragment ANDed after "claim_lock IS NULL", with
-// args bound in order after that predicate), against q. Candidates are
-// ordered by (priority, created_at, identifier): Linear priority is
-// 0=none,1=urgent,2=high,3=medium,4=low, so the most urgent actionable
-// candidate sorts first and 0=none (no priority set) sorts last. Ties break
-// on created_at ascending (oldest first), then identifier ascending, so
-// candidate order is deterministic even when two rows tie on both. This is
-// the one candidate-selection rule shared by ClaimReady (ready -> running,
-// filtered by lane_label), ClaimColumn (any downstream lane-entry column,
-// not filtered by lane_label), and their read-only Peek* counterparts, so
-// none of the four can drift apart from each other.
-func selectClaimCandidate(ctx context.Context, q queryRowContexter, whereExtra string, args ...any) (Issue, error) {
+// selectClaimCandidate scans the single best UNCLAIMED, non-backed-off issue
+// row matching whereExtra (a boolean SQL fragment ANDed after "claim_lock IS
+// NULL AND blocked_until <= now", with args bound in order AFTER now), against
+// q. Candidates are ordered by (priority, created_at, identifier): Linear
+// priority is 0=none,1=urgent,2=high,3=medium,4=low, so the most urgent
+// actionable candidate sorts first and 0=none (no priority set) sorts last.
+// Ties break on created_at ascending (oldest first), then identifier
+// ascending, so candidate order is deterministic even when two rows tie on
+// both.
+//
+// The "blocked_until <= now" predicate is auto-unblock layer 1's backoff gate:
+// an issue re-queued after a transient failure carries blocked_until =
+// retry-time + RecoverBackoffS, so it is invisible to every claim/peek until
+// that window passes. This is the one candidate-selection rule shared by
+// ClaimReady (ready -> running, filtered by lane_label), ClaimColumn (any
+// downstream lane-entry column, not filtered by lane_label), and their
+// read-only Peek* counterparts, so none of the four can drift apart from each
+// other — the backoff gate applies uniformly to all of them.
+func selectClaimCandidate(ctx context.Context, q queryRowContexter, now int64, whereExtra string, args ...any) (Issue, error) {
 	query := `
 		SELECT ` + claimCandidateColumns + `
 		FROM issues
-		WHERE claim_lock IS NULL AND ` + whereExtra + `
+		WHERE claim_lock IS NULL AND blocked_until <= ? AND ` + whereExtra + `
 		ORDER BY
 			CASE priority WHEN 0 THEN 999999999 ELSE priority END ASC,
 			created_at ASC,
@@ -60,8 +66,8 @@ func selectClaimCandidate(ctx context.Context, q queryRowContexter, whereExtra s
 		LIMIT 1
 	`
 	var issue Issue
-	err := q.QueryRowContext(ctx, query, args...).Scan(
-		&issue.ID, &issue.Identifier, &issue.Title, &issue.Description, &issue.LaneLabel, &issue.BoardStatus, &issue.ReworkCount, &issue.Deps, &issue.Priority,
+	err := q.QueryRowContext(ctx, query, append([]any{now}, args...)...).Scan(
+		&issue.ID, &issue.Identifier, &issue.Title, &issue.Description, &issue.LaneLabel, &issue.BoardStatus, &issue.ReworkCount, &issue.RecoverAttempts, &issue.BlockedUntil, &issue.Deps, &issue.Priority,
 		&issue.BranchName, &issue.ClaimLock, &issue.ClaimExpires, &issue.UpdatedAt, &issue.LastSeen, &issue.CreatedAt,
 	)
 	return issue, err
@@ -138,7 +144,7 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op if already committed
 
-	issue, err := selectClaimCandidate(ctx, tx, "board_status = 'ready' AND lane_label = ?", laneLabel)
+	issue, err := selectClaimCandidate(ctx, tx, now, "board_status = 'ready' AND lane_label = ?", laneLabel)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNoReady
 	}
@@ -232,7 +238,7 @@ func (s *Store) ClaimColumn(ctx context.Context, column, lane, runID string, now
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op if already committed
 
-	issue, err := selectClaimCandidate(ctx, tx, "board_status = ?", column)
+	issue, err := selectClaimCandidate(ctx, tx, now, "board_status = ?", column)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNoReady
 	}
@@ -310,8 +316,11 @@ func (s *Store) ClaimColumn(ctx context.Context, column, lane, runID string, now
 // happens: the caller's subsequent ClaimReady still CAS-guards the actual
 // claim, so a peeked-then-stolen row just yields ErrNoReady there instead
 // of a double-claim.
-func (s *Store) PeekReadyCandidate(ctx context.Context, laneLabel string) (Issue, error) {
-	issue, err := selectClaimCandidate(ctx, s.db, "board_status = 'ready' AND lane_label = ?", laneLabel)
+//
+// now gates the same backoff window ClaimReady enforces (blocked_until <= now),
+// so a peek never proposes a card the subsequent claim would then skip.
+func (s *Store) PeekReadyCandidate(ctx context.Context, laneLabel string, now int64) (Issue, error) {
+	issue, err := selectClaimCandidate(ctx, s.db, now, "board_status = 'ready' AND lane_label = ?", laneLabel)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Issue{}, ErrNoReady
 	}
@@ -325,9 +334,9 @@ func (s *Store) PeekReadyCandidate(ctx context.Context, laneLabel string) (Issue
 // UNCLAIMED card currently sitting in column that ClaimColumn would claim
 // right now, or ErrNoReady if none exist -- the downstream analogue of
 // PeekReadyCandidate; see its doc comment for why this is safe without a
-// transaction.
-func (s *Store) PeekColumnCandidate(ctx context.Context, column string) (Issue, error) {
-	issue, err := selectClaimCandidate(ctx, s.db, "board_status = ?", column)
+// transaction. now gates the backoff window exactly as PeekReadyCandidate's.
+func (s *Store) PeekColumnCandidate(ctx context.Context, column string, now int64) (Issue, error) {
+	issue, err := selectClaimCandidate(ctx, s.db, now, "board_status = ?", column)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Issue{}, ErrNoReady
 	}
