@@ -199,7 +199,7 @@ def test_pass_verdict_runs_full_node_order_and_emits_done(tmp_path):
 
     order, result = asyncio.run(_drive(graph, input_state, config))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "classify", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "emit_result"]
     _assert_valid_result(result, blocked=False)
     assert result.outcome == Outcome.done
     assert result.lane == Lane.reviewer
@@ -215,6 +215,76 @@ def test_pass_verdict_runs_full_node_order_and_emits_done(tmp_path):
     # tool reviews the diff; the wrapping graph posts nothing.
     gh_calls = [c for c in runner.calls if c.argv[0] == "gh"]
     assert gh_calls == []
+
+
+# ---------------------------------------------------------------------------
+# load_diff: the PR diff is pre-computed into task_text (so the reviewer sees
+# it in-context, never depending on the agent shelling out `git diff` -- the
+# live Phase-3 smoke rejected that via the read-mostly allow-list and passed
+# a PR blind).
+# ---------------------------------------------------------------------------
+
+
+def test_load_diff_injects_pr_diff_into_task_text(tmp_path):
+    diff_text = (
+        "diff --git a/HELLO.md b/HELLO.md\n"
+        "--- /dev/null\n+++ b/HELLO.md\n@@ -0,0 +1 @@\n"
+        "+Clipse turns Linear issues into merged PRs.\n"
+    )
+    runner = _base_runner()
+    runner.rules.insert(0, (_starts_with("git", "diff"), coder.CommandResult(0, diff_text, "")))
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-9",
+        "run_id": "run-1",
+        "thread_id": "thread-9",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "Add HELLO.md with the tagline.",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-9"}}))
+
+    # load_diff ran the diff command (default base "main")...
+    assert any(c.argv[:2] == ["git", "diff"] and "main...HEAD" in c.argv for c in runner.calls)
+    # ...and the DAC turn was driven with a task_text that carries BOTH the
+    # original issue text AND the diff content, in a ```diff fence.
+    task_text = turn_calls[0]["task_text"]
+    assert "Add HELLO.md with the tagline." in task_text
+    assert "Clipse turns Linear issues into merged PRs." in task_text
+    assert "```diff" in task_text
+
+
+def test_load_diff_degrades_gracefully_when_git_diff_fails(tmp_path):
+    runner = _base_runner()
+    runner.rules.insert(0, (_starts_with("git", "diff"), coder.CommandResult(128, "", "fatal: bad revision 'main...HEAD'")))
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-9b",
+        "run_id": "run-1",
+        "thread_id": "thread-9b",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    # A failing `git diff` must NOT raise -- the review still runs, with a note.
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-9b"}}))
+    assert "load_diff" in order
+    assert "could not compute" in turn_calls[0]["task_text"]
+    assert result.outcome == Outcome.done
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +317,7 @@ def test_changes_requested_posts_inline_comments_and_requests_changes(tmp_path):
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-2"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "classify", "post_comments", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "post_comments", "emit_result"]
     _assert_valid_result(result, blocked=False)
     assert result.outcome == Outcome.changes_requested
     assert result.pr_url == "https://github.com/acme/widgets/pull/7"
@@ -293,7 +363,7 @@ def test_changes_requested_still_requests_changes_when_no_structured_comments_fo
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-2b"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "classify", "post_comments", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "post_comments", "emit_result"]
     assert result.outcome == Outcome.changes_requested
 
     api_calls = [c for c in runner.calls if c.argv[:2] == ["gh", "api"]]
@@ -331,7 +401,7 @@ def test_missing_verdict_is_treated_as_changes_requested_not_pass(tmp_path):
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-2c"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "classify", "post_comments", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "post_comments", "emit_result"]
     assert result.outcome == Outcome.changes_requested
 
 
@@ -365,7 +435,7 @@ def test_interrupt_emits_blocked_needs_input_and_skips_classify_and_gh(tmp_path)
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-3"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "emit_result"]
     _assert_valid_result(result, blocked=True)
     assert result.block_kind == BlockKind.needs_input
     assert result.pr_url is None
@@ -404,7 +474,7 @@ def test_token_ceiling_exceeded_emits_blocked_capability_even_if_interrupted(tmp
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-4"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "emit_result"]
     _assert_valid_result(result, blocked=True)
     assert result.block_kind == BlockKind.capability
     assert "1100" in result.summary
@@ -439,7 +509,7 @@ def test_resume_turn_drives_dac_with_resume_payload_not_task_text(tmp_path):
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-6"}}))
 
-    assert order[:3] == ["load_context", "ensure_worktree", "run_DAC"]
+    assert order[:4] == ["load_context", "ensure_worktree", "load_diff", "run_DAC"]
     assert turn_calls[0]["resume"] == {"int-1": {"decisions": [{"type": "approve"}]}}
     assert "task_text" not in turn_calls[0]
     assert result.turn_count == 2
@@ -490,7 +560,7 @@ def test_build_reviewer_graph_default_wiring_uses_real_dac_module_with_safety_in
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-10"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "classify", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "emit_result"]
     assert result.outcome == Outcome.done
     assert result.tokens.in_ == 7
     assert result.tokens.out == 3

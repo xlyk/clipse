@@ -79,6 +79,7 @@ __all__ = [
     "route_after_dac",
     "route_after_classify",
     "emit_result",
+    "make_load_diff",
     "make_run_dac",
     "make_post_comments",
     "build_reviewer_graph",
@@ -161,6 +162,7 @@ class ReviewerState(TypedDict, total=False):
     thread_id: str
     workspace: str
     branch: str  # if omitted, ensure_worktree derives it via `git rev-parse`
+    base_branch: str  # PR base for the reviewed diff; defaults to "main"
     issue_text: str  # falls back to $CLIPSE_ISSUE_TEXT if omitted
     turn_count: int  # turns already completed for this issue; default 0
     max_tokens: int | None
@@ -211,6 +213,51 @@ _REVIEW_DAC_THREAD_NAMESPACE_SUFFIX = "::review-dac"
 
 def _dac_config(thread_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": f"{thread_id}{_REVIEW_DAC_THREAD_NAMESPACE_SUFFIX}"}}
+
+
+# ---------------------------------------------------------------------------
+# load_diff
+# ---------------------------------------------------------------------------
+
+_MAX_DIFF_CHARS = 60_000
+
+
+def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict[str, Any]]:
+    """Pre-compute the PR diff into `task_text` so the DAC review turn sees it
+    in-context, instead of relying on the agent to shell out `git diff`.
+
+    The live Phase-3 smoke exposed why this matters: the read-mostly allow-list
+    rejected the agent's `cd <worktree> && git diff main...HEAD`, so the
+    reviewer PASSED a PR it never actually saw. Computing the diff here (via the
+    injectable runner, in the worktree) makes the review independent of the
+    agent's shell entirely. Degrades to a note (never raises) if the diff can't
+    be produced, and caps an oversized diff so one huge PR can't blow the token
+    budget.
+    """
+
+    def _node(state: ReviewerState) -> dict[str, Any]:
+        base = state.get("base_branch") or "main"
+        cwd = state["cwd"]
+        result = _run(run_command, ["git", "diff", f"{base}...HEAD"], cwd, check=False)
+        if result.returncode != 0:
+            diff_block = (
+                f"(could not compute `git diff {base}...HEAD` "
+                f"(exit {result.returncode}): {result.stderr.strip()})"
+            )
+        else:
+            diff = result.stdout
+            if len(diff) > _MAX_DIFF_CHARS:
+                diff = diff[:_MAX_DIFF_CHARS] + f"\n... (diff truncated at {_MAX_DIFF_CHARS} chars)"
+            diff_block = diff.strip() or "(empty diff -- no changes between base and HEAD)"
+
+        task_text = state.get("task_text", "")
+        augmented = (
+            f"{task_text}\n\n---\nPR diff (`git diff {base}...HEAD`), provided for your review:\n\n"
+            f"```diff\n{diff_block}\n```\n"
+        )
+        return {"task_text": augmented}
+
+    return _node
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +582,7 @@ def build_reviewer_graph(
     graph: StateGraph[ReviewerState, Any, Any, Any] = StateGraph(ReviewerState)
     graph.add_node("load_context", load_context)
     graph.add_node("ensure_worktree", coder.make_ensure_worktree(resolved_run_command))
+    graph.add_node("load_diff", make_load_diff(resolved_run_command))
     graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer))
     graph.add_node("classify", classify)
     graph.add_node("post_comments", make_post_comments(resolved_run_command))
@@ -542,7 +590,8 @@ def build_reviewer_graph(
 
     graph.add_edge(START, "load_context")
     graph.add_edge("load_context", "ensure_worktree")
-    graph.add_edge("ensure_worktree", "run_DAC")
+    graph.add_edge("ensure_worktree", "load_diff")
+    graph.add_edge("load_diff", "run_DAC")
     graph.add_conditional_edges("run_DAC", route_after_dac)
     graph.add_conditional_edges("classify", route_after_classify)
     graph.add_edge("post_comments", "emit_result")
