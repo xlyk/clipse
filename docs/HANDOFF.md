@@ -1,64 +1,91 @@
 # Clipse — session handoff
 
-**Date:** 2026-07-01 · **Phase:** 0 + 1 complete (on draft PR #1); **Phase 2 gate CLEARED** — implementing the DAC coder worker on `feat/phase-2-coder` (draft PR #2).
+**Date:** 2026-07-02 · **Branch:** `feat/phase-3-pipeline` · **Gate:** `make test` + `go test -race ./...` + `make lint` green.
 
-Resume brief for a fresh Claude Code session (terminal). Read this, then the guide + design + plan, then execute.
-
-## What this is
-
-Clipse turns Linear issues into merged PRs. A deterministic Go **dispatcher/kernel** polls Linear, atomically claims work into local SQLite, spawns per-issue Python **LangGraph + DAC** worker subprocesses in git worktrees, and owns every board transition off the worker's typed JSON result. The kernel is LLM-free; the LLM lives only in the worker. Full rationale + decision log (A–O) in the design doc.
-
-- Guide (architecture, invariants, conventions, commands): [AGENTS.md](../AGENTS.md)
-- Design: [docs/design/2026-07-01-clipse-design.md](design/2026-07-01-clipse-design.md)
-- Plan (phased checkbox work + acceptance criteria): [docs/plans/2026-07-01-clipse-implementation-plan.md](plans/2026-07-01-clipse-implementation-plan.md)
-- Applied code-review amendments: [docs/plans/2026-07-01-plan-amendments.md](plans/2026-07-01-plan-amendments.md)
-- SDD ledger (what shipped, commit SHAs, open follow-ups): `.superpowers/sdd/progress.md`
+Resume brief for a fresh session. Read this, then the guide + design + plan, then continue.
 
 ## Current state
 
-Phase 0 (scaffold + JSON-Schema contract + cross-language codegen + CI drift guard) and Phase 1 (the complete zero-LLM Go kernel) are **done** and on **draft PR #1** (`github.com/xlyk/clipse`, private; branch `feat/phase-0-1-kernel`, merged to `main`). All 11 Phase-1 acceptance criteria pass; `go test -race ./...` clean; CI green (go + python + codegen-drift). Kernel: `internal/{config,store,board,spawn,linear,contract}` + `dispatcher/` + `cli/` (`dispatch`/`status`/`tui`) + `testworker/`. Phase 0+1 plan checkboxes are ticked; Phase 2–4 are unchecked.
+The full pipeline is implemented. Phase 0/1 (the zero-LLM Go kernel), Phase 2
+(the DAC Coder worker), and Phase 3 (the Reviewer, Scribe, and Git-operator
+lanes, cross-lane per-column claiming, and the rework cap) all run. A live smoke
+took a 10-issue dependency DAG on a real Linear board through to merged PRs on
+`main`.
 
-Phase-2 work continues on branch `feat/phase-2-coder`.
+The kernel stays LLM-free; the LLM lives only in the worker; the seam is the
+subprocess + typed-JSON contract. Kernel invariants hold (see AGENTS.md):
+`running` only via CAS claim, SQLite is truth, Linear written only through the
+outbox, failures park in `blocked`, bare lane in the store, `block_kind` present
+iff blocked.
 
-## Scope for this run: Phase 2 (real DAC coder worker) — gate CLEARED
+Reference docs:
 
-All prerequisites are met (verified 2026-07-01):
+- Guide (architecture, invariants, conventions, commands): [AGENTS.md](../AGENTS.md)
+- Design: [docs/design/2026-07-01-clipse-design.md](design/2026-07-01-clipse-design.md)
+- GitHub App bot identity (follow-up design): [docs/design/2026-07-02-github-app-bot-identity.md](design/2026-07-02-github-app-bot-identity.md)
+- Plan (phased checkboxes + acceptance): [docs/plans/2026-07-01-clipse-implementation-plan.md](plans/2026-07-01-clipse-implementation-plan.md)
+- Applied code-review amendments: [docs/plans/2026-07-01-plan-amendments.md](plans/2026-07-01-plan-amendments.md)
+- SDD ledger (commit SHAs, open follow-ups): `.superpowers/sdd/progress.md`
 
-1. **DAC API spike** — ✅ **DONE** against `deepagents_code` 0.1.22. Findings in the design doc's "DAC API spike findings" subsection. Net: wrap DAC as an **in-process LangGraph graph** via `create_cli_agent(...)` (do not shell out to `dcode -n`); the kernel owns the `AsyncSqliteSaver` checkpointer + `thread_id`; **the worker must use `auto_approve=False, interrupt_shell_only=True`** or the shell allow-list is silently dropped.
-2. `ANTHROPIC_API_KEY` — ✅ (`../agents/apps/estimator-v2/.env`; `sk-ant…`). `gh` — ✅ (`xlyk`, `repo` scope).
-3. Linear board — ✅ **workspace `clipse-development`, team `CLI` (id `8b5b3301-8da3-4933-9b07-9efc027bc09d`)**. Workflow states created to match `internal/linear/status.go`: `Todo · Ready · Running · Review · Merging · Documentation · Done · Rework · Blocked` (+ Backlog/Canceled/Duplicate). Labels `agent:coder|reviewer|git_operator|scribe` created. **`LINEAR_API_KEY` in `~/.secrets` now → clipse-development** (old reflex key commented; backup `~/.secrets.bak.clipse`). Access via the `linear` CLI in **env-key mode** (`LINEAR_API_KEY` set ⇒ do NOT pass `--workspace`; e.g. `linear api '{ … }'`). Still TODO (non-blocking): connect Linear's **GitHub integration** to `xlyk/clipse` for PR↔issue auto-link.
-4. Target repo — ✅ **`xlyk/clipse` itself** (private, default `main`). Phase 2 only *opens* PRs (no merge), so this is fine as-is. ⚠️ `main` has **no branch protection / required checks yet** — stand these up before Phase-3 CI-gated auto-merge.
+## What shipped this session
 
-## How to execute
+Phase 3 lanes (`20c9ac1`) plus a run of fixes, each its own commit:
 
-Use `superpowers:subagent-driven-development`. In a normal interactive session, **`Workflow`-tool orchestration and background agents are fine** — orchestrate with the Workflow tool and sonnet-5 sub-agents. (Only if a workflow ever dies on a process cycle: fall back to **foreground `Agent` tool calls** and resume via `resumeFromRunId`.) Review each committed diff yourself (controller), dispatch a sonnet-5 fixer for Critical/Important findings, and run a broad whole-branch review at the end. Track progress in the plan checkboxes AND `.superpowers/sdd/progress.md`. Work on a feature branch → draft PR; never commit to `main` directly.
+- **Scribe writes docs on its own branch.** Docs land on a `-docs` branch off
+  `origin/<base>`, so the Scribe never force-pushes or non-ff-pushes the merged
+  branch (`964b3c3`).
+- **Dependency-direction bug fixed.** The kernel now reads Linear
+  `inverseRelations` to find an issue's blockers. Gating was inverted before, so
+  promotion order was wrong; it now promotes in true dependency order
+  (`29355c3`).
+- **Linear comments render as markdown** — emoji headings and fenced code, not
+  flat text (`a8b924d`).
+- **Reviewer posts `gh pr comment`, not a self-`gh pr review`.** GitHub blocks a
+  formal review on your own PR; the verdict flows through the typed result
+  instead (`ebcf5c4`, `6f5b1ad`). See the GitHub App design doc for why one
+  identity is fine here.
+- **Coder leaves git/gh to the platform.** It no longer loops on `gh pr create`;
+  the kernel owns commit/push/PR (`1ca66ca`).
+- **Git-operator retries a not-yet-ready merge** instead of blocking on it, and
+  marks a draft PR ready before merging (`2fc26f9`, `28ae4f3`).
+- **`max_tokens_per_run` default raised to 1M** (the smoke config uses 2M)
+  (`03f79c2`).
+- **Gorgeous bubbletea TUI** — liveness dot, activity feed, deps/progress,
+  `j`/`k` + `enter` inspector, and a `tab` kanban view; token counts sum across
+  all runs, not just the latest (`c36889f`, `f8314ec`, `855510a`, `6a16332`).
 
-## Hard constraints / invariants (do not break)
+## Live smoke
 
-- **TDD** (failing test first); `make test` is the gate; also `go test -race ./...`.
-- The kernel is LLM-free and its tests use zero LLM/network; the worker is the only LLM. Never let the kernel import Python or the worker touch the kernel DB — the seam is the subprocess + typed-JSON contract.
-- `schema/*.json` is the source of truth; `make codegen` regenerates both sides (do-not-edit the generated files); CI fails on drift.
-- Preserve kernel invariants: `running` only via CAS claim; SQLite is truth, Linear written only via the outbox; failures park in `blocked` (no auto-retry); bare lane in the store; `block_kind` present iff blocked.
-- **DAC worker shell safety (spike 2026-07-01):** the worker builds its agent with `auto_approve=False, interrupt_shell_only=True, shell_allow_list=[…]`. `auto_approve=True` silently disables the allow-list (`agent.py:1336/1597/1612`) — never use it as the sole boundary.
-- Structured logging only (slog JSON). Conventional/lowercase commits, one concern each, no AI signature. Never `git add -A`. Open PRs as drafts; push with `--force-with-lease`; never `--no-verify`. Ask before adding deps beyond the stack in AGENTS.md. When a Phase-2 finding contradicts the design doc (esp. the DAC API), update the design doc first, then the plan, then code.
+A 10-issue "greet" dependency DAG on the `clipse-development` Linear board (team
+`CLI`) against `xlyk/clipse`. Dependency-ordered promotion is proven end to end;
+about 8 of 10 issues merged to `main`. The smoke config lives at
+`~/Code/clipse-smoke/clipse.yaml` (local, uncommitted) with a reusable
+`seed.sh`.
 
-## Known follow-ups to fold into Phase 2/3 (see ledger)
+## How to run
 
-- **Cross-lane claiming**: reviewer/git-op/scribe issues sit at `review`/`merging`/`documentation`, but `store.ClaimReady` only claims `ready`→`running` — decide handoff-spawn vs. per-lane-entry claiming (Phase 3).
-- Wire `dispatcher.Workspacer.Remove` on the terminal (`done`) cleanup transition.
-- Linear `SetState` needs column → per-team-workflow-state-id resolution (do against `clipse-development`).
-- Per the Phase-2 plan: env-scrubbing allow-list (worker never sees `LINEAR_API_KEY`), per-issue checkpointer db + cleanup, `max_tokens_per_run` ceiling, idempotent `open_PR`.
-- **Pin `deepagents-code==0.1.22`** (`agent/pyproject.toml`) — every DAC symbol we import is internal/pre-1.0 (spike finding #5).
+- `make test` — the gate (Go suite + `agent/` pytest). Add `go test -race ./...`.
+- `make build` — compile `./bin/clipse`.
+- `./bin/clipse dispatch --config <clipse.yaml>` — the daemon (`--board <dir>`
+  optional; defaults to config `board_dir`).
+- `./bin/clipse tui --board <dir>` — live dashboard. Keys: `?` help, `tab`
+  kanban, `enter` detail, `q` quit. (`--board` defaults to `./.clipse`.)
+- `./bin/clipse status` — one-shot SQLite snapshot table.
 
-## Environment
+## Open follow-ups
 
-- Toolchain (verify): go (per `go.mod`, 1.25 floor), uv, python 3.13+, gh, git — all present as of 2026-07-01.
-- `deepagents-code` 0.1.22 + `langgraph` resolve and are installed in `agent/.venv`.
-- Sandbox/network: `go mod download` / `uv sync` / `git push` need network — allow it or disable the sandbox for those steps.
-
-## Immediate next steps
-
-1. Read AGENTS.md + design + plan + amendments + ledger.
-2. DAC API spike — ✅ done; findings in the design doc.
-3. Verify the last prerequisite: Linear board (`clipse-development`, via the `linear` CLI). Target repo = `xlyk/clipse` (add branch protection for Phase 3).
-4. Once the board exists, report the Phase-2 implementation plan (prerequisite status first) before writing worker code.
+- **Rework feedback → Coder retry prompt** (in progress). Without it, a
+  `changes_requested` issue re-runs as a fresh task and can't converge on the
+  reviewer's feedback. This is the next thing to finish.
+- **Auto-unblock, layer 1.** A bounded, deterministic retry of transient /
+  capability / crash blocks. `needs_input` and `rework_cap` exhaustion are
+  **not** auto-retryable — they need a human or new input.
+- **GitHub App bot identity.** Give Clipse its own `clipse[bot]` identity for
+  attribution and security, replacing the owner's PAT. Design + how-to in
+  [docs/design/2026-07-02-github-app-bot-identity.md](design/2026-07-02-github-app-bot-identity.md).
+- **HITL answer → resume channel.** A `blocked(needs_input)` issue that is
+  requeued re-runs as a fresh turn, not a resume with the human's answer fed
+  back into the pending interrupt. Design the answer → `Command(resume=…)`
+  channel (e.g. sourced from a Linear comment).
+- **Smoke cleanup.** `samples/greet/*` from the smoke was merged into
+  `xlyk/clipse` `main`; delete it once you're done demoing.
