@@ -112,7 +112,16 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 func (m Model) rowDetail(row Row, s section, now int64) string {
 	if s.waiting {
 		if unmet := unmetDeps(row.Deps, m.identByID, m.statusByID); len(unmet) > 0 {
-			return waitingStyle.Render("⏳ waiting on " + strings.Join(unmet, ", "))
+			// Cap the listed deps so a heavily-blocked card's detail can't grow
+			// wide enough to wrap the row (which would also throw off the body
+			// line geometry orderedLineIndex measures).
+			const maxShown = 3
+			suffix := ""
+			if len(unmet) > maxShown {
+				suffix = fmt.Sprintf(" +%d", len(unmet)-maxShown)
+				unmet = unmet[:maxShown]
+			}
+			return waitingStyle.Render("⏳ waiting on " + strings.Join(unmet, ", ") + suffix)
 		}
 	}
 
@@ -155,19 +164,34 @@ func (m Model) renderDoneSummary(inner int) string {
 }
 
 // orderedLineIndex returns the 0-based line, within renderBody's output, of the
-// ordered row at global index g. It mirrors renderSection's box geometry:
-// each panel is 1 top-border + 1 heading + max(1, rowCount) content + 1
-// bottom-border lines, and panels are joined with no blank line between them.
-// Used only to keep the selected row visible; a small drift is harmless.
+// ordered row at global index g. It measures actual rendered heights rather
+// than assuming one line per row, so a row that wraps at a narrow width can't
+// drift the result: preceding panels are summed via lipgloss.Height of the
+// whole panel, and rows preceding g within its panel via lipgloss.Height of
+// each rendered row (the heading is a single short line). Used to keep the
+// selected row visible when scrolling.
 func (m Model) orderedLineIndex(g int) int {
+	width := m.width
+	if width <= 0 {
+		width = 96
+	}
+	inner := width - 4
+	if inner < 24 {
+		inner = 24
+	}
+
 	line := 0
 	seen := 0
 	for _, s := range m.sectionList() {
 		if g < seen+len(s.rows) {
-			return line + 2 + (g - seen) // +1 top border, +1 heading
+			line += 2 // top border + heading
+			for i := 0; i < g-seen; i++ {
+				line += lipgloss.Height(m.renderRow(s.rows[i], s, inner, 0))
+			}
+			return line
 		}
 		seen += len(s.rows)
-		line += 3 + maxInt(1, len(s.rows)) // 2 borders + heading + rows/placeholder
+		line += lipgloss.Height(m.renderSection(s, inner, 0))
 	}
 	return line
 }

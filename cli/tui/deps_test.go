@@ -4,6 +4,10 @@ import (
 	"math"
 	"reflect"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/xlyk/clipse/internal/store"
 )
 
 // TestParseDeps covers the forgiving JSON decode: well-formed arrays parse,
@@ -94,5 +98,36 @@ func TestEstimateCostUSD(t *testing.T) {
 	}
 	if got := estimateCostUSD(0, 0); got != 0 {
 		t.Errorf("estimateCostUSD(0,0) = %f, want 0", got)
+	}
+}
+
+// TestOrderedLineIndex_StrictlyIncreasing asserts the scroll-follow line
+// geometry advances monotonically across the flattened ordered rows spanning
+// all four sections — the property ensureSelectionVisible relies on. Because
+// orderedLineIndex measures rendered heights, this holds even if a row wraps.
+func TestOrderedLineIndex_StrictlyIncreasing(t *testing.T) {
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			{Issue: store.Issue{ID: "1", Identifier: "CLI-1", BoardStatus: "running"}},
+			{Issue: store.Issue{ID: "2", Identifier: "CLI-2", BoardStatus: "review"}},
+			{Issue: store.Issue{ID: "3", Identifier: "CLI-3", BoardStatus: "blocked"}},
+			{Issue: store.Issue{ID: "4", Identifier: "CLI-4", BoardStatus: "ready"}},
+			{Issue: store.Issue{ID: "5", Identifier: "CLI-5", BoardStatus: "todo"}},
+		},
+	}
+	m := NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: snap})
+
+	if len(m.ordered) != 5 {
+		t.Fatalf("ordered rows = %d, want 5", len(m.ordered))
+	}
+	prev := -1
+	for i := range m.ordered {
+		li := m.orderedLineIndex(i)
+		if li <= prev {
+			t.Errorf("orderedLineIndex(%d) = %d, want strictly > previous (%d)", i, li, prev)
+		}
+		prev = li
 	}
 }
