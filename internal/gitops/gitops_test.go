@@ -373,3 +373,37 @@ func TestRun_InvalidSpec_ReturnsError(t *testing.T) {
 		t.Fatal("Run: expected an error for an empty Spec, got nil")
 	}
 }
+
+func TestRun_DraftPR_MarksReadyThenMerges(t *testing.T) {
+	spec, callLog := setupScenario(t, "draft")
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+	if res.Outcome != OutcomeMerged {
+		t.Fatalf("Run() Outcome = %q, want %q (Reason: %q)", res.Outcome, OutcomeMerged, res.Reason)
+	}
+
+	calls := readCallLog(t, callLog)
+	// gh refuses to merge a draft PR (the Coder lane opens drafts), so Run
+	// must `gh pr ready` it exactly once, strictly before `gh pr merge`.
+	if got := countCallsWithPrefix(calls, "pr ready "+spec.Branch); got != 1 {
+		t.Errorf("gh pr ready called %d times, want 1 (calls: %v)", got, calls)
+	}
+	if got := countCallsWithPrefix(calls, "pr merge "+spec.Branch); got != 1 {
+		t.Errorf("gh pr merge called %d times, want 1 (calls: %v)", got, calls)
+	}
+	readyIdx, mergeIdx := -1, -1
+	for i, c := range calls {
+		if readyIdx == -1 && strings.HasPrefix(c, "pr ready "+spec.Branch) {
+			readyIdx = i
+		}
+		if mergeIdx == -1 && strings.HasPrefix(c, "pr merge "+spec.Branch) {
+			mergeIdx = i
+		}
+	}
+	if readyIdx == -1 || mergeIdx == -1 || readyIdx > mergeIdx {
+		t.Errorf("expected `gh pr ready` before `gh pr merge`; readyIdx=%d mergeIdx=%d calls=%v", readyIdx, mergeIdx, calls)
+	}
+}

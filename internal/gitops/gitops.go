@@ -221,6 +221,15 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 		}
 	}
 
+	// The Coder lane opens draft PRs (project convention); gh refuses to
+	// merge a draft, so convert it to ready-for-review first. Gated on
+	// IsDraft so a non-draft PR is never needlessly readied.
+	if view.IsDraft {
+		if err := readyPR(ctx, spec, runCommand); err != nil {
+			return Result{}, fmt.Errorf("gitops: marking draft PR ready for branch %s: %w", spec.Branch, err)
+		}
+	}
+
 	mergeRes, err := mergePR(ctx, spec, runCommand)
 	if err != nil {
 		return Result{}, fmt.Errorf("gitops: merging PR for branch %s: %w", spec.Branch, err)

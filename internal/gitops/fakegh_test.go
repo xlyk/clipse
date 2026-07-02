@@ -39,6 +39,9 @@ pr)
 		already_merged)
 			echo '{"number":7,"url":"https://github.com/x/y/pull/7","state":"MERGED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN"}'
 			;;
+		draft)
+			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"MERGEABLE","mergeStateStatus":"DRAFT","isDraft":true}'
+			;;
 		stale_base_merges | stale_base_conflict)
 			if [ -f "$updated_marker" ]; then
 				if [ "$scenario" = "stale_base_conflict" ]; then
@@ -88,6 +91,9 @@ pr)
 		mkdir -p "$state_dir"
 		touch "$updated_marker"
 		echo 'Updated branch clp-1 with latest changes from main'
+		;;
+	ready)
+		echo 'https://github.com/x/y/pull/7'
 		;;
 	*)
 		echo "fakegh: unknown pr subcommand: $sub2" >&2
