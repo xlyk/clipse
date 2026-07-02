@@ -49,7 +49,22 @@ func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, w
 		args = []string{"worktree", "add", "-b", branch, path, baseBranch}
 	}
 	if err := runGitCmd(ctx, primaryClonePath, args...); err != nil {
-		return "", fmt.Errorf("creating worktree for branch %s at %s: %w", branch, path, err)
+		if !isMissingButRegisteredWorktreeErr(err) {
+			return "", fmt.Errorf("creating worktree for branch %s at %s: %w", branch, path, err)
+		}
+		// The target directory was removed directly (e.g. os.RemoveAll,
+		// bypassing RemoveWorktree/`git worktree remove`), but git's own
+		// .git/worktrees administrative metadata still claims path, so the
+		// add above fails with "is a missing but already registered
+		// worktree" every time until that stale registration is pruned.
+		// Prune once and retry the exact same add; a failure past that point
+		// is a real error, not this recoverable collision.
+		if pruneErr := runGitCmd(ctx, primaryClonePath, "worktree", "prune"); pruneErr != nil {
+			return "", fmt.Errorf("pruning stale worktree registrations for branch %s at %s: %w", branch, path, pruneErr)
+		}
+		if retryErr := runGitCmd(ctx, primaryClonePath, args...); retryErr != nil {
+			return "", fmt.Errorf("creating worktree for branch %s at %s (retry after prune): %w", branch, path, retryErr)
+		}
 	}
 
 	return path, nil
@@ -111,6 +126,16 @@ func runGitCmd(ctx context.Context, dir string, args ...string) error {
 		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// isMissingButRegisteredWorktreeErr reports whether a `git worktree add`
+// failure is git's "missing but already registered worktree" error (exit
+// 128): the target path's on-disk directory is gone, but git's own
+// .git/worktrees metadata still has it registered, so EnsureWorktree can
+// recover by pruning that stale registration and retrying once, rather than
+// treating this the same as any other add failure.
+func isMissingButRegisteredWorktreeErr(err error) bool {
+	return strings.Contains(err.Error(), "is a missing but already registered worktree")
 }
 
 // isAlreadyGoneWorktreeErr reports whether a `git worktree remove` failure

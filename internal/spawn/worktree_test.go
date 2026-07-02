@@ -137,6 +137,47 @@ func TestEnsureWorktree_ReusesExisting(t *testing.T) {
 	}
 }
 
+// TestEnsureWorktree_PrunesAndRetriesOnMissingButRegisteredCollision asserts
+// that when a worktree's directory was removed directly (e.g. os.RemoveAll,
+// bypassing `git worktree remove`/RemoveWorktree) rather than through the
+// normal cleanup path, a later EnsureWorktree call for the same branch
+// recovers instead of failing forever. git's own .git/worktrees
+// administrative metadata still claims the path even though the directory
+// itself is gone, so a bare retry of `git worktree add` fails with "is a
+// missing but already registered worktree" (exit 128) every time; the fix is
+// `git worktree prune` on the primary clone, then one retry of the same add.
+func TestEnsureWorktree_PrunesAndRetriesOnMissingButRegisteredCollision(t *testing.T) {
+	primary := newPrimaryRepo(t, "main")
+	worktreeRoot := t.TempDir()
+
+	path, err := spawn.EnsureWorktree(ctxWithTimeout(t), primary, "clp-999-recover", "main", worktreeRoot)
+	if err != nil {
+		t.Fatalf("EnsureWorktree (first call): unexpected error: %v", err)
+	}
+
+	// Simulate the directory vanishing without going through
+	// RemoveWorktree (a crashed cleanup, a clobbered disk, an operator's
+	// stray rm -rf): git's own worktree registration survives even though
+	// the directory doesn't.
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("os.RemoveAll(%s): unexpected error: %v", path, err)
+	}
+
+	path2, err := spawn.EnsureWorktree(ctxWithTimeout(t), primary, "clp-999-recover", "main", worktreeRoot)
+	if err != nil {
+		t.Fatalf("EnsureWorktree (second call, after directory removed): unexpected error: %v", err)
+	}
+	if path2 != path {
+		t.Errorf("recovered worktree path = %q, want same as first call's %q", path2, path)
+	}
+	if _, statErr := os.Stat(path2); statErr != nil {
+		t.Errorf("recovered worktree path %s does not exist: %v", path2, statErr)
+	}
+	if got := currentBranch(t, path2); got != "clp-999-recover" {
+		t.Errorf("recovered worktree checked-out branch = %q, want %q", got, "clp-999-recover")
+	}
+}
+
 // TestRemoveWorktree_DeletesWorktreeAndBranch asserts RemoveWorktree removes
 // the worktree directory and deletes the local branch.
 func TestRemoveWorktree_DeletesWorktreeAndBranch(t *testing.T) {
