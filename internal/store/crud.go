@@ -271,7 +271,96 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		}
 	}
 
+	runs, err := s.runsByIssue(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	for i := range snap.Issues {
+		snap.Issues[i].Runs = runs[snap.Issues[i].ID]
+	}
+
+	events, err := s.recentEvents(ctx, recentEventLimit)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snap.RecentEvents = events
+	for _, e := range events {
+		if e.Ts > snap.LastEventAt {
+			snap.LastEventAt = e.Ts
+		}
+	}
+
 	return snap, nil
+}
+
+// recentEventLimit caps how many trailing events ReadSnapshot loads for the
+// TUI activity feed. Small enough to keep the read cheap on a busy board, big
+// enough to fill a feed panel.
+const recentEventLimit = 15
+
+// recentEvents returns the last `limit` events, newest-first (highest id
+// first). Unlike ListEvents (ascending, whole table) this is the tail read the
+// TUI activity feed wants; ordering by id — a monotonic AUTOINCREMENT — is a
+// stable proxy for append order even if two events share a ts.
+func (s *Store) recentEvents(ctx context.Context, limit int) ([]Event, error) {
+	const q = `
+		SELECT id, ts, issue_id, run_id, kind, detail
+		FROM events
+		ORDER BY id DESC
+		LIMIT ?
+	`
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("reading recent events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.ID, &e.Ts, &e.IssueID, &e.RunID, &e.Kind, &e.Detail); err != nil {
+			return nil, fmt.Errorf("scanning recent event row: %w", err)
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating recent event rows: %w", err)
+	}
+	return events, nil
+}
+
+// runsByIssue returns every run grouped by issue id, each issue's slice in
+// chronological order (oldest first, by started_at then run_id). One grouped
+// query rather than a per-issue lookup in ReadSnapshot's loop; an issue with
+// no runs is simply absent from the map (nil slice on lookup).
+func (s *Store) runsByIssue(ctx context.Context) (map[string][]Run, error) {
+	const q = `
+		SELECT run_id, issue_id, lane, worker_pid, proc_started_at, status, started_at, heartbeat_at,
+			attempt, turn_count, thread_id, result_json, error, tokens_in, tokens_out
+		FROM runs
+		ORDER BY issue_id, started_at, run_id
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("reading runs by issue: %w", err)
+	}
+	defer rows.Close()
+
+	byIssue := make(map[string][]Run)
+	for rows.Next() {
+		var r Run
+		if err := rows.Scan(
+			&r.RunID, &r.IssueID, &r.Lane, &r.WorkerPID, &r.ProcStartedAt, &r.Status, &r.StartedAt, &r.HeartbeatAt,
+			&r.Attempt, &r.TurnCount, &r.ThreadID, &r.ResultJSON, &r.Error, &r.TokensIn, &r.TokensOut,
+		); err != nil {
+			return nil, fmt.Errorf("scanning run-by-issue row: %w", err)
+		}
+		byIssue[r.IssueID] = append(byIssue[r.IssueID], r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating run-by-issue rows: %w", err)
+	}
+	return byIssue, nil
 }
 
 // unmirroredIssueIDs returns the set of issue ids that have at least one

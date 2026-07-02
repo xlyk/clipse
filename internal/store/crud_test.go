@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/xlyk/clipse/internal/store"
@@ -57,6 +59,129 @@ func TestReadSnapshot_CumulativeTokensAcrossRuns(t *testing.T) {
 	}
 	if snap.TotalTokensOut != 303 {
 		t.Errorf("Snapshot.TotalTokensOut = %d, want 303 (300+3)", snap.TotalTokensOut)
+	}
+}
+
+// TestReadSnapshot_RecentEventsAndLastEventAt asserts ReadSnapshot loads the
+// trailing events newest-first, capped at recentEventLimit (15), and reports
+// LastEventAt as the max ts across them — the data the TUI liveness signal and
+// activity feed read.
+func TestReadSnapshot_RecentEventsAndLastEventAt(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "running"}); err != nil {
+		t.Fatalf("UpsertIssue: %v", err)
+	}
+
+	// Append 20 events with increasing ts so the newest-first cap (15) drops
+	// the 5 oldest, and LastEventAt lands on the final append.
+	const n = 20
+	for i := 1; i <= n; i++ {
+		if err := s.AppendEvent(ctx, store.Event{
+			Ts:      int64(1000 + i),
+			IssueID: sql.NullString{String: "issue-1", Valid: true},
+			Kind:    "claimed",
+			Detail:  fmt.Sprintf("event %d", i),
+		}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+	}
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+
+	if got, want := len(snap.RecentEvents), 15; got != want {
+		t.Fatalf("len(RecentEvents) = %d, want %d (recentEventLimit cap)", got, want)
+	}
+	// Newest-first: the first element is the last-appended event (ts 1020).
+	if got, want := snap.RecentEvents[0].Detail, "event 20"; got != want {
+		t.Errorf("RecentEvents[0].Detail = %q, want %q (newest-first)", got, want)
+	}
+	if got, want := snap.RecentEvents[14].Detail, "event 6"; got != want {
+		t.Errorf("RecentEvents[14].Detail = %q, want %q (oldest retained)", got, want)
+	}
+	if got, want := snap.LastEventAt, int64(1000+n); got != want {
+		t.Errorf("LastEventAt = %d, want %d (max ts)", got, want)
+	}
+}
+
+// TestReadSnapshot_NoEvents asserts an empty events table yields no recent
+// events and a zero LastEventAt (the "no activity yet" liveness reading).
+func TestReadSnapshot_NoEvents(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "ready"}); err != nil {
+		t.Fatalf("UpsertIssue: %v", err)
+	}
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	if len(snap.RecentEvents) != 0 {
+		t.Errorf("len(RecentEvents) = %d, want 0", len(snap.RecentEvents))
+	}
+	if snap.LastEventAt != 0 {
+		t.Errorf("LastEventAt = %d, want 0", snap.LastEventAt)
+	}
+}
+
+// TestReadSnapshot_IssueRuns asserts each IssueSnapshot carries every one of
+// its runs in chronological order (oldest lane first), so the TUI detail view
+// can render the full per-lane history — while LatestRun still points at the
+// most recent run.
+func TestReadSnapshot_IssueRuns(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "documentation"}); err != nil {
+		t.Fatalf("UpsertIssue issue-1: %v", err)
+	}
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-2", Identifier: "CLP-2", BoardStatus: "ready"}); err != nil {
+		t.Fatalf("UpsertIssue issue-2: %v", err)
+	}
+
+	// issue-1: three lane runs, inserted out of chronological order to prove
+	// the query sorts by started_at rather than insertion order.
+	for _, r := range []store.Run{
+		{RunID: "r3", IssueID: "issue-1", Lane: "scribe", Status: "done", StartedAt: 30, Attempt: 1},
+		{RunID: "r1", IssueID: "issue-1", Lane: "coder", Status: "needs_review", StartedAt: 10, Attempt: 1},
+		{RunID: "r2", IssueID: "issue-1", Lane: "reviewer", Status: "done", StartedAt: 20, Attempt: 1},
+	} {
+		if err := s.InsertRun(ctx, r); err != nil {
+			t.Fatalf("InsertRun %s: %v", r.RunID, err)
+		}
+	}
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+
+	byID := map[string]store.IssueSnapshot{}
+	for _, is := range snap.Issues {
+		byID[is.ID] = is
+	}
+
+	got := byID["issue-1"].Runs
+	if len(got) != 3 {
+		t.Fatalf("issue-1 Runs len = %d, want 3", len(got))
+	}
+	wantOrder := []string{"coder", "reviewer", "scribe"}
+	for i, lane := range wantOrder {
+		if got[i].Lane != lane {
+			t.Errorf("issue-1 Runs[%d].Lane = %q, want %q (chronological)", i, got[i].Lane, lane)
+		}
+	}
+	if lr := byID["issue-1"].LatestRun; lr == nil || lr.RunID != "r3" {
+		t.Errorf("issue-1 LatestRun = %+v, want run r3 (most recent)", lr)
+	}
+	if got := byID["issue-2"].Runs; len(got) != 0 {
+		t.Errorf("issue-2 Runs len = %d, want 0 (no runs)", len(got))
 	}
 }
 

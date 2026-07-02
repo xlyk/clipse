@@ -88,6 +88,13 @@ type IssueSnapshot struct {
 	Issue
 	LatestRun *Run
 
+	// Runs is every run for this issue in chronological order (oldest first:
+	// coder, then reviewer, then git_operator, then scribe as the card
+	// advances). LatestRun is retained as the convenience "current lane"
+	// pointer; Runs is what the TUI's per-issue detail view walks to show the
+	// full lane history. A card with no runs yet has an empty (nil) slice.
+	Runs []Run
+
 	// TokensInTotal / TokensOutTotal sum tokens across ALL of this issue's
 	// runs (every lane it has passed through — coder, reviewer, scribe, ...),
 	// not just LatestRun. Displaying LatestRun's tokens alone dropped every
@@ -117,4 +124,14 @@ type Snapshot struct {
 	// UnmirroredCount is the number of issues with Unmirrored=true, i.e. how
 	// many issues currently have a pending Linear mirror write outstanding.
 	UnmirroredCount int
+
+	// RecentEvents is the tail of the append-only events stream, newest-first
+	// (highest id first), capped at a small limit for the TUI's activity feed.
+	RecentEvents []Event
+
+	// LastEventAt is the maximum ts across RecentEvents (0 when there are no
+	// events). The TUI derives a "last activity Ns ago" liveness reading from
+	// it. It is a wall-clock-free datum: View, not the pure Update, turns it
+	// into an age against time.Now.
+	LastEventAt int64
 }
