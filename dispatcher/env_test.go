@@ -89,6 +89,11 @@ func TestSpawnAttempt_DefaultEnvFor_FiltersToConfiguredAllowlist(t *testing.T) {
 	if _, leaked := got["LINEAR_API_KEY"]; leaked {
 		t.Errorf("worker env leaked LINEAR_API_KEY (env=%v)", specs[0].Env)
 	}
+	// A fresh ready claim is not a rework re-run, so it carries no review
+	// feedback — only a coder claim out of the rework column does.
+	if _, present := got["CLIPSE_REVIEW_FEEDBACK"]; present {
+		t.Errorf("worker env has CLIPSE_REVIEW_FEEDBACK on a fresh ready claim (env=%v)", specs[0].Env)
+	}
 	if _, leaked := got["SOME_UNRELATED_VAR"]; leaked {
 		t.Errorf("worker env leaked SOME_UNRELATED_VAR (env=%v)", specs[0].Env)
 	}

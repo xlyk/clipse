@@ -211,6 +211,18 @@ func defaultEnvFor(allowlist []string) func(store.Issue) []string {
 // worker.
 const clipseIssueTextEnvVar = "CLIPSE_ISSUE_TEXT"
 
+// clipseReviewFeedbackEnvVar carries the most recent review/rework feedback
+// into a Coder lane re-run claimed out of the rework column: the summary of
+// the run that routed the card there (a Reviewer's changes_requested, or a
+// Git-operator stale-base conflict -- see store.LatestReworkFeedback).
+// graphs/coder.py load_context folds it into the DAC prompt so the Coder
+// actually acts on the feedback instead of re-emitting a byte-identical diff.
+// Like CLIPSE_ISSUE_TEXT it is injected directly by the dispatcher at spawn
+// time (spawnAttempt), never sourced from the host environment, so it bypasses
+// the EnvAllowlist scrubbing entirely; a fresh coder claim from ready never
+// sets it.
+const clipseReviewFeedbackEnvVar = "CLIPSE_REVIEW_FEEDBACK"
+
 // issueText composes the worker-facing task text for issue: its title, plus
 // a blank-line-separated description when non-empty (just the title
 // otherwise). Trailing whitespace is stripped so a Linear issue with a

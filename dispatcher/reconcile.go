@@ -143,7 +143,11 @@ func (d *Dispatcher) applyContinue(ctx context.Context, issue store.Issue, rr ru
 		return fmt.Errorf("bumping turn for run %s: %w", rr.runID, err)
 	}
 
-	if err := d.spawnAttempt(ctx, issue, rr.runID, inf.lane, rr.res.Worker.ThreadId, newTurn); err != nil {
+	// A continuation resumes the same thread the previous turn checkpointed;
+	// its context carries forward on that thread, so no fresh rework feedback
+	// is injected here (the turn-cap continue path is unused for the DAC coder
+	// anyway — see AGENTS.md).
+	if err := d.spawnAttempt(ctx, issue, rr.runID, inf.lane, rr.res.Worker.ThreadId, newTurn, ""); err != nil {
 		return fmt.Errorf("respawning run %s for continuation: %w", rr.runID, err)
 	}
 	return nil

@@ -546,3 +546,80 @@ func TestReadSnapshot_FlagsUnmirroredIssues(t *testing.T) {
 		t.Errorf("UnmirroredCount = %d, want 1", snap.UnmirroredCount)
 	}
 }
+
+// TestLatestReworkFeedback covers the read the dispatcher uses to thread the
+// most recent review/rework verdict into a Coder re-run's prompt: the newest
+// changes_requested run's summary (from result_json), an error fallback when
+// result_json carries no summary, and "" when the issue never had a
+// changes_requested run at all (so a fresh coder claim threads nothing).
+func TestLatestReworkFeedback(t *testing.T) {
+	ns := func(v string) sql.NullString { return sql.NullString{String: v, Valid: true} }
+
+	tests := []struct {
+		name string
+		runs []store.Run
+		want string
+	}{
+		{
+			name: "newest changes_requested summary wins over older ones and non-rework runs",
+			runs: []store.Run{
+				{RunID: "r1", Lane: "coder", Status: "needs_review", StartedAt: 10, ResultJSON: ns(`{"summary":"coder turn 1"}`)},
+				{RunID: "r2", Lane: "reviewer", Status: "changes_requested", StartedAt: 20, ResultJSON: ns(`{"summary":"first review: needs work"}`)},
+				{RunID: "r3", Lane: "coder", Status: "needs_review", StartedAt: 25, ResultJSON: ns(`{"summary":"coder turn 2"}`)},
+				{RunID: "r4", Lane: "reviewer", Status: "changes_requested", StartedAt: 30, ResultJSON: ns(`{"summary":"remove the fabricated clipse.yaml section"}`)},
+			},
+			want: "remove the fabricated clipse.yaml section",
+		},
+		{
+			name: "falls back to error when result_json is absent",
+			runs: []store.Run{
+				{RunID: "r1", Lane: "git_operator", Status: "changes_requested", StartedAt: 10, Error: ns("stale base conflict (conflicting files: a.go)")},
+			},
+			want: "stale base conflict (conflicting files: a.go)",
+		},
+		{
+			name: "empty when the issue never had a changes_requested run",
+			runs: []store.Run{
+				{RunID: "r1", Lane: "coder", Status: "needs_review", StartedAt: 10, ResultJSON: ns(`{"summary":"coder turn 1"}`)},
+			},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := openTestStore(t)
+			ctx := context.Background()
+			if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "rework"}); err != nil {
+				t.Fatalf("UpsertIssue: unexpected error: %v", err)
+			}
+			for _, r := range tt.runs {
+				r.IssueID = "issue-1"
+				if err := s.InsertRun(ctx, r); err != nil {
+					t.Fatalf("InsertRun %s: unexpected error: %v", r.RunID, err)
+				}
+			}
+
+			got, err := s.LatestReworkFeedback(ctx, "issue-1")
+			if err != nil {
+				t.Fatalf("LatestReworkFeedback: unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("LatestReworkFeedback = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLatestReworkFeedback_UnknownIssue returns "" (no error) for an issue
+// with no runs at all, matching the "fresh claim threads nothing" contract.
+func TestLatestReworkFeedback_UnknownIssue(t *testing.T) {
+	s := openTestStore(t)
+	got, err := s.LatestReworkFeedback(context.Background(), "no-such-issue")
+	if err != nil {
+		t.Fatalf("LatestReworkFeedback: unexpected error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("LatestReworkFeedback = %q, want empty", got)
+	}
+}

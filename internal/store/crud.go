@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -464,6 +465,54 @@ func (s *Store) BumpRunTurn(ctx context.Context, runID string) (int, error) {
 		return 0, fmt.Errorf("bumping turn for run %s: reading new turn_count: %w", runID, err)
 	}
 	return newTurn, nil
+}
+
+// LatestReworkFeedback returns the human-readable feedback that most
+// recently routed issueID to the rework column: the summary of the newest
+// run whose status is "changes_requested". That covers both edges the board
+// state machine treats identically (see dispatcher.applyTerminalWorkerOutcome):
+// the Reviewer lane's changes_requested from review, and the Git-operator
+// lane's stale-base-conflict route from merging (dispatcher.applyGitopsResult
+// builds an equivalent changes_requested WorkerResult) -- both close their run
+// with status "changes_requested" and their summary in runs.result_json.
+//
+// The summary is read out of result_json's "summary" field; when result_json
+// is absent or carries an empty summary, runs.error is used as a fallback. It
+// returns "" (and no error) when the issue has never had a changes_requested
+// run, so a fresh Coder claim from ready threads no feedback -- only a
+// re-run claimed out of the rework column does.
+func (s *Store) LatestReworkFeedback(ctx context.Context, issueID string) (string, error) {
+	const q = `
+		SELECT result_json, error
+		FROM runs
+		WHERE issue_id = ? AND status = 'changes_requested'
+		ORDER BY started_at DESC, run_id DESC
+		LIMIT 1
+	`
+	var resultJSON, runErr sql.NullString
+	err := s.db.QueryRowContext(ctx, q, issueID).Scan(&resultJSON, &runErr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading latest rework feedback for issue %s: %w", issueID, err)
+	}
+
+	if resultJSON.Valid && resultJSON.String != "" {
+		var payload struct {
+			Summary string `json:"summary"`
+		}
+		if err := json.Unmarshal([]byte(resultJSON.String), &payload); err != nil {
+			return "", fmt.Errorf("parsing rework feedback result_json for issue %s: %w", issueID, err)
+		}
+		if payload.Summary != "" {
+			return payload.Summary, nil
+		}
+	}
+	if runErr.Valid {
+		return runErr.String, nil
+	}
+	return "", nil
 }
 
 // latestRun returns the most recently started run for issueID, or nil if

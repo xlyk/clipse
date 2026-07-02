@@ -83,7 +83,17 @@ func (d *Dispatcher) claimCoderPool(ctx context.Context, now int64) error {
 			return fmt.Errorf("claiming coder pool candidate: %w", err)
 		}
 
-		if !fromRework {
+		// A rework re-run must carry the feedback that routed the card back
+		// here (the reviewer's changes_requested, or a gitops stale-base
+		// conflict) so the Coder lane can actually address it rather than
+		// re-emitting the same diff. A fresh ready claim has no such feedback.
+		reviewFeedback := ""
+		if fromRework {
+			reviewFeedback, err = d.store.LatestReworkFeedback(ctx, claim.Issue.ID)
+			if err != nil {
+				return fmt.Errorf("loading rework feedback for issue %s: %w", claim.Issue.ID, err)
+			}
+		} else {
 			// Only the ready -> running move changes board_status, so
 			// only it needs a Linear mirror (R5): ClaimReady's CAS is not
 			// itself a Transition call, so nothing else enqueues this
@@ -96,7 +106,7 @@ func (d *Dispatcher) claimCoderPool(ctx context.Context, now int64) error {
 			}
 		}
 
-		if err := d.spawnClaim(ctx, *claim); err != nil {
+		if err := d.spawnClaim(ctx, *claim, reviewFeedback); err != nil {
 			return fmt.Errorf("spawning claim for issue %s: %w", claim.Issue.ID, err)
 		}
 	}
@@ -193,7 +203,9 @@ func (d *Dispatcher) claimSimpleColumn(ctx context.Context, now int64, column, l
 			return fmt.Errorf("claiming column %s: %w", column, err)
 		}
 
-		if err := d.spawnClaim(ctx, *claim); err != nil {
+		// Reviewer/scribe claims carry no rework feedback — that is a
+		// Coder-lane-only concern (see claimCoderPool).
+		if err := d.spawnClaim(ctx, *claim, ""); err != nil {
 			return fmt.Errorf("spawning claim for issue %s: %w", claim.Issue.ID, err)
 		}
 	}
@@ -203,10 +215,12 @@ func (d *Dispatcher) claimSimpleColumn(ctx context.Context, now int64, column, l
 // Lane already carries the lane the claim dispatched (the bare lane
 // ClaimReady/ClaimColumn recorded — "coder"/"reviewer"/"scribe"), so this
 // needs no per-lane branching: spawnAttempt/WorkerSpec build the right
-// `--lane` flag for whichever lane the claim was for (R5). A Spawn failure
+// `--lane` flag for whichever lane the claim was for (R5). reviewFeedback is
+// the rework feedback for a Coder re-run out of the rework column (empty for
+// every other claim); see spawnAttempt. A Spawn failure
 // (e.g. workspace setup or exec failure, as opposed to a worker process
 // failure) is treated the same as an in-run failure: the issue is blocked
 // immediately, since there is no process to wait on.
-func (d *Dispatcher) spawnClaim(ctx context.Context, claim store.Claim) error {
-	return d.spawnAttempt(ctx, claim.Issue, claim.Run.RunID, claim.Run.Lane, "", 1)
+func (d *Dispatcher) spawnClaim(ctx context.Context, claim store.Claim, reviewFeedback string) error {
+	return d.spawnAttempt(ctx, claim.Issue, claim.Run.RunID, claim.Run.Lane, "", 1, reviewFeedback)
 }

@@ -3,6 +3,7 @@ package dispatcher_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,17 @@ import (
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/store"
 )
+
+// envValue returns the value bound to key in a KEY=VALUE environment slice
+// (as carried on spawn.WorkerSpec.Env), and whether it was present at all.
+func envValue(env []string, key string) (string, bool) {
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			return v, true
+		}
+	}
+	return "", false
+}
 
 // openTestStore opens a Store backed by a fresh SQLite file in a temp dir,
 // mirroring internal/store's own test helper (unexported there, so it can't

@@ -130,6 +130,7 @@ class CoderState(TypedDict, total=False):
     branch: str  # if omitted, ensure_worktree derives it via `git rev-parse`
     base_branch: str  # base branch for a newly-created PR; default "main"
     issue_text: str  # falls back to $CLIPSE_ISSUE_TEXT if omitted
+    review_feedback: str  # falls back to $CLIPSE_REVIEW_FEEDBACK if omitted
     turn_count: int  # turns already completed for this issue; default 0
     max_tokens: int | None
     resume_payload: Any | None  # non-None => resume a prior DAC interrupt
@@ -182,8 +183,9 @@ def _dac_config(thread_id: str) -> dict[str, Any]:
 
 
 def load_context(state: CoderState) -> dict[str, Any]:
-    """Compose this turn's DAC prompt from the issue text (args/env) plus
-    whatever summary a previous turn left behind.
+    """Compose this turn's DAC prompt from the issue text (args/env), any
+    summary a previous turn left behind, and any review feedback that routed
+    the card back to this lane for a rework re-run.
 
     `issue_text` normally arrives via the invocation input (set by
     worker.py from its own args); the `$CLIPSE_ISSUE_TEXT` env fallback
@@ -192,14 +194,25 @@ def load_context(state: CoderState) -> dict[str, Any]:
     compiled with a checkpointer and invoked again with the same
     thread_id, it also arrives automatically as whatever `emit_result` set
     on the previous turn (see `build_coder_graph`'s docstring).
+
+    `review_feedback` mirrors `issue_text`'s input/env handling
+    (`$CLIPSE_REVIEW_FEEDBACK`, injected by the dispatcher only for a Coder
+    re-run claimed out of the rework column). Unlike `prior_summary` (this
+    lane's OWN previous-turn summary), it is a DIFFERENT lane's verdict -- the
+    reviewer's changes_requested, or a git-operator stale-base conflict -- so
+    it is folded in under its own clearly-delimited heading and, being the
+    most recent and most actionable instruction, last. A fresh run has none
+    and the prompt is unchanged from before this feature.
     """
     issue_text = state.get("issue_text") or os.environ.get("CLIPSE_ISSUE_TEXT", "")
     prior_summary = state.get("prior_summary")
+    review_feedback = state.get("review_feedback") or os.environ.get("CLIPSE_REVIEW_FEEDBACK", "")
 
+    task_text = issue_text
     if prior_summary:
-        task_text = f"{issue_text}\n\nProgress from a previous turn on this issue:\n{prior_summary}"
-    else:
-        task_text = issue_text
+        task_text = f"{task_text}\n\nProgress from a previous turn on this issue:\n{prior_summary}"
+    if review_feedback:
+        task_text = f"{task_text}\n\nThe previous review requested these changes; address them:\n{review_feedback}"
 
     return {"task_text": task_text}
 
