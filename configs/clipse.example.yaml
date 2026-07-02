@@ -11,6 +11,12 @@ repo:
   # base_branch is the branch workers branch off and PRs target.
   base_branch: "main"
 
+# team_key / team_id: the Linear team clipse operates against. team_key
+# scopes the candidate-issues query to this team; team_id resolves board
+# columns to that team's Linear workflow-state ids for SetState.
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+
 # poll_interval_s: how often the dispatcher polls Linear for issue updates.
 poll_interval_s: 30
 
@@ -34,6 +40,12 @@ turn_cap: 5
 # the issue is parked in Blocked (stale/hung detection).
 max_runtime_s: 3600
 
+# max_tokens_per_run: per-run token ceiling passed to the worker as
+# --max-tokens. The worker tracks usage from its own DAC callbacks and
+# aborts over budget with outcome=blocked, block_kind=capability, naming the
+# spend in its summary.
+max_tokens_per_run: 200000
+
 # lane_label_prefix: Linear label prefix used to select a lane for an issue.
 # e.g. the label "agent:coder" selects the coder lane.
 lane_label_prefix: "agent:"
@@ -42,3 +54,44 @@ lane_label_prefix: "agent:"
 # and dispatcher-restart requeues) before it is parked in Blocked instead of
 # requeued again.
 max_attempts: 3
+
+# worker: how the dispatcher execs the clipse-worker subprocess. command is
+# the argv PREFIX the Spawner execs for every worker invocation; the
+# dispatcher appends the per-run flags (--issue/--lane/--run/--thread/
+# --workspace/--checkpoint-db/--max-tokens) after it. clipse-worker is a uv
+# console script defined in agent/pyproject.toml, so the common case runs it
+# scoped to that project rather than requiring a global install. No
+# default — machine-specific (an absolute --project path below), so this
+# must be set explicitly.
+worker:
+  command:
+    - uv
+    - --project
+    - "/absolute/path/to/clipse/agent"
+    - run
+    - clipse-worker
+
+# checkpoints_dir: directory holding one LangGraph checkpointer SQLite
+# database per issue (<checkpoints_dir>/<issue-identifier>.db), outside any
+# git worktree — passed to the worker per-issue as --checkpoint-db. Defaults
+# to "./.clipse/checkpoints" when omitted.
+checkpoints_dir: "./.clipse/checkpoints"
+
+# board_dir: the dispatcher's own state directory — kernel SQLite db,
+# singleton lockfile, per-issue worker stderr logs, and git worktrees.
+# Defaults to "./.clipse" when omitted; overridable per-invocation via
+# `clipse dispatch --board`.
+board_dir: "./.clipse"
+
+# env_allowlist: environment variable names copied from the dispatcher's own
+# process environment into a spawned worker's — nothing else is forwarded,
+# so a worker never inherits secrets it doesn't need. The worker must NEVER
+# see LINEAR_API_KEY (the kernel-only Linear credential); listing it here is
+# a config error. Defaults to the list below when omitted.
+env_allowlist:
+  - ANTHROPIC_API_KEY
+  - PATH
+  - HOME
+  - GH_TOKEN
+  - GITHUB_TOKEN
+  - TESTWORKER_SCENARIO

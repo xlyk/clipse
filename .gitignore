@@ -2,6 +2,11 @@
 /bin/
 /clipse
 
+# local runtime config: machine-specific (primary-clone path, worker
+# command) — configs/clipse.example.yaml is the committed, documented
+# template this is copied from.
+/configs/clipse.yaml
+
 # databases
 *.db
 *.db-wal

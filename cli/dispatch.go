@@ -51,8 +51,8 @@ of pending Linear mirror writes, once per poll interval, until interrupted
 	}
 
 	cmd.Flags().StringVar(&flags.configPath, "config", configPathDefault(), "path to clipse.yaml")
-	cmd.Flags().StringVar(&flags.boardDir, "board", "./.clipse", "board state directory")
-	cmd.Flags().StringVar(&flags.workerBin, "worker", "clipse-worker", "worker binary path")
+	cmd.Flags().StringVar(&flags.boardDir, "board", "", "board state directory (default: config board_dir)")
+	cmd.Flags().StringVar(&flags.workerBin, "worker", "", "override worker command with a single binary (default: config worker.command)")
 
 	return cmd
 }
@@ -64,6 +64,31 @@ func configPathDefault() string {
 		return v
 	}
 	return defaultConfigPath
+}
+
+// resolveBoardDir returns the effective board directory: flagValue when the
+// operator passed --board explicitly (non-empty), otherwise cfgValue (from
+// config's board_dir, itself defaulted by config.Load when the YAML document
+// omits it — see config.Config.BoardDir).
+func resolveBoardDir(flagValue, cfgValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return cfgValue
+}
+
+// resolveWorkerCommand returns the argv the Spawner execs for every worker
+// invocation: a single-element override []string{flagValue} when the
+// operator passed --worker explicitly (non-empty binary path — handy for
+// pointing straight at a prebuilt testworker binary during manual
+// smoke-testing), otherwise cfgCommand (config.Worker.Command — see its doc
+// comment for the ["uv", "--project", ..., "run", "clipse-worker"] shape
+// production configs use).
+func resolveWorkerCommand(flagValue string, cfgCommand []string) []string {
+	if flagValue != "" {
+		return []string{flagValue}
+	}
+	return cfgCommand
 }
 
 // runDispatch is the dispatch command's composition root: it configures
@@ -82,13 +107,16 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 		return fmt.Errorf("loading config %s: %w", flags.configPath, err)
 	}
 
-	if err := os.MkdirAll(flags.boardDir, 0o755); err != nil {
-		return fmt.Errorf("creating board dir %s: %w", flags.boardDir, err)
+	boardDir := resolveBoardDir(flags.boardDir, cfg.BoardDir)
+	workerCommand := resolveWorkerCommand(flags.workerBin, cfg.Worker.Command)
+
+	if err := os.MkdirAll(boardDir, 0o755); err != nil {
+		return fmt.Errorf("creating board dir %s: %w", boardDir, err)
 	}
 
-	dbPath := filepath.Join(flags.boardDir, "clipse.db")
-	lockPath := filepath.Join(flags.boardDir, "clipse.lock")
-	worktreeRoot := filepath.Join(flags.boardDir, "worktrees")
+	dbPath := filepath.Join(boardDir, "clipse.db")
+	lockPath := filepath.Join(boardDir, "clipse.lock")
+	worktreeRoot := filepath.Join(boardDir, "worktrees")
 
 	release, err := dispatcher.AcquireSingleton(lockPath)
 	if err != nil {
@@ -104,6 +132,14 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 		}
 	}()
 
+	// cfg.CheckpointsDir is where the dispatcher roots each issue's
+	// --checkpoint-db (dispatcher.checkpointDBPath); the kernel owns this
+	// path, so it ensures the directory exists rather than leaving that to
+	// each spawned worker.
+	if err := os.MkdirAll(cfg.CheckpointsDir, 0o755); err != nil {
+		return fmt.Errorf("creating checkpoints dir %s: %w", cfg.CheckpointsDir, err)
+	}
+
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening store %s: %w", dbPath, err)
@@ -114,17 +150,15 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 		}
 	}()
 
-	// NOTE (Phase-2 gap): NewHTTPClient only wires the API-key-authenticated
-	// GraphQL client; it does not resolve per-team Linear workflow-state ids
-	// (SetState's targetColumn -> state-id mapping), which Phase 2 is
-	// expected to add. Wiring it best-effort here rather than blocking the
-	// daemon on it; a manual smoke test covers the gap in the meantime.
-	lc, err := linear.NewHTTPClient()
+	// NewHTTPClient scopes candidate-issue polling and workflow-state
+	// resolution (SetState's column -> Linear state-id mapping) to the
+	// configured team; see internal/linear/state_resolver.go.
+	lc, err := linear.NewHTTPClient(cfg.TeamKey, cfg.TeamID)
 	if err != nil {
 		return fmt.Errorf("building linear client: %w", err)
 	}
 
-	spawner := spawn.NewLocalSpawner(flags.workerBin, flags.boardDir)
+	spawner := spawn.NewLocalSpawner(workerCommand, boardDir)
 	ws := dispatcher.NewGitWorkspacer(cfg.Repo.Path, cfg.Repo.BaseBranch, worktreeRoot)
 
 	d := dispatcher.New(*cfg, st, lc, spawner, ws, dispatcher.WithLogger(logger))

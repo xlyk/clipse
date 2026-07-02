@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -26,6 +27,8 @@ repo:
   remote: "https://github.com/yourorg/yourrepo.git"
   path: "/home/you/code/yourrepo"
   base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
 poll_interval_s: 45
 caps:
   global: 10
@@ -36,8 +39,23 @@ caps:
     scribe: 2
 turn_cap: 7
 max_runtime_s: 1800
+max_tokens_per_run: 250000
 lane_label_prefix: "lane:"
 max_attempts: 4
+env_allowlist:
+  - ANTHROPIC_API_KEY
+  - PATH
+  - HOME
+  - GH_TOKEN
+worker:
+  command:
+    - uv
+    - --project
+    - /abs/path/agent
+    - run
+    - clipse-worker
+checkpoints_dir: "/abs/path/board/checkpoints"
+board_dir: "/abs/path/board"
 `)
 
 	cfg, err := config.Load(path)
@@ -53,6 +71,12 @@ max_attempts: 4
 	}
 	if cfg.Repo.BaseBranch != "main" {
 		t.Errorf("Repo.BaseBranch = %q, want %q", cfg.Repo.BaseBranch, "main")
+	}
+	if cfg.TeamKey != "CLI" {
+		t.Errorf("TeamKey = %q, want %q", cfg.TeamKey, "CLI")
+	}
+	if cfg.TeamID != "8b5b3301-8da3-4933-9b07-9efc027bc09d" {
+		t.Errorf("TeamID = %q, want %q", cfg.TeamID, "8b5b3301-8da3-4933-9b07-9efc027bc09d")
 	}
 	if cfg.PollIntervalS != 45 {
 		t.Errorf("PollIntervalS = %d, want 45", cfg.PollIntervalS)
@@ -84,6 +108,23 @@ max_attempts: 4
 	if cfg.MaxAttempts != 4 {
 		t.Errorf("MaxAttempts = %d, want 4", cfg.MaxAttempts)
 	}
+	wantAllowlist := []string{"ANTHROPIC_API_KEY", "PATH", "HOME", "GH_TOKEN"}
+	if !slices.Equal(cfg.EnvAllowlist, wantAllowlist) {
+		t.Errorf("EnvAllowlist = %v, want %v", cfg.EnvAllowlist, wantAllowlist)
+	}
+	if cfg.MaxTokensPerRun != 250000 {
+		t.Errorf("MaxTokensPerRun = %d, want 250000", cfg.MaxTokensPerRun)
+	}
+	wantCommand := []string{"uv", "--project", "/abs/path/agent", "run", "clipse-worker"}
+	if !slices.Equal(cfg.Worker.Command, wantCommand) {
+		t.Errorf("Worker.Command = %v, want %v", cfg.Worker.Command, wantCommand)
+	}
+	if cfg.CheckpointsDir != "/abs/path/board/checkpoints" {
+		t.Errorf("CheckpointsDir = %q, want %q", cfg.CheckpointsDir, "/abs/path/board/checkpoints")
+	}
+	if cfg.BoardDir != "/abs/path/board" {
+		t.Errorf("BoardDir = %q, want %q", cfg.BoardDir, "/abs/path/board")
+	}
 }
 
 func TestLoad_MinimalConfigGetsDefaults(t *testing.T) {
@@ -92,6 +133,11 @@ repo:
   remote: "https://github.com/yourorg/yourrepo.git"
   path: "/home/you/code/yourrepo"
   base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+worker:
+  command:
+    - clipse-worker
 `)
 
 	cfg, err := config.Load(path)
@@ -128,6 +174,19 @@ repo:
 	}
 	if cfg.MaxAttempts != 3 {
 		t.Errorf("MaxAttempts = %d, want default 3", cfg.MaxAttempts)
+	}
+	wantDefaultAllowlist := []string{"ANTHROPIC_API_KEY", "PATH", "HOME", "GH_TOKEN", "GITHUB_TOKEN", "TESTWORKER_SCENARIO"}
+	if !slices.Equal(cfg.EnvAllowlist, wantDefaultAllowlist) {
+		t.Errorf("EnvAllowlist = %v, want default %v", cfg.EnvAllowlist, wantDefaultAllowlist)
+	}
+	if cfg.MaxTokensPerRun != 200000 {
+		t.Errorf("MaxTokensPerRun = %d, want default 200000", cfg.MaxTokensPerRun)
+	}
+	if cfg.CheckpointsDir != "./.clipse/checkpoints" {
+		t.Errorf("CheckpointsDir = %q, want default %q", cfg.CheckpointsDir, "./.clipse/checkpoints")
+	}
+	if cfg.BoardDir != "./.clipse" {
+		t.Errorf("BoardDir = %q, want default %q", cfg.BoardDir, "./.clipse")
 	}
 }
 
@@ -244,6 +303,122 @@ repo:
 max_attempts: 0
 `,
 			wantErrSubstr: "max_attempts",
+		},
+		{
+			name: "missing team_key",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+`,
+			wantErrSubstr: "team_key",
+		},
+		{
+			name: "missing team_id",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+`,
+			wantErrSubstr: "team_id",
+		},
+		{
+			// A worker must NEVER see LINEAR_API_KEY (kernel-only secret,
+			// threat model B3) — reject it at config-load time rather than
+			// silently forwarding it into every spawned worker's env.
+			name: "env_allowlist contains LINEAR_API_KEY",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+env_allowlist:
+  - ANTHROPIC_API_KEY
+  - LINEAR_API_KEY
+`,
+			wantErrSubstr: "LINEAR_API_KEY",
+		},
+		{
+			name: "explicitly empty env_allowlist",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+env_allowlist: []
+`,
+			wantErrSubstr: "env_allowlist",
+		},
+		{
+			// worker.command is the argv PREFIX the Spawner execs for every
+			// worker invocation (e.g. a uv-scoped run of clipse-worker); it
+			// is machine-specific (an absolute --project path in the common
+			// case), so unlike most fields it has no default — Load requires
+			// it explicitly. team_key/team_id are set here (unlike the other
+			// "missing repo.*" cases above) because validate checks
+			// worker.command LAST, after every pre-existing check — omitting
+			// them would make this fixture fail on "team_key is required"
+			// first instead of isolating worker.command.
+			name: "missing worker.command",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+`,
+			wantErrSubstr: "worker.command",
+		},
+		{
+			name: "empty worker.command",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+worker:
+  command: []
+`,
+			wantErrSubstr: "worker.command",
+		},
+		{
+			name: "worker.command contains an empty entry",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+worker:
+  command:
+    - uv
+    - ""
+`,
+			wantErrSubstr: "worker.command",
+		},
+		{
+			name: "non-positive max_tokens_per_run",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+worker:
+  command:
+    - clipse-worker
+max_tokens_per_run: 0
+`,
+			wantErrSubstr: "max_tokens_per_run",
 		},
 	}
 

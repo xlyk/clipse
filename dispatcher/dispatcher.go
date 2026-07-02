@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/xlyk/clipse/internal/config"
@@ -105,8 +106,10 @@ func WithRunIDGenerator(gen func() string) Option {
 }
 
 // WithEnvFor sets the function used to build a spawned worker's environment
-// for a given issue. Defaults to nil (the worker inherits no extra env
-// beyond whatever the Spawner implementation itself sets).
+// for a given issue, overriding New's default (see defaultEnvFor). Tests use
+// this to substitute a fixed or scenario-specific environment (e.g. to drive
+// testworker's TESTWORKER_SCENARIO directly) without going through
+// cfg.EnvAllowlist.
 func WithEnvFor(envFor func(issue store.Issue) []string) Option {
 	return func(d *Dispatcher) { d.envFor = envFor }
 }
@@ -130,7 +133,8 @@ const defaultResultsBuffer = 256
 
 // New constructs a Dispatcher from its required dependencies, applying any
 // Options on top of the defaults (a real time.Now clock, a crypto/rand hex
-// run id generator, no extra worker env, and slog.Default()).
+// run id generator, an allow-listed worker env per defaultEnvFor, and
+// slog.Default()).
 func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spawner, ws Workspacer, opts ...Option) *Dispatcher {
 	d := &Dispatcher{
 		cfg:      cfg,
@@ -140,6 +144,7 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 		ws:       ws,
 		now:      func() int64 { return time.Now().Unix() },
 		newRunID: newRandomRunID,
+		envFor:   defaultEnvFor(cfg.EnvAllowlist),
 		logger:   slog.Default(),
 		results:  make(chan runResult, defaultResultsBuffer),
 		inflight: make(map[string]inflightRun),
@@ -148,6 +153,20 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 		opt(d)
 	}
 	return d
+}
+
+// defaultEnvFor is New's default envFor, overridable via WithEnvFor: it
+// ignores the issue (Phase 2 has no per-lane secret differences yet — see
+// config.Config.EnvAllowlist) and returns the dispatcher's own environment
+// filtered down to allowlist via spawn.AllowlistedEnv. This is what keeps a
+// spawned worker from ever inheriting LINEAR_API_KEY or anything else the
+// dispatcher process holds that isn't explicitly allow-listed (design doc
+// threat model, B3) — closing the gap where an unset envFor previously left
+// WorkerSpec.Env nil, which exec.Cmd.Env treats as "inherit everything".
+func defaultEnvFor(allowlist []string) func(store.Issue) []string {
+	return func(store.Issue) []string {
+		return spawn.AllowlistedEnv(os.Environ(), allowlist)
+	}
 }
 
 // newRandomRunID generates a unique run id via crypto/rand: 16 random bytes

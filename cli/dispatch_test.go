@@ -20,6 +20,11 @@ repo:
   remote: "https://example.invalid/repo.git"
   path: "/tmp/clipse-test-repo"
   base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+worker:
+  command:
+    - clipse-worker
 `
 
 func TestDispatchCmd_Help(t *testing.T) {

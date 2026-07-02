@@ -69,7 +69,7 @@ func TestTick_EndToEnd_RealSpawnerNeedsReview(t *testing.T) {
 	s := openTestStore(t)
 	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
 
-	spawner := spawn.NewLocalSpawner(bin, boardDir)
+	spawner := spawn.NewLocalSpawner([]string{bin}, boardDir)
 	ws := newStubWorkspacer(t.TempDir())
 	lc := &linear.MockClient{}
 	cfg := testConfig()

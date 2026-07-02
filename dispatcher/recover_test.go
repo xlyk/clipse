@@ -22,7 +22,7 @@ func spawnRealOrphan(t *testing.T, boardDir, issueID, lane string) spawn.RunHand
 	ctx := context.Background()
 
 	bin := buildTestworker(t)
-	spawner := spawn.NewLocalSpawner(bin, boardDir)
+	spawner := spawn.NewLocalSpawner([]string{bin}, boardDir)
 	spec := spawn.WorkerSpec{
 		Issue:     issueID,
 		Lane:      lane,

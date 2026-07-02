@@ -76,7 +76,7 @@ func newSpec(t *testing.T, boardDir, scenario string) spawn.WorkerSpec {
 func TestLocalSpawner_Success(t *testing.T) {
 	bin := buildTestworker(t)
 	boardDir := t.TempDir()
-	s := spawn.NewLocalSpawner(bin, boardDir)
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -117,13 +117,68 @@ func TestLocalSpawner_Success(t *testing.T) {
 	assertStderrLog(t, boardDir, "CLP-1")
 }
 
+// TestLocalSpawner_MultiElementCommand asserts a configured command PREFIX
+// longer than one element (e.g. the ["uv", "--project", ..., "run",
+// "clipse-worker"] shape config.Worker.Command documents) execs correctly:
+// the Spawner runs command[0] with command[1:] threaded ahead of the
+// per-spec flags, not just command[0] alone. "env" re-execs its arguments
+// unchanged, so env+bin here behaves exactly like bin alone would, proving
+// the prefix is passed through rather than dropped or misordered.
+func TestLocalSpawner_MultiElementCommand(t *testing.T) {
+	bin := buildTestworker(t)
+	boardDir := t.TempDir()
+	s := spawn.NewLocalSpawner([]string{"env", bin}, boardDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	spec := newSpec(t, boardDir, "done")
+
+	handle, err := s.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn: unexpected error: %v", err)
+	}
+
+	res, err := handle.Wait()
+	if err != nil {
+		t.Fatalf("Wait: unexpected top-level error: %v", err)
+	}
+	if res.Err != nil {
+		t.Fatalf("Result.Err = %v, want nil", res.Err)
+	}
+	if res.Worker.Outcome != contract.WorkerResultOutcomeDone {
+		t.Errorf("Outcome = %q, want done", res.Worker.Outcome)
+	}
+	if res.Worker.IssueId != "CLP-1" {
+		t.Errorf("IssueId = %q, want CLP-1", res.Worker.IssueId)
+	}
+}
+
+// TestLocalSpawner_EmptyCommandErrors asserts Spawn fails fast with a clear
+// error rather than panicking when no command is configured (defense in
+// depth: config.Load's validation is what normally prevents this in
+// production — see config.Worker.Command).
+func TestLocalSpawner_EmptyCommandErrors(t *testing.T) {
+	boardDir := t.TempDir()
+	s := spawn.NewLocalSpawner(nil, boardDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	spec := newSpec(t, boardDir, "done")
+
+	if _, err := s.Spawn(ctx, spec); err == nil {
+		t.Fatal("Spawn: expected error for empty command, got nil")
+	}
+}
+
 // TestLocalSpawner_CrashNonzeroExit asserts a nonzero-exit worker (no valid
 // JSON on stdout) surfaces as a Result carrying an error, without Wait
 // itself returning a top-level error (the dispatcher maps this to Blocked).
 func TestLocalSpawner_CrashNonzeroExit(t *testing.T) {
 	bin := buildTestworker(t)
 	boardDir := t.TempDir()
-	s := spawn.NewLocalSpawner(bin, boardDir)
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -156,7 +211,7 @@ func TestLocalSpawner_CrashNonzeroExit(t *testing.T) {
 func TestLocalSpawner_Timeout(t *testing.T) {
 	bin := buildTestworker(t)
 	boardDir := t.TempDir()
-	s := spawn.NewLocalSpawner(bin, boardDir)
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -199,7 +254,7 @@ func TestLocalSpawner_Timeout(t *testing.T) {
 func TestLocalSpawner_Malformed(t *testing.T) {
 	bin := buildTestworker(t)
 	boardDir := t.TempDir()
-	s := spawn.NewLocalSpawner(bin, boardDir)
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

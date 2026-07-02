@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/xlyk/clipse/internal/spawn"
@@ -25,18 +26,21 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, fmt.Errorf("preparing workspace: %w", err))
 	}
 
-	var env []string
-	if d.envFor != nil {
-		env = d.envFor(issue)
-	}
+	// d.envFor is always set (New defaults it to defaultEnvFor;
+	// WithEnvFor overrides it) — never nil, so this never falls back to a
+	// nil WorkerSpec.Env, which exec.Cmd.Env would treat as "inherit the
+	// dispatcher's full environment".
+	env := d.envFor(issue)
 
 	spec := spawn.WorkerSpec{
-		Issue:     issue.Identifier,
-		Lane:      lane,
-		RunID:     runID,
-		ThreadID:  threadID,
-		Workspace: workspace,
-		Env:       env,
+		Issue:        issue.Identifier,
+		Lane:         lane,
+		RunID:        runID,
+		ThreadID:     threadID,
+		Workspace:    workspace,
+		Env:          env,
+		CheckpointDB: d.checkpointDBPath(issue),
+		MaxTokens:    d.cfg.MaxTokensPerRun,
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -73,6 +77,23 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	}()
 
 	return nil
+}
+
+// checkpointDBPath returns the per-issue LangGraph checkpointer database
+// path the worker should use, derived from cfg.CheckpointsDir and the
+// issue's Linear identifier — the same identifier passed as --issue,
+// matching the design doc's "<board>/checkpoints/<issue_id>.db" convention.
+// It returns "" when CheckpointsDir is unset: hand-built Configs that
+// bypass config.Load (as most dispatcher tests do) have no directory to
+// root a path under, and LocalSpawner only appends --checkpoint-db when
+// this is non-empty (see internal/spawn.workerArgs). Real production
+// configs always have a non-empty CheckpointsDir, since config.Load
+// defaults it.
+func (d *Dispatcher) checkpointDBPath(issue store.Issue) string {
+	if d.cfg.CheckpointsDir == "" {
+		return ""
+	}
+	return filepath.Join(d.cfg.CheckpointsDir, issue.Identifier+".db")
 }
 
 // blockOnSpawnFailure transitions issue straight to blocked when the

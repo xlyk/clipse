@@ -19,23 +19,58 @@ import (
 // It is the only Spawner implementation in v1 (see the design doc's Spawner
 // seam note); a remote/SSH host-pool Spawner is reserved for v2.
 type LocalSpawner struct {
-	binaryPath string
-	boardDir   string
+	command  []string
+	boardDir string
 }
 
-// NewLocalSpawner returns a LocalSpawner that execs binaryPath for every
-// worker, redirecting each worker's stderr to <boardDir>/logs/<issue>.log.
-func NewLocalSpawner(binaryPath, boardDir string) *LocalSpawner {
-	return &LocalSpawner{binaryPath: binaryPath, boardDir: boardDir}
+// NewLocalSpawner returns a LocalSpawner that execs command (an argv PREFIX,
+// e.g. ["uv", "--project", "/abs/path/agent", "run", "clipse-worker"] for
+// the real worker, or a single-element []string{binaryPath} for testworker)
+// for every worker, appending workerArgs(spec) after it and redirecting each
+// worker's stderr to <boardDir>/logs/<issue>.log. command must be non-empty;
+// config.Load's validation is what normally guarantees that in production
+// (see config.Worker.Command).
+func NewLocalSpawner(command []string, boardDir string) *LocalSpawner {
+	return &LocalSpawner{command: command, boardDir: boardDir}
 }
 
-// Spawn starts binaryPath with args built from spec's fixed fields
-// (--issue/--lane/--run/--thread/--workspace), running it as the leader of
+// workerArgs returns the ordered CLI flags every worker invocation carries:
+// the five fields every worker invocation carries, followed by
+// --checkpoint-db and --max-tokens ONLY when spec carries them
+// (CheckpointDB non-empty / MaxTokens > 0 — see WorkerSpec's doc comment).
+// Kept as a pure helper (tested directly in argv_test.go) so this
+// conditional-append logic doesn't need a real subprocess to exercise, and
+// so a worker that has neither configured (e.g. testworker, driven by
+// hand-built WorkerSpecs in kernel tests) never sees a flag it doesn't
+// understand.
+func workerArgs(spec WorkerSpec) []string {
+	args := []string{
+		"--issue=" + spec.Issue,
+		"--lane=" + spec.Lane,
+		"--run=" + spec.RunID,
+		"--thread=" + spec.ThreadID,
+		"--workspace=" + spec.Workspace,
+	}
+	if spec.CheckpointDB != "" {
+		args = append(args, "--checkpoint-db="+spec.CheckpointDB)
+	}
+	if spec.MaxTokens > 0 {
+		args = append(args, fmt.Sprintf("--max-tokens=%d", spec.MaxTokens))
+	}
+	return args
+}
+
+// Spawn starts s.command (its first element as the program, the rest as a
+// fixed prefix) with workerArgs(spec) appended, running it as the leader of
 // its own process group (so Kill and the max_runtime deadline can reap the
 // whole group, not just the leader). ctx's deadline governs the worker's
 // max_runtime: the caller sets it, and once it fires the process group is
 // killed and Wait returns a timeout Result.
 func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, error) {
+	if len(s.command) == 0 {
+		return nil, fmt.Errorf("spawning worker: no command configured")
+	}
+
 	logPath, err := s.stderrLogPath(spec.Issue)
 	if err != nil {
 		return nil, err
@@ -45,14 +80,13 @@ func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, e
 		return nil, fmt.Errorf("opening worker stderr log %s: %w", logPath, err)
 	}
 
-	args := []string{
-		"--issue=" + spec.Issue,
-		"--lane=" + spec.Lane,
-		"--run=" + spec.RunID,
-		"--thread=" + spec.ThreadID,
-		"--workspace=" + spec.Workspace,
-	}
-	cmd := exec.CommandContext(ctx, s.binaryPath, args...)
+	// Copy s.command[1:] into a fresh slice before appending workerArgs:
+	// Spawn must be safe for concurrent calls sharing the same s.command,
+	// and appending onto a slice that reslices s.command directly could
+	// otherwise race on (or corrupt) its backing array.
+	name := s.command[0]
+	args := append(append([]string{}, s.command[1:]...), workerArgs(spec)...)
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = spec.Env
 	cmd.Stderr = logFile
 
@@ -67,7 +101,7 @@ func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, e
 
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
-		return nil, fmt.Errorf("starting worker %s: %w", s.binaryPath, err)
+		return nil, fmt.Errorf("starting worker %s: %w", name, err)
 	}
 
 	startedAt, psErr := processStartTime(cmd.Process.Pid)
