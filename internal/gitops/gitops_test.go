@@ -195,6 +195,27 @@ func TestRun_FailingChecks_NotMergeable(t *testing.T) {
 	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
 }
 
+// TestRun_MergeNotReady_CIPending asserts that a `gh pr merge` refusal because
+// the PR isn't ready YET — GitHub's "base branch policy prohibits the merge …
+// after all the requirements have been met" (required checks still pending, or
+// a strict up-to-date policy after a concurrent merge advanced the base) — is
+// treated as a retryable pending state, NOT a permanent NotMergeable block. A
+// hard block here would strand a PR that just needed a couple more minutes for
+// CI; instead the merging claim's short TTL expires and the next poll retries.
+func TestRun_MergeNotReady_CIPending(t *testing.T) {
+	spec, _ := setupScenario(t, "merge_not_ready")
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+	if res.Outcome != OutcomeCIPending {
+		t.Fatalf("Run() Outcome = %q, want %q (transient not-ready, retry next poll)", res.Outcome, OutcomeCIPending)
+	}
+	// Worktree must stay intact — nothing merged, so no cleanup.
+	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+}
+
 // TestRun_AbsentChecks_NotMergeable asserts no required checks at all
 // blocks the merge (never treated as "nothing to wait for, go ahead").
 func TestRun_AbsentChecks_NotMergeable(t *testing.T) {

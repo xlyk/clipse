@@ -82,6 +82,11 @@ pr)
 			echo 'not all required checks have passed' >&2
 			exit 1
 			;;
+		merge_not_ready)
+			echo 'X Pull request x/y#7 is not mergeable: the base branch policy prohibits the merge.' >&2
+			echo 'To have the pull request merged after all the requirements have been met, add the --auto flag.' >&2
+			exit 1
+			;;
 		*)
 			echo 'https://github.com/x/y/pull/7'
 			;;

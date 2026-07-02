@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Outcome enumerates what one Run pass over a merging card's PR decided.
@@ -235,7 +236,19 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 		return Result{}, fmt.Errorf("gitops: merging PR for branch %s: %w", spec.Branch, err)
 	}
 	if mergeRes.ExitCode != 0 {
-		return notMergeable(view, fmt.Sprintf("gh pr merge failed: %s", firstNonEmpty(mergeRes.Stderr, mergeRes.Stdout))), nil
+		reason := firstNonEmpty(mergeRes.Stderr, mergeRes.Stdout)
+		if mergeNotReady(reason) {
+			// GitHub refused the merge because the PR isn't ready YET — required
+			// checks still pending/re-running, or a strict "up to date" policy
+			// after a concurrent merge advanced the base — not a genuine failure.
+			// Treat it exactly like a pending check (R3): leave the merging
+			// claim in place, let its short TTL expire, and retry next poll, by
+			// which point the checks finish (or a later pass's resolveStaleBase
+			// catches the base up). A hard NotMergeable block here would strand a
+			// PR that just needed a couple more minutes.
+			return Result{Outcome: OutcomeCIPending, PRURL: view.URL, PRNumber: view.Number}, nil
+		}
+		return notMergeable(view, fmt.Sprintf("gh pr merge failed: %s", reason)), nil
 	}
 
 	if spec.Tag != "" {
@@ -294,6 +307,31 @@ func resolveStaleBase(ctx context.Context, spec Spec, runner CommandRunner) (res
 		// than inventing a third "waiting" flavor of Result.
 		return Result{Outcome: OutcomeCIPending, PRURL: recheck.URL, PRNumber: recheck.Number}, false, nil
 	}
+}
+
+// mergeNotReady reports whether a failed `gh pr merge` reflects a transient
+// not-ready state — required checks still pending/re-running, or a strict
+// "require branches to be up to date" policy after a concurrent merge advanced
+// the base — rather than a genuine, terminal failure. GitHub phrases these as
+// "not mergeable: the base branch policy prohibits the merge", references the
+// required status checks, or says the PR is "not in a mergeable state", and
+// hints at --auto/--admin. Retrying next poll lets the checks finish (or a
+// later resolveStaleBase pass catch the base up). Matched case-insensitively
+// on stable fragments of gh's own message.
+func mergeNotReady(output string) bool {
+	o := strings.ToLower(output)
+	for _, marker := range []string{
+		"base branch policy",
+		"required status check",
+		"not in a mergeable state",
+		"requirements have been met",
+		"--auto",
+	} {
+		if strings.Contains(o, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // joinNames renders a []string as a comma-separated list for a Result
