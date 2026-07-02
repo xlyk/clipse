@@ -24,14 +24,15 @@ const apiKeyEnvVar = "LINEAR_API_KEY"
 // agent:<lane> labels, blocks/blocked-by relations, priority, branch name,
 // and updatedAt.
 //
-// Filtering to "active" issues (Linear's built-in state-type filter) keeps
-// completed/cancelled work out of the candidate set; the dispatcher decides
-// dispatchability from Status/Deps, not from this query. Filtering to
-// team.key scopes the candidate set to the single team clipse is configured
-// against (config.Config.TeamKey), so a workspace with other teams' issues
-// never surfaces them as candidates.
+// Excluding the terminal state types (Linear has no "active" type; the real
+// types are backlog/unstarted/started/completed/canceled/triage, plus
+// duplicate) keeps completed/cancelled/duplicate work out of the candidate
+// set; the dispatcher decides dispatchability from Status/Deps, not from this
+// query. Filtering to team.key scopes the candidate set to the single team
+// clipse is configured against (config.Config.TeamKey), so a workspace with
+// other teams' issues never surfaces them as candidates.
 const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
-  issues(filter: { state: { type: { eq: "active" } }, team: { key: { eq: $teamKey } } }) {
+  issues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } }, team: { key: { eq: $teamKey } } }) {
     nodes {
       id
       identifier
