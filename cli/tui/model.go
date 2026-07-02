@@ -269,12 +269,46 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		m.lastErr = msg.Err
 		return m, nil
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
 	default:
 		return m, nil
 	}
+}
+
+// handleMouse forwards a mouse (wheel) event to whichever viewport the pointer
+// is over, so the panes scroll under the wheel: the detail pane in detail mode,
+// and the pipeline vs. activity pane on the dashboard by pointer position. It
+// is pure — viewport.Update on a wheel event only adjusts the scroll offset —
+// so it upholds the "no I/O in Update" invariant.
+func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
+	switch m.mode {
+	case modeDetail:
+		m.detailVp, _ = m.detailVp.Update(msg)
+	case modeDashboard:
+		if m.pointerOverActivity(msg.X, msg.Y) {
+			m.activityVp, _ = m.activityVp.Update(msg)
+		} else {
+			m.bodyVp, _ = m.bodyVp.Update(msg)
+		}
+	}
+	return m, nil
+}
+
+// pointerOverActivity reports whether (x,y) lands in the activity pane rather
+// than the pipeline pane, to route a dashboard wheel-scroll. In the two-column
+// layout the split is horizontal (past the left panel's border + gap column);
+// stacked, it is vertical (below the pipeline panel).
+func (m Model) pointerOverActivity(x, y int) bool {
+	d := m.dims()
+	if d.twoCol {
+		return x > d.leftW+2
+	}
+	return y >= d.headerH+d.tabsH+d.pipeH
 }
 
 // handleKey applies a key press against the current view mode. It never

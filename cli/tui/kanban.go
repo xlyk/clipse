@@ -33,39 +33,32 @@ const minKanbanColWidth = 16
 // identifier across the whole board) is highlighted, and enter still opens its
 // detail.
 func (m Model) renderKanbanScreen(inner int, now int64) string {
-	width := m.width
-	if width <= 0 {
-		width = 96
-	}
+	d := m.dims()
+	width := d.frameW
 
 	visible, hiddenCols := m.visibleKanbanColumns(width)
-	colW := clampInt(width/maxInt(1, len(visible))-1, minKanbanColWidth-1, 30)
+	n := maxInt(len(visible), 1)
+	colW := clampInt(width/n-2, minKanbanColWidth-2, 28)
 
-	// Card capacity per column from the height left under the header/footer.
-	height := m.height
-	if height <= 0 {
-		height = 40
+	// All columns share one height so the board is a clean equal-height grid
+	// that fills the body between the tab bar and the pinned footer.
+	boardH := d.bodyH
+	if hiddenCols > 0 {
+		boardH-- // reserve a line for the "+N more columns" note
 	}
-	headerH := lipgloss.Height(m.renderHeader(inner, 0))
-	cardCap := clampInt(height-headerH-6, 3, 30)
 
 	boxes := make([]string, 0, len(visible))
 	for _, col := range visible {
-		boxes = append(boxes, m.renderKanbanColumn(col, colW, cardCap))
+		boxes = append(boxes, m.renderKanbanColumn(col, colW, boardH))
 	}
 	board := lipgloss.JoinHorizontal(lipgloss.Top, boxes...)
 
-	var b strings.Builder
-	b.WriteString(m.renderHeader(inner, now))
-	b.WriteString("\n")
-	b.WriteString(board)
+	parts := []string{m.renderHeader(d.cw, now), m.renderTabs(d.cw), board}
 	if hiddenCols > 0 {
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  +%d more column(s) — widen the terminal to see them", hiddenCols)))
+		parts = append(parts, dimStyle.Render(fmt.Sprintf("  +%d more column(s) — widen the terminal to see them", hiddenCols)))
 	}
-	b.WriteString("\n")
-	b.WriteString(footerStyle.Render(m.help.View(m.keys)))
-	return b.String()
+	parts = append(parts, m.renderFooter(d.cw))
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 // visibleKanbanColumns decides which columns fit in width, shedding empty
@@ -94,22 +87,31 @@ func (m Model) visibleKanbanColumns(width int) (visible []string, hidden int) {
 	return nonEmpty[:fit], len(nonEmpty) - fit
 }
 
-// renderKanbanColumn draws one bordered column: a heading (status + count) and
-// up to cardCap compact cards, with a "+N more" footer when it overflows.
-func (m Model) renderKanbanColumn(status string, colW, cardCap int) string {
+// renderKanbanColumn draws one fixed-height bordered column: a heading (status
+// + count) over a rule, then the compact cards (or a dim placeholder), with a
+// "+N more" marker when they overflow the column height. colH is the column's
+// full height including its border; the card capacity is derived from it (each
+// card is two lines) so the content never overflows and skews the grid.
+func (m Model) renderKanbanColumn(status string, colW, colH int) string {
 	rows := m.byStatus[status]
 	heading := lipgloss.NewStyle().Bold(true).Foreground(statusColor(status)).
 		Render(fmt.Sprintf("%s (%d)", kanbanLabel(status), len(rows)))
+	// The rule spans the padded text width (colW − 2 for the 1-col padding), so
+	// it never overflows into a wrapped second line.
+	lines := []string{heading, ruleStyle.Render(strings.Repeat("─", maxInt(colW-2, 1)))}
 
-	lines := []string{heading}
-	if len(rows) == 0 {
-		lines = append(lines, dimStyle.Render("—"))
-	}
+	// Content budget = colH − border(2) − heading(1) − rule(1); each card is 2
+	// lines, and an overflow marker (if any) costs one more line.
+	maxCards := maxInt((colH-4)/2, 0)
 	shown := rows
 	overflow := 0
-	if len(shown) > cardCap {
-		overflow = len(shown) - cardCap
-		shown = shown[:cardCap]
+	if len(rows) > maxCards {
+		shown = rows[:maxInt((colH-5)/2, 0)]
+		overflow = len(rows) - len(shown)
+	}
+
+	if len(rows) == 0 {
+		lines = append(lines, dimStyle.Render("· none"))
 	}
 	for _, r := range shown {
 		lines = append(lines, m.renderKanbanCard(r))
@@ -118,11 +120,9 @@ func (m Model) renderKanbanColumn(status string, colW, cardCap int) string {
 		lines = append(lines, dimStyle.Render(fmt.Sprintf("+%d more", overflow)))
 	}
 
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(cBorder).
-		Padding(0, 1).
+	return panelBorderStyle.
 		Width(colW).
+		Height(maxInt(colH-2, 1)).
 		Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 }
 

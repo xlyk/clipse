@@ -35,13 +35,18 @@ func parseResult(rj store.Run) (workerResult, bool) {
 	return wr, true
 }
 
-// renderDetailScreen draws the selected issue's detail: a header, then the
-// detail viewport (content set by layout), then a footer. esc returns to the
-// dashboard.
+// renderDetailScreen draws the selected issue's detail: the header, then the
+// detail content framed in a full-height panel (so it fills the body instead of
+// floating in a void), then the pinned footer. esc returns to the dashboard.
+// The three regions sum to the frame height, so the footer stays flush bottom.
 func (m Model) renderDetailScreen(inner int, now int64) string {
-	return m.renderHeader(inner, now) + "\n" +
-		m.detailVp.View() + "\n" +
-		footerStyle.Render(m.help.View(m.keys))
+	d := m.dims()
+	panelH := maxInt(d.frameH-d.headerH-d.footerH, 3)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		m.renderHeader(d.cw, now),
+		panelBox("◆ ISSUE DETAIL", cCyan, m.detailVp.View(), d.cw, panelH),
+		m.renderFooter(d.cw),
+	)
 }
 
 // detailContent builds the scrollable detail body for the selected issue:
@@ -81,7 +86,11 @@ func (m Model) detailContent(inner int) string {
 	if is.BoardStatus == "blocked" {
 		if reason := blockReason(is.LatestRun); reason != "" {
 			b.WriteString("\n")
-			b.WriteString(lipgloss.NewStyle().Foreground(cRed).Render("⚠ " + truncatePlain(reason, (inner-4)*3)))
+			// Wrap (not just truncate) to the panel's text width so a long block
+			// reason folds onto multiple lines instead of overflowing the border.
+			w := maxInt(inner-2, 8)
+			b.WriteString(lipgloss.NewStyle().Foreground(cRed).Width(w).
+				Render("⚠ " + truncatePlain(reason, w*4)))
 			b.WriteString("\n")
 		}
 	}

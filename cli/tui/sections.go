@@ -36,28 +36,29 @@ func (m Model) renderBody(inner int, now int64) string {
 	return body
 }
 
-// renderSection draws one titled, bordered panel of rows (or a dim placeholder
-// when empty), tinted with the section's accent color.
+// renderSection renders one titled group of rows (or a dim placeholder when
+// empty), tinted with the section's accent color. It is borderless — the
+// enclosing PIPELINE panel supplies the single frame — so the four groups read
+// as one board rather than four separate boxes.
 func (m Model) renderSection(s section, inner int, now int64) string {
-	heading := lipgloss.NewStyle().Bold(true).Foreground(s.accent).
-		Render(fmt.Sprintf("%s %s", s.glyph, s.title))
-	count := dimStyle.Render(fmt.Sprintf(" (%d)", len(s.rows)))
+	head := lipgloss.NewStyle().Bold(true).Foreground(s.accent).Render(s.glyph+" "+s.title) +
+		dimStyle.Render(fmt.Sprintf(" (%d)", len(s.rows)))
+	// Extend the heading into a full-width divider so each group reads as a
+	// labeled band, giving the board structure even when it is sparse.
+	if fill := inner - lipgloss.Width(head) - 1; fill > 0 {
+		head += " " + ruleStyle.Render(strings.Repeat("─", fill))
+	}
 
-	lines := []string{heading + count}
+	lines := []string{head}
 	if len(s.rows) == 0 {
-		lines = append(lines, dimStyle.Render("  —"))
+		lines = append(lines, dimStyle.Render("   · none"))
 	} else {
 		for _, row := range s.rows {
 			lines = append(lines, m.renderRow(row, s, inner, now))
 		}
 	}
-
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(cBorder).
-		Padding(0, 1).
-		Width(inner).
-		Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+	lines = append(lines, "") // trailing spacer for breathing room between groups
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 // renderRow formats one issue line: a selection bar, a lead glyph/spinner, a
@@ -84,26 +85,19 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 		idCell = selIDStyle.Render(idText)
 	}
 
-	// Fixed-width cells so lane / id / status line up as columns across rows.
-	badgeCell := lipgloss.NewStyle().Width(14).Render(laneBadge(row.LaneLabel))
-	statusCell := lipgloss.NewStyle().Width(15).Render(statusChip(row.Status))
-	left := mark + lipgloss.JoinHorizontal(lipgloss.Center,
+	// Fixed-width, left-aligned cells so lane / id / status / meta read as an
+	// aligned table row, rather than flinging the metadata to the far edge of a
+	// wide panel where it reads as disconnected from its row.
+	badgeCell := lipgloss.NewStyle().Width(15).Render(laneBadge(row.LaneLabel))
+	statusCell := lipgloss.NewStyle().Width(13).Render(statusChip(row.Status))
+
+	return mark + lipgloss.JoinHorizontal(lipgloss.Center,
 		lead, " ",
 		badgeCell, " ",
 		idCell, " ",
-		statusCell,
+		statusCell, "  ",
+		m.rowDetail(row, s, now),
 	)
-
-	detail := m.rowDetail(row, s, now)
-	// Right-align the detail within the panel's text area. The panel sets
-	// Width(inner) but its Padding(0,1) consumes 2 of that, so the usable
-	// text width is inner-2; targeting inner here would overflow and wrap.
-	avail := inner - 2
-	gap := avail - lipgloss.Width(left) - lipgloss.Width(detail)
-	if gap < 1 {
-		gap = 1
-	}
-	return left + strings.Repeat(" ", gap) + detail
 }
 
 // rowDetail renders the trailing metadata. For a QUEUED row with unmet
@@ -155,36 +149,31 @@ func (m Model) renderDoneSummary(inner int) string {
 	for _, r := range done {
 		idents = append(idents, r.Identifier)
 	}
-	head := doneHeadStyle.Render(fmt.Sprintf("✓ DONE (%d)  ", len(done)))
-	// Budget the identifier list to the remaining width so the line never
-	// wraps (which would throw off the body's line geometry).
-	budget := inner - lipgloss.Width(head) - 2
-	list := truncatePlain(strings.Join(idents, "  "), budget)
-	return head + dimStyle.Render(list)
+	// Match the section groups: a full-width labeled band, then the completed
+	// identifiers on the line below (budgeted so the line never wraps).
+	head := doneHeadStyle.Render("✓ DONE") + dimStyle.Render(fmt.Sprintf(" (%d)", len(done)))
+	if fill := inner - lipgloss.Width(head) - 1; fill > 0 {
+		head += " " + ruleStyle.Render(strings.Repeat("─", fill))
+	}
+	list := dimStyle.Render("   " + truncatePlain(strings.Join(idents, "  "), maxInt(inner-4, 4)))
+	return head + "\n" + list
 }
 
 // orderedLineIndex returns the 0-based line, within renderBody's output, of the
 // ordered row at global index g. It measures actual rendered heights rather
 // than assuming one line per row, so a row that wraps at a narrow width can't
-// drift the result: preceding panels are summed via lipgloss.Height of the
-// whole panel, and rows preceding g within its panel via lipgloss.Height of
-// each rendered row (the heading is a single short line). Used to keep the
-// selected row visible when scrolling.
+// drift the result: preceding groups are summed via lipgloss.Height of the
+// whole (borderless) group, and rows preceding g within its group via
+// lipgloss.Height of each rendered row (the heading is a single line). Used to
+// keep the selected row visible when scrolling the pipeline viewport.
 func (m Model) orderedLineIndex(g int) int {
-	width := m.width
-	if width <= 0 {
-		width = 96
-	}
-	inner := width - 4
-	if inner < 24 {
-		inner = 24
-	}
+	inner := m.dims().pipeTextW
 
 	line := 0
 	seen := 0
 	for _, s := range m.sectionList() {
 		if g < seen+len(s.rows) {
-			line += 2 // top border + heading
+			line++ // heading
 			for i := 0; i < g-seen; i++ {
 				line += lipgloss.Height(m.renderRow(s.rows[i], s, inner, 0))
 			}

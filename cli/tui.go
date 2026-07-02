@@ -79,7 +79,13 @@ func runTUI(cmd *cobra.Command, boardDir string) error {
 
 	model := tui.NewModel(tui.WithRefreshCmd(refresh))
 
-	program := tea.NewProgram(programModel{model})
+	// WithAltScreen takes over the whole terminal (alternate screen buffer):
+	// the dashboard renders fullscreen, never bleeds into scrollback, and the
+	// terminal is restored on quit. It also fully repaints each frame, which
+	// eliminates the inline renderer's line-diff residue (stale cells from a
+	// taller/wider previous frame — e.g. the kanban columns — stranded behind
+	// a shorter one). WithMouseCellMotion lets the wheel scroll the viewports.
+	program := tea.NewProgram(programModel{model}, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running tui: %w", err)
 	}

@@ -58,6 +58,17 @@ var (
 	panelHeadStyle = lipgloss.NewStyle().Bold(true).Foreground(cText)
 	labelStyle     = lipgloss.NewStyle().Foreground(cDim)
 	doneHeadStyle  = lipgloss.NewStyle().Bold(true).Foreground(cGreen)
+
+	// Panel framing: one subtle rounded border shared by every panel so the
+	// whole dashboard reads as a single system. The accent lives on the title,
+	// never the border.
+	panelBorderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cBorder).Padding(0, 1)
+	panelTitleStyle  = lipgloss.NewStyle().Bold(true)
+	ruleStyle        = lipgloss.NewStyle().Foreground(cBorder)
+
+	// Tab switcher: the active view is a filled chip, inactive views are dim.
+	tabActiveStyle   = lipgloss.NewStyle().Bold(true).Foreground(cInk).Background(cCyan).Padding(0, 1)
+	tabInactiveStyle = lipgloss.NewStyle().Foreground(cDim).Padding(0, 1)
 )
 
 // section describes one dashboard group: its title, the accent color that
@@ -73,58 +84,128 @@ type section struct {
 	waiting bool
 }
 
+// layoutDims is the per-frame geometry derived purely from the terminal size
+// and current mode. Both layout() (which sizes the viewports) and the render
+// helpers read it, so panel sizes can never drift between the two. cw is the
+// width passed to a full-span bordered box's .Width() (its outer width is
+// cw+2 = frameW); textW inside such a box is cw-2 after the 1-col padding.
+type layoutDims struct {
+	frameW, frameH int
+	cw             int
+	headerH        int
+	tabsH          int
+	footerH        int
+	bodyH          int // rows available to the body between tabs and footer
+
+	twoCol        bool
+	leftW, rightW int // .Width() args for the pipeline / activity columns
+	pipeTextW     int
+	actTextW      int
+	pipeH, actH   int // full heights of the two panels
+	pipeVpH       int // pipeline viewport height (panel − border − title)
+	actVpH        int
+}
+
+// dims computes the frame geometry. It is pure (now=0 into the measured
+// helpers) so it is safe to call from both Update's layout() and View.
+func (m Model) dims() layoutDims {
+	w := m.width
+	if w <= 0 {
+		w = 120
+	}
+	h := m.height
+	if h <= 0 {
+		h = 40
+	}
+	d := layoutDims{frameW: w, frameH: h}
+	d.cw = maxInt(w-2, 24)
+
+	d.headerH = lipgloss.Height(m.renderHeader(d.cw, 0))
+	d.tabsH = lipgloss.Height(m.renderTabs(d.cw))
+	d.footerH = lipgloss.Height(m.renderFooter(d.cw))
+	d.bodyH = maxInt(h-d.headerH-d.tabsH-d.footerH, 6)
+
+	// Two side-by-side panels when there's room; otherwise stack them.
+	d.twoCol = w >= 100
+	if d.twoCol {
+		avail := w - 5 // left(+2 border) + gap(1) + right(+2 border)
+		d.leftW = maxInt(avail*56/100, 30)
+		d.rightW = avail - d.leftW
+		d.pipeH, d.actH = d.bodyH, d.bodyH
+	} else {
+		d.leftW, d.rightW = d.cw, d.cw
+		d.pipeH = maxInt(d.bodyH*3/5, 4)
+		d.actH = maxInt(d.bodyH-d.pipeH, 3)
+	}
+	d.pipeTextW = maxInt(d.leftW-2, 8)
+	d.actTextW = maxInt(d.rightW-2, 8)
+	d.pipeVpH = maxInt(d.pipeH-3, 1) // border(2) + title(1)
+	d.actVpH = maxInt(d.actH-3, 1)
+	return d
+}
+
 // View renders the active screen. It is the one place wall-clock time enters
 // the TUI: the pure Update never calls time.Now, so all "elapsed"/"ago"
 // readouts are computed here against a single now captured per frame.
 func (m Model) View() string {
 	now := time.Now().Unix()
-	width := m.width
-	if width <= 0 {
-		width = 96
-	}
-	inner := width - 4
-	if inner < 24 {
-		inner = 24
-	}
+	d := m.dims()
 
 	if m.showHelp {
-		return m.renderHelpScreen(inner, now)
+		return m.renderHelpScreen(now)
 	}
 	switch m.mode {
 	case modeDetail:
-		return m.renderDetailScreen(inner, now)
+		return m.renderDetailScreen(d.cw, now)
 	case modeKanban:
-		return m.renderKanbanScreen(inner, now)
+		return m.renderKanbanScreen(d.cw, now)
 	default:
-		return m.renderDashboard(inner, now)
+		return m.renderDashboard(now)
 	}
 }
 
-// renderDashboard is the default stacked view: a fixed header, the scrollable
-// body of section panels (in a viewport), the activity feed, and a footer.
-func (m Model) renderDashboard(inner int, now int64) string {
-	var b strings.Builder
-	b.WriteString(m.renderHeader(inner, now))
-	b.WriteString("\n")
+// renderDashboard is the default view: a dense header, a tab bar, a two-column
+// body (the PIPELINE panel beside the ACTIVITY feed) that fills the whole
+// terminal height, and a pinned footer. On a narrow terminal the two panels
+// stack instead. Every region is sized from dims() so header+tabs+body+footer
+// sum to exactly the frame height — no dead space, footer flush to the bottom.
+func (m Model) renderDashboard(now int64) string {
+	d := m.dims()
 
-	if m.lastErr != nil {
-		b.WriteString(errorStyle.Render("⚠ refresh error: " + m.lastErr.Error()))
-		b.WriteString("\n")
+	// Rebuild the pipeline content with the live now so RUNNING rows' elapsed
+	// timers tick every frame; layout() already sized/clamped the viewport off
+	// the now=0 content (elapsed is inline, so the line counts match).
+	pipeVp := m.bodyVp
+	pipeVp.SetContent(m.renderBody(d.pipeTextW, now))
+	left := panelBox("PIPELINE", cText, pipeVp.View(), d.leftW, d.pipeH)
+	right := panelBox("⚡ ACTIVITY", cAmber, m.activityVp.View(), d.rightW, d.actH)
+
+	var body string
+	if d.twoCol {
+		body = lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
+	} else {
+		body = lipgloss.JoinVertical(lipgloss.Left, left, right)
 	}
 
-	// The body viewport's content is (re)built here with the live now so the
-	// RUNNING rows' elapsed timers tick every frame; layout() has already set
-	// the same content sans elapsed to size the viewport and clamp its offset
-	// (elapsed is inline, so line counts match).
-	vp := m.bodyVp
-	vp.SetContent(m.renderBody(inner, now))
-	b.WriteString(vp.View())
-	b.WriteString("\n")
+	return lipgloss.JoinVertical(lipgloss.Left,
+		m.renderHeader(d.cw, now),
+		m.renderTabs(d.cw),
+		body,
+		m.renderFooter(d.cw),
+	)
+}
 
-	b.WriteString(m.renderActivityPanel(inner))
-	b.WriteString("\n")
-	b.WriteString(m.renderFooter())
-	return b.String()
+// panelBox frames a titled panel: an accent-colored title over its body inside
+// the shared subtle rounded border. colW is the .Width() arg (outer = colW+2);
+// totalH is the panel's full height including the border, so body must already
+// be (totalH−3) lines tall — one title line plus (totalH−3) body lines fills
+// the (totalH−2) content box exactly.
+func panelBox(title string, accent lipgloss.Color, body string, colW, totalH int) string {
+	head := panelTitleStyle.Foreground(accent).Render(title)
+	return panelBorderStyle.
+		Width(colW).
+		Height(maxInt(totalH-2, 1)).
+		Render(lipgloss.JoinVertical(lipgloss.Left, head, body))
 }
 
 // layout recomputes widget sizes and viewport content from the current model
@@ -133,65 +214,31 @@ func (m Model) renderDashboard(inner int, now int64) string {
 // Called after every state change that can alter sizing (snapshot, resize,
 // selection, mode).
 func (m *Model) layout() {
-	width := m.width
-	if width <= 0 {
-		width = 96
-	}
-	inner := width - 4
-	if inner < 24 {
-		inner = 24
-	}
-	height := m.height
-	if height <= 0 {
-		height = 40
-	}
+	d := m.dims()
 
-	m.help.Width = width
-	m.progress.Width = clampInt(inner/2, 12, 48)
+	m.help.Width = d.cw
+	m.progress.Width = clampInt(d.cw/3, 16, 60)
 
-	// Activity feed viewport, sized to its panel's inner text width.
-	m.activityVp.Width = inner - 2
-	actN := len(m.recentEvents)
-	if actN == 0 {
-		actN = 1
-	}
-	m.activityVp.Height = clampInt(actN, 1, 8)
-	m.activityVp.SetContent(strings.Join(m.activityLines(m.activityVp.Width), "\n"))
-	activityPanelH := m.activityVp.Height + 3 // heading (1) + border (2)
-
-	headerH := lipgloss.Height(m.renderHeader(inner, 0))
-	footerH := 1
-
-	// Body viewport: fit content when it fits, else cap to the remaining
-	// space so it scrolls. Content set with now=0 for a stable line count.
-	// Width matches the section boxes' outer width (inner + 2 borders) so the
-	// viewport pads its lines flush with the header rather than 2 cols wider.
-	m.bodyVp.Width = inner + 2
-	m.bodyVp.SetContent(m.renderBody(inner, 0))
-	contentH := m.bodyVp.TotalLineCount()
-	avail := height - headerH - activityPanelH - footerH - 3 // 3 = inter-panel newlines
-	if avail < 3 {
-		avail = 3
-	}
-	bodyH := contentH
-	if bodyH > avail {
-		bodyH = avail
-	}
-	if bodyH < 1 {
-		bodyH = 1
-	}
-	m.bodyVp.Height = bodyH
+	// Pipeline viewport (the left / top panel body).
+	m.bodyVp.Width = d.pipeTextW
+	m.bodyVp.Height = d.pipeVpH
+	m.bodyVp.SetContent(m.renderBody(d.pipeTextW, 0))
 	m.bodyVp.SetYOffset(m.bodyVp.YOffset) // re-clamp against the new bounds
 
-	// Detail viewport fills the space below the header (its content carries
-	// its own heading, so there is no wrapping box to budget for).
-	m.detailVp.Width = width
-	detailAvail := height - headerH - footerH - 3
-	if detailAvail < 3 {
-		detailAvail = 3
-	}
-	m.detailVp.Height = detailAvail
-	m.detailVp.SetContent(m.detailContent(inner))
+	// Activity viewport (the right / bottom panel body). Newest-first content,
+	// top-anchored, so a full feed scrolls under the wheel / pgup.
+	m.activityVp.Width = d.actTextW
+	m.activityVp.Height = d.actVpH
+	m.activityVp.SetContent(strings.Join(m.activityLines(d.actTextW), "\n"))
+	m.activityVp.SetYOffset(m.activityVp.YOffset)
+
+	// Detail viewport is the body of the ISSUE DETAIL panel: it fills the space
+	// under the header (the detail screen has no tab bar) minus the panel's own
+	// border(2) and title(1). The panel width's padding leaves cw−2 for text.
+	detailW := maxInt(d.cw-2, 8)
+	m.detailVp.Width = detailW
+	m.detailVp.Height = maxInt(d.frameH-d.headerH-d.footerH-3, 1)
+	m.detailVp.SetContent(m.detailContent(detailW))
 	m.detailVp.SetYOffset(m.detailVp.YOffset)
 }
 
@@ -212,49 +259,74 @@ func (m *Model) ensureSelectionVisible() {
 	}
 }
 
-// renderHeader draws the top panel: the "clipse" title, a liveness dot with a
-// "last activity" age, status-count chips, a completion progress bar with a
-// rough cost estimate, and the cumulative token counters.
-func (m Model) renderHeader(inner int, now int64) string {
-	titleLine := lipgloss.JoinHorizontal(lipgloss.Center,
-		titleStyle.Render("clipse"),
-		"  ",
-		subtitleStyle.Render("pipeline dashboard"),
-		"   ",
+// renderHeader draws the top panel in three dense rows — title + liveness, the
+// status-count chips, and the progress bar + cost + token counters — inside a
+// cyan-bordered box. The liveness badge and token counters are pushed flush
+// right on their rows, so the header spends horizontal width, not the vertical
+// blank lines it used to.
+func (m Model) renderHeader(cw int, now int64) string {
+	textW := maxInt(cw-2, 8)
+
+	row1 := padBetween(
+		lipgloss.JoinHorizontal(lipgloss.Center,
+			titleStyle.Render("clipse"), " ",
+			subtitleStyle.Render("pipeline dashboard"),
+		),
 		m.livenessBadge(now),
+		textW,
 	)
 
 	chips := lipgloss.JoinHorizontal(lipgloss.Center,
-		countChip("▶", "running", m.count("running"), cGreen),
-		"  ",
-		countChip("◐", "in flight", m.inFlightCount(), cCyan),
-		"  ",
-		countChip("•", "queued", m.count("ready")+m.count("todo"), cAmber),
-		"  ",
-		countChip("✖", "blocked", m.count("blocked"), cRed),
-		"  ",
+		countChip("▶", "running", m.count("running"), cGreen), "   ",
+		countChip("◐", "in flight", m.inFlightCount(), cCyan), "   ",
+		countChip("•", "queued", m.count("ready")+m.count("todo"), cAmber), "   ",
+		countChip("✖", "blocked", m.count("blocked"), cRed), "   ",
 		countChip("✓", "done", m.count("done"), cPurple),
 	)
 
-	progressLine := m.renderProgress()
+	row3 := padBetween(m.renderProgress(), m.renderTokens(), textW)
 
-	tokens := lipgloss.JoinHorizontal(lipgloss.Center,
-		dimStyle.Render("tokens  "),
-		lipgloss.NewStyle().Foreground(cCyan).Render("↓ "),
+	body := lipgloss.JoinVertical(lipgloss.Left, row1, chips, row3)
+	return panelBorderStyle.Width(cw).BorderForeground(cCyan).Render(body)
+}
+
+// renderTabs draws the view switcher (dashboard / board) as a chip row with a
+// right-aligned hint. The active view is a filled chip; the other is dim.
+func (m Model) renderTabs(cw int) string {
+	mk := func(icon, label string, active bool) string {
+		if active {
+			return tabActiveStyle.Render(icon + " " + label)
+		}
+		return tabInactiveStyle.Render(icon + " " + label)
+	}
+	tabs := lipgloss.JoinHorizontal(lipgloss.Center,
+		mk("▚", "dashboard", m.mode == modeDashboard), " ",
+		mk("▦", "board", m.mode == modeKanban),
+	)
+	return padBetween(tabs, dimStyle.Render("tab switches view  "), cw)
+}
+
+// renderTokens renders the cumulative token counters (↓ in / ↑ out).
+func (m Model) renderTokens() string {
+	return lipgloss.JoinHorizontal(lipgloss.Center,
+		dimStyle.Render("tokens "),
+		lipgloss.NewStyle().Foreground(cCyan).Render("↓"),
 		tokenNumStyle.Render(humanizeTokens(m.tokensIn)),
-		dimStyle.Render(" in    "),
-		lipgloss.NewStyle().Foreground(cPurple).Render("↑ "),
+		dimStyle.Render(" in  "),
+		lipgloss.NewStyle().Foreground(cPurple).Render("↑"),
 		tokenNumStyle.Render(humanizeTokens(m.tokensOut)),
 		dimStyle.Render(" out"),
 	)
+}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, titleLine, "", chips, "", progressLine, "", tokens)
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(cCyan).
-		Padding(0, 1).
-		Width(inner).
-		Render(body)
+// padBetween joins left and right with a space filler so right sits flush
+// against width, giving a justified line. The two never touch (min 1-col gap).
+func padBetween(left, right string, width int) string {
+	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
 }
 
 // livenessBadge renders the dispatcher liveness dot plus a "last activity Ns
@@ -291,24 +363,39 @@ func (m Model) renderProgress() string {
 	return lipgloss.JoinHorizontal(lipgloss.Center, bar, label, cost)
 }
 
-// renderFooter draws the one-line key hints via the bubbles help widget
-// (short form). '?' toggles the expanded overlay.
-func (m Model) renderFooter() string {
-	return footerStyle.Render(m.help.View(m.keys))
+// renderFooter draws the pinned bottom bar: a thin full-width rule, then the
+// key hints (bubbles help, short form) on the left with a "mode · selection"
+// context flush right.
+func (m Model) renderFooter(cw int) string {
+	ctx := m.ViewMode()
+	if m.selected != "" {
+		ctx += " · " + m.selected
+	}
+	line := padBetween(footerStyle.Render(m.help.View(m.keys)), dimStyle.Render(ctx), cw)
+	return lipgloss.JoinVertical(lipgloss.Left, ruleStyle.Render(strings.Repeat("─", cw)), line)
 }
 
 // renderHelpScreen overlays the full, column-grouped keybinding list (bubbles
-// help, ShowAll) beneath the header.
-func (m Model) renderHelpScreen(inner int, now int64) string {
+// help, ShowAll) as a card centered in the body area, beneath the header and
+// tab bar, so the frame stays full-height and consistent with the dashboard.
+func (m Model) renderHelpScreen(now int64) string {
+	d := m.dims()
 	h := m.help
 	h.ShowAll = true
-	box := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(cCyan).
-		Padding(0, 1).
-		Width(inner).
-		Render(lipgloss.JoinVertical(lipgloss.Left, panelHeadStyle.Render("HELP — keybindings"), "", h.View(m.keys)))
-	return m.renderHeader(inner, now) + "\n\n" + box + "\n" + footerStyle.Render("esc / ? to close")
+	cardW := clampInt(d.cw*3/5, 40, 84)
+	card := panelBorderStyle.Width(cardW).BorderForeground(cCyan).Render(
+		lipgloss.JoinVertical(lipgloss.Left,
+			panelTitleStyle.Foreground(cCyan).Render("HELP · keybindings"), "",
+			h.View(m.keys),
+		),
+	)
+	body := lipgloss.Place(d.cw, d.bodyH, lipgloss.Center, lipgloss.Center, card)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		m.renderHeader(d.cw, now),
+		m.renderTabs(d.cw),
+		body,
+		m.renderFooter(d.cw),
+	)
 }
 
 // count returns the board-wide number of issues in a given board_status.
