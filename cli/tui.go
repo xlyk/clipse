@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
 	"github.com/xlyk/clipse/cli/tui"
-	"github.com/xlyk/clipse/dispatcher"
 	"github.com/xlyk/clipse/internal/store"
 )
 
@@ -70,8 +72,8 @@ func runTUI(cmd *cobra.Command, boardDir string) error {
 		if err != nil {
 			return tui.ErrMsg{Err: fmt.Errorf("reading snapshot: %w", err)}
 		}
-		// Liveness is I/O (a lock probe), so it lives here in the refresh
-		// command rather than in the pure Update.
+		// Liveness is I/O (reading the lockfile), so it lives here in the
+		// refresh command rather than in the pure Update.
 		return tui.SnapshotMsg{Snap: snap, Live: dispatcherLive(lockPath)}
 	}
 
@@ -84,24 +86,27 @@ func runTUI(cmd *cobra.Command, boardDir string) error {
 	return nil
 }
 
-// dispatcherLive reports whether a clipse dispatcher is currently holding the
-// board's singleton lock, which is the authoritative "the pipeline is running"
-// signal. It probes non-destructively by trying to acquire the same flock the
-// dispatcher takes: if the lock is already held, acquisition fails with
-// ErrAlreadyRunning (⇒ live); if it succeeds, no dispatcher is running and the
-// probe immediately releases so the TUI never becomes the singleton itself and
-// blocks a real dispatcher from starting. Any other error is treated as "can't
-// tell" (not live).
+// dispatcherLive reports whether a clipse dispatcher is currently running,
+// the authoritative "the pipeline is live" signal. It reads the PID the
+// dispatcher records in its singleton lockfile (see
+// dispatcher.AcquireSingleton) and probes that process with signal 0. Reading
+// is passive — unlike acquiring the flock, it cannot race a starting
+// dispatcher into an ErrAlreadyRunning failure. A missing/empty/garbled
+// lockfile, or a PID that no longer exists, all read as not-live.
 func dispatcherLive(lockPath string) bool {
-	release, err := dispatcher.AcquireSingleton(lockPath)
-	if errors.Is(err, dispatcher.ErrAlreadyRunning) {
-		return true
-	}
+	data, err := os.ReadFile(lockPath)
 	if err != nil {
 		return false
 	}
-	_ = release()
-	return false
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	// signal 0 delivers nothing but still resolves the target: nil ⇒ the
+	// process is alive; EPERM ⇒ it exists but is owned by another user (still
+	// alive); ESRCH ⇒ it is gone.
+	err = syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // programModel adapts tui.Model to the tea.Model interface. tea.Model.Update

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +68,37 @@ func TestAcquireSingleton_ReleaseIsIdempotent(t *testing.T) {
 	}
 	if err := release(); err != nil {
 		t.Fatalf("second release() error = %v, want nil (idempotent)", err)
+	}
+}
+
+// TestAcquireSingleton_RecordsPIDAndClearsOnRelease asserts the holder writes
+// its PID into the lockfile (so a read-only observer can gauge liveness
+// without taking the flock) and clears it on release.
+func TestAcquireSingleton_RecordsPIDAndClearsOnRelease(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "clipse.lock")
+
+	release, err := AcquireSingleton(lockPath)
+	if err != nil {
+		t.Fatalf("AcquireSingleton() error = %v, want nil", err)
+	}
+
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("reading lockfile: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(data)), strconv.Itoa(os.Getpid()); got != want {
+		t.Errorf("lockfile PID = %q, want %q", got, want)
+	}
+
+	if err := release(); err != nil {
+		t.Fatalf("release() error = %v, want nil", err)
+	}
+	data, err = os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("reading lockfile after release: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "" {
+		t.Errorf("lockfile after release = %q, want empty (PID cleared)", string(data))
 	}
 }
 
