@@ -7,6 +7,14 @@
 # template this is copied from.
 /configs/clipse.yaml
 
+# smoke-test local config + generated artifacts (machine-specific; templates
+# are scripts/smoke/smoke.env.example + configs/clipse.smoke.example.yaml).
+/scripts/smoke/smoke.env
+/scripts/smoke/*.local.yaml
+/scripts/smoke/clipse.smoke.yaml
+/scripts/smoke/*.log
+/scripts/smoke/smoke-manifest.tsv
+
 # databases
 *.db
 *.db-wal

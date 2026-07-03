@@ -1,0 +1,56 @@
+# Clipse smoke-test dispatcher config -- DOCUMENTATION ONLY.
+#
+# The smoke harness (scripts/smoke/smoke.sh) GENERATES the live config from
+# scripts/smoke/smoke.env on every run and writes it to $SMOKE_YAML (gitignored,
+# default $SMOKE_HOME/clipse.smoke.yaml). This file just shows the shape the
+# harness produces so you can eyeball it. Editing this file has no effect on a
+# run; change smoke.env instead. See configs/clipse.example.yaml for the full
+# field-by-field reference.
+
+repo:
+  # A throwaway target repo -- reset force-resets its main branch.
+  remote: "git@github.com:xlyk/clipse-smoke-target.git"
+  # Primary clone the dispatcher makes worktrees from.
+  path: "/Users/you/Code/clipse-smoke/primary"
+  base_branch: "main"
+
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+
+poll_interval_s: 20
+
+caps:
+  global: 6
+  per_lane:
+    coder: 3
+    reviewer: 2
+    git_operator: 2
+    scribe: 2
+
+turn_cap: 3
+max_runtime_s: 900
+max_tokens_per_run: 2000000
+lane_label_prefix: "agent:"
+max_attempts: 3
+rework_cap: 3
+recover_cap: 5
+
+worker:
+  command:
+    - uv
+    - --project
+    - "/Users/you/Code/clipse/agent"
+    - run
+    - clipse-worker
+
+checkpoints_dir: "/Users/you/Code/clipse-smoke/checkpoints"
+board_dir: "/Users/you/Code/clipse-smoke/board"
+
+# LINEAR_API_KEY is intentionally absent: it is the kernel-only credential and
+# config.Load rejects it here -- it must never reach a worker.
+env_allowlist:
+  - ANTHROPIC_API_KEY
+  - PATH
+  - HOME
+  - GH_TOKEN
+  - GITHUB_TOKEN
