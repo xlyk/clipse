@@ -45,6 +45,11 @@ done
 source "$ROOT/scripts/smoke/smoke.env"
 : "${SMOKE_HOME:=$HOME/Code/clipse-smoke}"
 : "${BOARD_DIR:=$SMOKE_HOME/board}"
+# The Linear view the demo opens. `open -a Linear <url>` routes it to the
+# desktop app (not the browser). Set this view to list-layout grouped-by-status
+# in Linear ONCE — Linear persists layout+grouping per view, so every later run
+# opens straight into the right look.
+: "${LINEAR_BOARD_URL:=https://linear.app/clipse-development/team/CLI/all}"
 DEMO_DIR="$SMOKE_HOME/demo"
 RAW="$DEMO_DIR/raw.mov"
 OUT="$DEMO_DIR/clipse-demo.mp4"
@@ -70,7 +75,7 @@ trap cleanup EXIT INT TERM
 command -v ffmpeg >/dev/null || die "ffmpeg not found"
 command -v ffprobe >/dev/null || die "ffprobe not found"
 [[ -x "$CLIPSE_BIN" ]] || die "no ./bin/clipse — the harness build will make it, but check the repo"
-pgrep -x Linear >/dev/null || die "Linear.app is not running — open it on the CLI board (list view, grouped by status)"
+# Linear is launched + navigated in phase B (open -a Linear), so it need not be running here.
 
 avail_kb="$(df -k "$SMOKE_HOME" 2>/dev/null | awk 'NR==2{print $4}')"
 [[ -n "$avail_kb" && "$avail_kb" -lt 1048576 ]] && warn "less than ~1GB free under $SMOKE_HOME — a raw capture can be large"
@@ -91,7 +96,10 @@ info "pre-roll: reset + build + seed (${FAST_FLAG:-full DAG})"
 # shellcheck disable=SC2086
 "$SMOKE" $FAST_FLAG --no-run
 
-# --- phase B: stage the set -------------------------------------------------
+# --- phase B: open Linear on the board + stage the windows ------------------
+info "opening Linear on the CLI board: $LINEAR_BOARD_URL"
+open -a Linear "$LINEAR_BOARD_URL" 2>/dev/null || warn "could not open Linear — open it manually on the CLI board"
+sleep 2   # let Linear launch/navigate before positioning it
 info "arranging windows (Linear left, terminal right)"
 osascript "$SCRIPT_DIR/arrange-windows.applescript" || warn "window arrange failed (Accessibility permission?) — arrange manually"
 if defaults write com.apple.dock autohide -bool true 2>/dev/null; then killall Dock 2>/dev/null || true; DOCK_HIDDEN=1; fi
