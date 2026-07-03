@@ -76,11 +76,13 @@ var (
 // its rows show a live elapsed/spinner (only RUNNING does), and whether it is
 // the QUEUED group (whose rows get a dependency "waiting on …" hint).
 type section struct {
-	title   string
-	accent  lipgloss.Color
-	glyph   string
-	rows    []Row
-	live    bool
+	title  string
+	accent lipgloss.Color
+	glyph  string
+	rows   []Row
+	// waiting marks the QUEUED section, whose rows render a "waiting on …"
+	// dependency hint instead of run metadata. (Liveness is per-row — see
+	// Row.Live — not a section-wide flag.)
 	waiting bool
 }
 
@@ -332,7 +334,28 @@ func (m Model) livenessBadge(now int64) string {
 	} else {
 		age = dimStyle.Render("updated " + formatAge(now-m.lastEventAt) + " ago")
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Center, dot, "  ", age)
+	segs := []string{dot, "  ", age}
+	// A prominent tally of how many agents are actively working right now
+	// (claims held, across every lane) so concurrent coder/reviewer/scribe
+	// work is legible without scanning the sections for spinners.
+	if n := m.workingCount(); n > 0 {
+		segs = append(segs, "  ", lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render(fmt.Sprintf("⚡ %d working", n)))
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Center, segs...)
+}
+
+// workingCount is the number of issues a worker is actively on right now (a
+// held dispatcher claim), across every lane. It sums Row.Live over the ordered
+// rows (blocked/queued rows are never live), giving the header its live-agent
+// tally.
+func (m Model) workingCount() int {
+	n := 0
+	for _, r := range m.ordered {
+		if r.Live {
+			n++
+		}
+	}
+	return n
 }
 
 // renderProgress draws the completion progress bar (done/total issues) via the

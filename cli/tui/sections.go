@@ -13,10 +13,10 @@ import (
 // lockstep.
 func (m Model) sectionList() []section {
 	return []section{
-		{"RUNNING", cGreen, "▶", m.running, true, false},
-		{"IN FLIGHT", cCyan, "◐", m.inFlight, false, false},
-		{"BLOCKED", cRed, "✖", m.blocked, false, false},
-		{"QUEUED", cAmber, "•", m.queued, false, true},
+		{"RUNNING", cGreen, "▶", m.running, false},
+		{"IN FLIGHT", cCyan, "◐", m.inFlight, false},
+		{"BLOCKED", cRed, "✖", m.blocked, false},
+		{"QUEUED", cAmber, "•", m.queued, true},
 	}
 }
 
@@ -74,8 +74,11 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 		mark = selMarkStyle.Render("▌") + " "
 	}
 
+	// Liveness is per-row (an active claim = a worker on it now), so the
+	// spinner lights up for a working agent in ANY lane — reviewer, scribe, or
+	// git_operator — not only the coder-lane "running" section.
 	lead := lipgloss.NewStyle().Foreground(s.accent).Render(s.glyph)
-	if s.live && row.Run != nil {
+	if row.Live {
 		lead = lipgloss.NewStyle().Foreground(cGreen).Render(spinnerFrames[m.frame%len(spinnerFrames)])
 	}
 
@@ -85,10 +88,18 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 		idCell = selIDStyle.Render(idText)
 	}
 
+	// Badge the lane actually working the card when it's live (reviewer while
+	// a review card is being reviewed, scribe while docs are written), falling
+	// back to the issue's home label when nothing is actively on it.
+	badgeLane := row.LaneLabel
+	if row.Live && row.ActiveLane != "" {
+		badgeLane = row.ActiveLane
+	}
+
 	// Fixed-width, left-aligned cells so lane / id / status / meta read as an
 	// aligned table row, rather than flinging the metadata to the far edge of a
 	// wide panel where it reads as disconnected from its row.
-	badgeCell := lipgloss.NewStyle().Width(15).Render(laneBadge(row.LaneLabel))
+	badgeCell := lipgloss.NewStyle().Width(15).Render(laneBadge(badgeLane))
 	statusCell := lipgloss.NewStyle().Width(13).Render(statusChip(row.Status))
 
 	return mark + lipgloss.JoinHorizontal(lipgloss.Center,
@@ -128,7 +139,7 @@ func (m Model) rowDetail(row Row, s section, now int64) string {
 			dimStyle.Render(" ")+
 			lipgloss.NewStyle().Foreground(cPurple).Render("↑"+humanizeTokens(row.TokensOut)))
 	}
-	if s.live && row.Run != nil {
+	if row.Live {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Render("⏱ "+formatElapsed(row.Run, now)))
 	}
 	if len(parts) == 0 {

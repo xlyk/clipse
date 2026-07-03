@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"database/sql"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -154,6 +155,57 @@ func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
 	}
 	if got := len(updated.Queued()); got != 0 {
 		t.Errorf("Queued() len = %d, want 0", got)
+	}
+}
+
+// TestFold_ActiveClaimMarksRowLiveWithWorkingLane asserts that liveness is
+// per-row and keyed off the active claim, NOT the board_status: any card the
+// dispatcher currently holds a claim on (a worker running in ANY lane) is
+// Live, and its ActiveLane reports the lane actually working it — which for a
+// downstream column differs from the issue's coder home label. A card parked
+// in a downstream column with no active claim is not Live. This is what lets
+// the dashboard show a spinner + the reviewer/scribe/git_operator badge +
+// elapsed for every working agent, not just the coder-lane "running" one.
+func TestFold_ActiveClaimMarksRowLiveWithWorkingLane(t *testing.T) {
+	claimed := sql.NullString{String: "claim-tok", Valid: true}
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			// Coder actively running (claimed): live, working lane = coder.
+			{
+				Issue:     store.Issue{ID: "i-run", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "running", ClaimLock: claimed},
+				LatestRun: &store.Run{RunID: "r1", Lane: "coder", Status: "running", StartedAt: 100},
+			},
+			// Reviewer actively working a review card (claimed): live, working
+			// lane = reviewer, even though the issue's home label is coder.
+			{
+				Issue:     store.Issue{ID: "i-rev", Identifier: "CLP-2", LaneLabel: "coder", BoardStatus: "review", ClaimLock: claimed},
+				LatestRun: &store.Run{RunID: "r2", Lane: "reviewer", Status: "running", StartedAt: 100},
+			},
+			// Review card parked with no active claim (its latest run is the
+			// completed coder handoff): NOT live.
+			{
+				Issue:     store.Issue{ID: "i-park", Identifier: "CLP-3", LaneLabel: "coder", BoardStatus: "review"},
+				LatestRun: &store.Run{RunID: "r3", Lane: "coder", Status: "needs_review", StartedAt: 100},
+			},
+		},
+	}
+
+	m := tui.NewModel()
+	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
+
+	byID := make(map[string]tui.Row)
+	for _, r := range append(append([]tui.Row{}, updated.Running()...), updated.InFlight()...) {
+		byID[r.Identifier] = r
+	}
+
+	if r := byID["CLP-1"]; !r.Live || r.ActiveLane != "coder" {
+		t.Errorf("CLP-1 (running, claimed): Live=%v ActiveLane=%q, want true/\"coder\"", r.Live, r.ActiveLane)
+	}
+	if r := byID["CLP-2"]; !r.Live || r.ActiveLane != "reviewer" {
+		t.Errorf("CLP-2 (review, claimed): Live=%v ActiveLane=%q, want true/\"reviewer\" (the working lane, not the coder home label)", r.Live, r.ActiveLane)
+	}
+	if r := byID["CLP-3"]; r.Live || r.ActiveLane != "" {
+		t.Errorf("CLP-3 (review, unclaimed): Live=%v ActiveLane=%q, want false/\"\"", r.Live, r.ActiveLane)
 	}
 }
 

@@ -73,6 +73,23 @@ type Row struct {
 	// just Run, the latest) — the honest per-card usage.
 	TokensIn  int
 	TokensOut int
+
+	// Live is true iff the dispatcher currently holds a claim on this issue —
+	// i.e. a worker is actively working it RIGHT NOW, in whatever lane. It is
+	// keyed off the claim, not board_status, so it lights up for the
+	// reviewer/scribe/git_operator agents (review/documentation/merging) just
+	// as it does for the coder ("running"), and it goes dark for a card merely
+	// parked in a downstream column waiting to be claimed. Live rows render
+	// with the spinner + elapsed, whatever section they fall in.
+	Live bool
+
+	// ActiveLane is the bare lane of the run currently working this issue
+	// (Run.Lane) when Live, else "". It differs from LaneLabel (the issue's
+	// coder "home" label) once a card reaches a downstream lane — a review
+	// card being reviewed has ActiveLane "reviewer" but LaneLabel "coder" — so
+	// the row badge can name the agent that is actually working, not the one
+	// that opened the issue.
+	ActiveLane string
 }
 
 // Model is the bubbletea model for `clipse tui`. It holds only
@@ -476,6 +493,14 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.statusByID = make(map[string]string, len(snap.Issues))
 
 	for _, is := range sortedIssueSnapshots(snap.Issues) {
+		// A held claim means a worker is actively on this card now, in whatever
+		// lane — the honest "an agent is working" signal, independent of the
+		// board_status bucket the row lands in below.
+		live := is.ClaimLock.Valid && is.LatestRun != nil
+		activeLane := ""
+		if live {
+			activeLane = is.LatestRun.Lane
+		}
 		row := Row{
 			ID:         is.ID,
 			Identifier: is.Identifier,
@@ -485,6 +510,8 @@ func (m *Model) fold(snap store.Snapshot) {
 			Run:        is.LatestRun,
 			TokensIn:   is.TokensInTotal,
 			TokensOut:  is.TokensOutTotal,
+			Live:       live,
+			ActiveLane: activeLane,
 		}
 
 		m.byStatus[is.BoardStatus] = append(m.byStatus[is.BoardStatus], row)
