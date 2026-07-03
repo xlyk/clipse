@@ -127,14 +127,12 @@ func (h *fakeHandle) Wait() (spawn.Result, error) {
 
 // stubWorkspacer is a Workspacer test double: Ensure returns a fixed root
 // dir (a fresh subdirectory per issue, so tests can assert distinct
-// workspaces), Remove just records the call.
+// workspaces).
 type stubWorkspacer struct {
 	mu   sync.Mutex
 	root string
 
-	ensured     []string
-	ensuredDocs []string
-	removed     []string
+	ensured []string
 }
 
 func newStubWorkspacer(root string) *stubWorkspacer {
@@ -146,30 +144,6 @@ func (w *stubWorkspacer) Ensure(issue store.Issue) (string, error) {
 	w.ensured = append(w.ensured, issue.ID)
 	w.mu.Unlock()
 	return w.root + "/" + issue.ID, nil
-}
-
-// EnsureDocs returns a path under a distinct "docs/" subdir so tests can tell a
-// scribe docs worktree apart from a plain Ensure worktree, and records the
-// call for assertions.
-func (w *stubWorkspacer) EnsureDocs(issue store.Issue) (string, error) {
-	w.mu.Lock()
-	w.ensuredDocs = append(w.ensuredDocs, issue.ID)
-	w.mu.Unlock()
-	return w.root + "/docs/" + issue.ID, nil
-}
-
-// DocsEnsured returns the issue IDs EnsureDocs was called for, in call order.
-func (w *stubWorkspacer) DocsEnsured() []string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return append([]string(nil), w.ensuredDocs...)
-}
-
-func (w *stubWorkspacer) Remove(issue store.Issue) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.removed = append(w.removed, issue.ID)
-	return nil
 }
 
 // sequentialRunIDs returns a deterministic run id generator: "run-1",

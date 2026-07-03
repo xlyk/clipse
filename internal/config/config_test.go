@@ -36,7 +36,6 @@ caps:
     coder: 5
     reviewer: 3
     git_operator: 2
-    scribe: 2
 turn_cap: 7
 max_runtime_s: 1800
 rework_cap: 6
@@ -95,9 +94,6 @@ board_dir: "/abs/path/board"
 	}
 	if cfg.Caps.PerLane.GitOperator != 2 {
 		t.Errorf("Caps.PerLane.GitOperator = %d, want 2", cfg.Caps.PerLane.GitOperator)
-	}
-	if cfg.Caps.PerLane.Scribe != 2 {
-		t.Errorf("Caps.PerLane.Scribe = %d, want 2", cfg.Caps.PerLane.Scribe)
 	}
 	if cfg.TurnCap != 7 {
 		t.Errorf("TurnCap = %d, want 7", cfg.TurnCap)
@@ -171,9 +167,6 @@ worker:
 	}
 	if cfg.Caps.PerLane.GitOperator != 1 {
 		t.Errorf("Caps.PerLane.GitOperator = %d, want default 1", cfg.Caps.PerLane.GitOperator)
-	}
-	if cfg.Caps.PerLane.Scribe != 1 {
-		t.Errorf("Caps.PerLane.Scribe = %d, want default 1", cfg.Caps.PerLane.Scribe)
 	}
 	if cfg.TurnCap != 5 {
 		t.Errorf("TurnCap = %d, want default 5", cfg.TurnCap)

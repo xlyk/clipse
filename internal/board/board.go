@@ -35,12 +35,9 @@ const (
 	// allow it.
 	ActionMerge = "merge"
 
-	// ActionDocument means the Git-operator lane landed the PR; the
-	// dispatcher hands the card to the always-on Scribe lane.
-	ActionDocument = "document"
-
-	// ActionComplete means the Scribe lane finished (wrote docs or no-op'd);
-	// the card reaches its terminal Done state.
+	// ActionComplete means the Git-operator lane merged the PR; the card
+	// reaches its terminal Done state. (Documentation is written inside the
+	// Coder lane's own turn now, so there is no separate post-merge stage.)
 	ActionComplete = "complete"
 
 	// ActionCommentBlock means a worker reported blocked from an active
@@ -72,8 +69,8 @@ type transitionResult struct {
 // design doc's "Board & state machine" table plus the per-lane outcome
 // semantics: Running/Rework are Coder-lane columns (needs_review/blocked/
 // continue), Review is the Reviewer lane (done=pass/changes_requested/
-// blocked), Merging is the Git-operator lane (done=merged/blocked), and
-// Documentation is the Scribe lane (done/blocked). Every (outcome, column)
+// blocked), Merging is the Git-operator lane (done=merged, straight to Done/blocked; and
+// documentation is written inside the Coder turn). Every (outcome, column)
 // pair from the contract enums not present here is an illegal transition —
 // see TestNext_AllPairsCovered in board_test.go, which audits this table
 // against the full cross product.
@@ -112,9 +109,11 @@ var transitions = map[transitionKey]transitionResult{
 	},
 
 	// Merging (Git-operator lane; deterministic executor, board semantics
-	// only — see decision log J amendment).
+	// only — see decision log J amendment). A merged PR goes straight to the
+	// terminal Done state — documentation is written inside the Coder lane's
+	// own turn now, not in a separate post-merge stage.
 	{outcome: string(contract.WorkerResultOutcomeDone), current: string(contract.ColumnMerging)}: {
-		next: string(contract.ColumnDocumentation), action: ActionDocument,
+		next: string(contract.ColumnDone), action: ActionComplete,
 	},
 	{outcome: string(contract.WorkerResultOutcomeBlocked), current: string(contract.ColumnMerging)}: {
 		next: string(contract.ColumnBlocked), action: ActionCommentBlock,
@@ -126,14 +125,6 @@ var transitions = map[transitionKey]transitionResult{
 	// review -- both mean "the Coder lane gets another attempt".
 	{outcome: string(contract.WorkerResultOutcomeChangesRequested), current: string(contract.ColumnMerging)}: {
 		next: string(contract.ColumnRework), action: ActionRequestChanges,
-	},
-
-	// Documentation (Scribe lane).
-	{outcome: string(contract.WorkerResultOutcomeDone), current: string(contract.ColumnDocumentation)}: {
-		next: string(contract.ColumnDone), action: ActionComplete,
-	},
-	{outcome: string(contract.WorkerResultOutcomeBlocked), current: string(contract.ColumnDocumentation)}: {
-		next: string(contract.ColumnBlocked), action: ActionCommentBlock,
 	},
 }
 

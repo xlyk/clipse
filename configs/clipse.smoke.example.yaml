@@ -25,7 +25,6 @@ caps:
     coder: 3
     reviewer: 2
     git_operator: 2
-    scribe: 2
 
 turn_cap: 3
 max_runtime_s: 900

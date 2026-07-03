@@ -7,9 +7,9 @@ dispatch to the named lane's graph, and print exactly one line of
 schema-valid `contract.WorkerResult` JSON to stdout no matter what happens
 underneath -- including an unimplemented/garbage lane or an exception raised
 deep inside the graph. Every wired lane's graph (`clipse_agent.graphs.
-{coder,reviewer,scribe}`) is always faked here via `worker.build_coder_graph`
-/ `worker.build_reviewer_graph` / `worker.build_scribe_graph`'s own
-monkeypatch seams, so these tests never touch DAC, git, or gh. The one real
+{coder,reviewer}`) is always faked here via `worker.build_coder_graph`
+/ `worker.build_reviewer_graph`'s own monkeypatch seams, so these tests never
+touch DAC, git, or gh. The one real
 (but local, network-free) piece of infrastructure exercised is the
 AsyncSqliteSaver checkpointer built from --checkpoint-db, which is just a
 sqlite file.
@@ -61,9 +61,9 @@ def _fake_build_coder_graph(graph: _FakeGraph, build_calls: list[Any]) -> Any:
     """Named after its original (Coder-lane) use, but genuinely lane-generic:
     every `build_*_graph` function worker.py calls takes the same
     `checkpointer=...` keyword and returns a compiled graph, so this one
-    fake factory is reused below for `build_reviewer_graph`/
-    `build_scribe_graph` too -- mirrors `dac.build_coder_agent` being reused
-    across lanes for the same reason (see graphs/reviewer.py's docstring).
+    fake factory is reused below for `build_reviewer_graph` too -- mirrors
+    `dac.build_coder_agent` being reused across lanes for the same reason
+    (see graphs/reviewer.py's docstring).
     """
 
     def factory(*, checkpointer: Any = None) -> _FakeGraph:
@@ -312,7 +312,7 @@ def test_main_uses_no_checkpointer_when_checkpoint_db_omitted(monkeypatch, capsy
 
 
 # ---------------------------------------------------------------------------
-# Lane dispatch: coder/reviewer/scribe each reach their own graph; anything
+# Lane dispatch: coder/reviewer each reach their own graph; anything
 # else (including the real Lane member "git_operator", which never gets a
 # Python graph -- decision O/J amendment: it runs as deterministic Go
 # internal/gitops -- and any garbage string) stays blocked/transient.
@@ -363,60 +363,20 @@ def test_main_dispatches_reviewer_lane_and_prints_graph_result(monkeypatch, caps
     assert graph.calls[0]["config"] == {"configurable": {"thread_id": "thread-20::reviewer"}}
 
 
-def test_main_dispatches_scribe_lane_and_prints_graph_result(monkeypatch, capsys):
-    canned = _canned_result(
-        lane=Lane.scribe,
-        outcome=Outcome.done,
-        summary="no documentation changes needed",
-        pr_url=None,
-        artifacts=[],
-    )
-    graph = _FakeGraph(final_state={"result": canned})
-    build_calls: list[Any] = []
-
-    lines, result = _run_main_capture(
-        monkeypatch,
-        capsys,
-        [
-            "--issue",
-            "SPAC-21",
-            "--lane",
-            "scribe",
-            "--run",
-            "run-1",
-            "--thread",
-            "thread-21",
-            "--workspace",
-            "/ws",
-        ],
-        graph=graph,
-        build_calls=build_calls,
-        attr="build_scribe_graph",
-    )
-
-    assert result == canned
-    _assert_schema_valid(result, lines[0], blocked=False)
-    assert build_calls == [None]
-    assert len(graph.calls) == 1
-    input_state = graph.calls[0]["input_state"]
-    assert input_state["issue_id"] == "SPAC-21"
-    assert input_state["workspace"] == "/ws"
-
-
 # ---------------------------------------------------------------------------
 # Outer wrapping-graph checkpoint thread_id: namespaced per lane so
-# coder/reviewer/scribe never collide on the same physical checkpoint (the
-# inner DAC thread is already namespaced this way one level down -- see
-# graphs/coder.py's "::dac" and the reviewer/scribe analogues -- but the
-# OUTER wrapping graph this module drives was not, before this fix).
+# coder/reviewer never collide on the same physical checkpoint (the inner DAC
+# thread is already namespaced this way one level down -- see graphs/coder.py's
+# "::dac" and the reviewer analogue -- but the OUTER wrapping graph this module
+# drives was not, before this fix).
 # ---------------------------------------------------------------------------
 
 
 def test_outer_thread_id_is_namespaced_per_lane_and_distinct_across_lanes(monkeypatch, capsys):
     # A fresh claim's --thread is the SAME raw value regardless of lane (the
     # kernel has no reason to vary it by lane -- see internal/spawn's
-    # workerArgs) -- so without a per-lane namespace here, coder/reviewer/
-    # scribe dispatched against the same issue would collide on the OUTER
+    # workerArgs) -- so without a per-lane namespace here, coder/reviewer
+    # dispatched against the same issue would collide on the OUTER
     # wrapping-graph's own checkpoint thread_id.
     shared_thread = "shared-thread"
 
@@ -439,26 +399,12 @@ def test_outer_thread_id_is_namespaced_per_lane_and_distinct_across_lanes(monkey
         attr="build_reviewer_graph",
     )
 
-    scribe_graph = _FakeGraph(
-        final_state={"result": _canned_result(lane=Lane.scribe, outcome=Outcome.done, pr_url=None, artifacts=[])}
-    )
-    _run_main_capture(
-        monkeypatch,
-        capsys,
-        ["--lane", "scribe", "--run", "run-1", "--thread", shared_thread, "--workspace", "/ws"],
-        graph=scribe_graph,
-        build_calls=[],
-        attr="build_scribe_graph",
-    )
-
     coder_thread = coder_graph.calls[0]["config"]["configurable"]["thread_id"]
     reviewer_thread = reviewer_graph.calls[0]["config"]["configurable"]["thread_id"]
-    scribe_thread = scribe_graph.calls[0]["config"]["configurable"]["thread_id"]
 
     assert coder_thread == "shared-thread::coder"
     assert reviewer_thread == "shared-thread::reviewer"
-    assert scribe_thread == "shared-thread::scribe"
-    assert len({coder_thread, reviewer_thread, scribe_thread}) == 3
+    assert coder_thread != reviewer_thread
 
 
 def test_unimplemented_lane_returns_blocked_transient_without_building_graph(monkeypatch, capsys):

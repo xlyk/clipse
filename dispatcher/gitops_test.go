@@ -11,12 +11,13 @@ import (
 	"github.com/xlyk/clipse/internal/linear"
 )
 
-// TestTick_MergingClaim_Mergeable_RoutesToDocumentation asserts a claimed
-// merging card whose fake gitops run reports OutcomeMerged flows through
-// the SAME applyTerminalOutcome/board.Next path a spawned worker's "done"
-// result would: merging -> documentation, claim cleared, a setstate mirror
-// enqueued for the new column.
-func TestTick_MergingClaim_Mergeable_RoutesToDocumentation(t *testing.T) {
+// TestTick_MergingClaim_Mergeable_RoutesToDone asserts a claimed merging
+// card whose fake gitops run reports OutcomeMerged flows through the SAME
+// applyTerminalOutcome/board.Next path a spawned worker's "done" result
+// would: merging -> done (terminal; documentation is written in the Coder
+// turn now, so there is no post-merge stage), claim cleared, a setstate
+// mirror enqueued for the new column.
+func TestTick_MergingClaim_Mergeable_RoutesToDone(t *testing.T) {
 	s := openTestStore(t)
 	seedColumnIssue(t, s, "issue-1", "merging", 1, 100)
 
@@ -59,21 +60,21 @@ func TestTick_MergingClaim_Mergeable_RoutesToDocumentation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: unexpected error: %v", err)
 	}
-	if issue.BoardStatus != string(contract.ColumnDocumentation) {
-		t.Errorf("BoardStatus = %q, want documentation", issue.BoardStatus)
+	if issue.BoardStatus != string(contract.ColumnDone) {
+		t.Errorf("BoardStatus = %q, want done", issue.BoardStatus)
 	}
 	if issue.ClaimLock.Valid {
 		t.Errorf("ClaimLock.Valid = true, want cleared")
 	}
 
-	var sawDocSetState bool
+	var sawDoneSetState bool
 	for _, c := range lc.SetStateCalls {
-		if c.TargetColumn == string(contract.ColumnDocumentation) {
-			sawDocSetState = true
+		if c.TargetColumn == string(contract.ColumnDone) {
+			sawDoneSetState = true
 		}
 	}
-	if !sawDocSetState {
-		t.Errorf("SetState calls = %+v, want a mirror to documentation", lc.SetStateCalls)
+	if !sawDoneSetState {
+		t.Errorf("SetState calls = %+v, want a mirror to done", lc.SetStateCalls)
 	}
 
 	// No spawned worker process for the merging column — gitops runs inline.
@@ -306,8 +307,8 @@ func TestTick_MergingClaim_CIPendingThenExpiresAndRechecksNextPoll(t *testing.T)
 	if err != nil {
 		t.Fatalf("GetIssue: unexpected error: %v", err)
 	}
-	if issue.BoardStatus != string(contract.ColumnDocumentation) {
-		t.Errorf("BoardStatus = %q, want documentation (re-check found it mergeable)", issue.BoardStatus)
+	if issue.BoardStatus != string(contract.ColumnDone) {
+		t.Errorf("BoardStatus = %q, want done (re-check found it mergeable)", issue.BoardStatus)
 	}
 }
 

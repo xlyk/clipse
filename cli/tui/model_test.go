@@ -108,21 +108,19 @@ func TestUpdate_SnapshotMsg_FoldsGroupsAndTotals(t *testing.T) {
 }
 
 // TestFold_DownstreamColumnsAppearInInFlightBucket asserts that issues
-// sitting in review/rework/merging/documentation — active downstream
-// columns a spawned worker or gitops is (or will be) working through — are
-// visible in the TUI via a dedicated in-flight bucket, rather than silently
-// dropped the way fold's original running/blocked/queued-only switch left
-// them (none of those three cases match any of the four). A "done" issue
-// (terminal, nothing left to watch) still shows up nowhere, exactly as
-// before — this must be an explicit set of active columns, not a catch-all
-// default that would also sweep in "done".
+// sitting in review/rework/merging — active downstream columns a spawned
+// worker or gitops is (or will be) working through — are visible in the TUI
+// via a dedicated in-flight bucket, rather than silently dropped the way
+// fold's original running/blocked/queued-only switch left them. A "done"
+// issue (terminal, nothing left to watch) still shows up nowhere — this must
+// be an explicit set of active columns, not a catch-all default that would
+// also sweep in "done".
 func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
 	snap := store.Snapshot{
 		Issues: []store.IssueSnapshot{
 			{Issue: store.Issue{ID: "i-review", Identifier: "CLP-10", LaneLabel: "agent:reviewer", BoardStatus: "review"}},
 			{Issue: store.Issue{ID: "i-rework", Identifier: "CLP-11", LaneLabel: "agent:coder", BoardStatus: "rework"}},
 			{Issue: store.Issue{ID: "i-merging", Identifier: "CLP-12", LaneLabel: "agent:git_operator", BoardStatus: "merging"}},
-			{Issue: store.Issue{ID: "i-docs", Identifier: "CLP-13", LaneLabel: "agent:scribe", BoardStatus: "documentation"}},
 			{Issue: store.Issue{ID: "i-done", Identifier: "CLP-14", LaneLabel: "agent:coder", BoardStatus: "done"}},
 		},
 	}
@@ -131,14 +129,14 @@ func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
 	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
 
 	inFlight := updated.InFlight()
-	if got, want := len(inFlight), 4; got != want {
-		t.Fatalf("InFlight() len = %d, want %d (review/rework/merging/documentation); got %+v", got, want, inFlight)
+	if got, want := len(inFlight), 3; got != want {
+		t.Fatalf("InFlight() len = %d, want %d (review/rework/merging); got %+v", got, want, inFlight)
 	}
 	gotIDs := make(map[string]bool, len(inFlight))
 	for _, row := range inFlight {
 		gotIDs[row.Identifier] = true
 	}
-	for _, want := range []string{"CLP-10", "CLP-11", "CLP-12", "CLP-13"} {
+	for _, want := range []string{"CLP-10", "CLP-11", "CLP-12"} {
 		if !gotIDs[want] {
 			t.Errorf("InFlight() missing %q, got %+v", want, inFlight)
 		}
@@ -164,7 +162,7 @@ func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
 // Live, and its ActiveLane reports the lane actually working it — which for a
 // downstream column differs from the issue's coder home label. A card parked
 // in a downstream column with no active claim is not Live. This is what lets
-// the dashboard show a spinner + the reviewer/scribe/git_operator badge +
+// the dashboard show a spinner + the reviewer/git_operator badge +
 // elapsed for every working agent, not just the coder-lane "running" one.
 func TestFold_ActiveClaimMarksRowLiveWithWorkingLane(t *testing.T) {
 	claimed := sql.NullString{String: "claim-tok", Valid: true}

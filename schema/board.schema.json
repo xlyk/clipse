@@ -7,7 +7,7 @@
     "Lane": {
       "type": "string",
       "description": "The DAC profile a worker runs under for an issue.",
-      "enum": ["coder", "reviewer", "git_operator", "scribe"]
+      "enum": ["coder", "reviewer", "git_operator"]
     },
     "Column": {
       "type": "string",
@@ -18,7 +18,6 @@
         "running",
         "review",
         "merging",
-        "documentation",
         "done",
         "rework",
         "blocked"

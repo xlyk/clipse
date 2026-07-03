@@ -40,7 +40,6 @@ class Lane(StrEnum):
     coder = 'coder'
     reviewer = 'reviewer'
     git_operator = 'git_operator'
-    scribe = 'scribe'
 
 
 class Column(StrEnum):
@@ -53,7 +52,6 @@ class Column(StrEnum):
     running = 'running'
     review = 'review'
     merging = 'merging'
-    documentation = 'documentation'
     done = 'done'
     rework = 'rework'
     blocked = 'blocked'

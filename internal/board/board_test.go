@@ -25,7 +25,6 @@ var allColumns = []string{
 	string(contract.ColumnRunning),
 	string(contract.ColumnReview),
 	string(contract.ColumnMerging),
-	string(contract.ColumnDocumentation),
 	string(contract.ColumnDone),
 	string(contract.ColumnRework),
 	string(contract.ColumnBlocked),
@@ -60,8 +59,9 @@ var legalTransitions = []legalCase{
 	{outcome: "blocked", current: "rework", next: "blocked", action: ActionCommentBlock},
 	{outcome: "continue", current: "rework", next: "rework", action: ActionRespawn},
 
-	// Merging: Git-operator lane lands the PR.
-	{outcome: "done", current: "merging", next: "documentation", action: ActionDocument},
+	// Merging: Git-operator lane lands the PR; a merge goes straight to Done
+	// (documentation is written inside the Coder turn, no separate stage).
+	{outcome: "done", current: "merging", next: "done", action: ActionComplete},
 	{outcome: "blocked", current: "merging", next: "blocked", action: ActionCommentBlock},
 	// Merging -> Rework: the Git-operator lane's stale-base-conflict route
 	// (internal/gitops.OutcomeStaleBaseConflict maps to changes_requested
@@ -70,10 +70,6 @@ var legalTransitions = []legalCase{
 	// so the Coder lane gets another attempt rather than parking the issue
 	// in Blocked outright.
 	{outcome: "changes_requested", current: "merging", next: "rework", action: ActionRequestChanges},
-
-	// Documentation: Scribe lane writes docs (or no-ops).
-	{outcome: "done", current: "documentation", next: "done", action: ActionComplete},
-	{outcome: "blocked", current: "documentation", next: "blocked", action: ActionCommentBlock},
 }
 
 func legalKey(outcome, current string) string { return outcome + "|" + current }

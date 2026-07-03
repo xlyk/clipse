@@ -7,10 +7,16 @@ Resume brief for a fresh session. Read this, then the guide + design + plan, the
 ## Current state
 
 The full pipeline is implemented. Phase 0/1 (the zero-LLM Go kernel), Phase 2
-(the DAC Coder worker), and Phase 3 (the Reviewer, Scribe, and Git-operator
-lanes, cross-lane per-column claiming, and the rework cap) all run. A live smoke
-took a 10-issue dependency DAG on a real Linear board through to merged PRs on
-`main`.
+(the DAC Coder worker), and Phase 3 (the Reviewer and Git-operator lanes,
+cross-lane per-column claiming, and the rework cap) all run. A live smoke took a
+10-issue dependency DAG on a real Linear board through to merged PRs on `main`.
+
+**Documentation is now a step inside the coder graph, not a separate lane.**
+The `run_docs` node (`graphs/coder.py`) writes docs into the coder's own
+worktree right before the PR is opened, so they ride the same commit/PR and get
+reviewed. A merged PR goes `merging → done` directly — the `documentation`
+column, the `scribe` lane, and the `-docs` branch/worktree apparatus are gone.
+(This retires the "Scribe writes docs on its own branch" note below.)
 
 The kernel stays LLM-free; the LLM lives only in the worker; the seam is the
 subprocess + typed-JSON contract. Kernel invariants hold (see AGENTS.md):
@@ -31,9 +37,10 @@ Reference docs:
 
 Phase 3 lanes (`20c9ac1`) plus a run of fixes, each its own commit:
 
-- **Scribe writes docs on its own branch.** Docs land on a `-docs` branch off
-  `origin/<base>`, so the Scribe never force-pushes or non-ff-pushes the merged
-  branch (`964b3c3`).
+- **Scribe writes docs on its own branch.** _(Superseded: documentation is now
+  a coder-graph step — see Current state. The `-docs` branch existed only
+  because the scribe ran post-merge.)_ Docs landed on a `-docs` branch off
+  `origin/<base>`, so the Scribe never force-pushed the merged branch (`964b3c3`).
 - **Dependency-direction bug fixed.** The kernel now reads Linear
   `inverseRelations` to find an issue's blockers. Gating was inverted before, so
   promotion order was wrong; it now promotes in true dependency order
@@ -96,29 +103,27 @@ retains the board. (The old `record-demo.sh` + `arrange-windows.applescript`,
 which drove ffmpeg + window placement, were removed — too brittle across macOS
 TCC/Accessibility grants.)
 
-## Verified: `merging` / `documentation` DO mirror to Linear — Linear coalesces the display
+## Verified: board transitions DO mirror to Linear — Linear coalesces the display
 
-A "cards skip merging/documentation on the board" report was investigated and
-the kernel is **correct**: the `linear_writes` table shows all six hops per
-issue (`ready→running→review→merging→documentation→done`) sent with
-`status=done`, zero retries, zero errors, and all nine workflow states exist on
-the team. The board's *current* state is always right.
+_(Investigated when `documentation` was still a column; that column has since
+been removed — see Current state — but the coalescing insight still applies to
+the remaining fast hops like `merging`.)_ A "cards skip stages on the board"
+report was investigated and the kernel is **correct**: the `linear_writes`
+table showed every hop per issue sent with `status=done`, zero retries, zero
+errors. The board's *current* state is always right.
 
 The blips are **Linear's own activity/history coalescing**: rapid successive
-state changes by the same actor collapse in Linear's history. Proof from a live
-run — CLI-33 (ran last, waited 38s at Merging for CI) shows all six hops;
-CLI-32 shows only `Documentation→Done`; CLI-31 (ran first, fastest) shows zero —
-yet all three are correctly `Done`. `documentation` always dwells ~1s (the
-Scribe no-ops on a trivial PR), so it coalesces hardest. Decision: **leave the
-kernel as-is** (no artificial per-column dwell in a deterministic
-production kernel). The **TUI is the faithful surface** — it reads SQLite, which
-never coalesces, and now shows every working lane live (below).
+state changes by the same actor collapse in Linear's history — the faster a card
+transits a column, the more Linear collapses it. Decision: **leave the kernel
+as-is** (no artificial per-column dwell in a deterministic production kernel).
+The **TUI is the faithful surface** — it reads SQLite, which never coalesces,
+and shows every working lane live.
 
 ## Open follow-ups
 
 - **TUI live-agent visibility — shipped the cheap half; worker internals are the follow-up.**
   Liveness is now per-row, keyed off the held claim, so the spinner + the
-  working-lane badge + elapsed light up for the reviewer/scribe/git_operator
+  working-lane badge + elapsed light up for the reviewer/git_operator
   agents too (not just the coder "running" row), and the header shows a
   `⚡ N working` tally. What's still missing is *what* each worker is doing
   mid-run: the captured worker log (`<board>/logs/<issue>.log`) is only DAC

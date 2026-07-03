@@ -26,25 +26,9 @@ type Workspacer interface {
 	// Ensure returns the workspace directory for issue, creating it if
 	// necessary. Used by the Coder/Reviewer lanes and by the inline
 	// Git-operator: all three operate on the issue's own (coder) branch.
+	// (Documentation is written inside the Coder lane's own turn, in this
+	// same worktree, so there is no separate docs-branch workspace.)
 	Ensure(issue store.Issue) (string, error)
-
-	// EnsureDocs returns a workspace for the Scribe lane: a fresh worktree on
-	// a dedicated docs branch, cut from origin/<base> (the just-merged state),
-	// NOT the issue's own already-merged Coder branch. Reusing the Coder
-	// branch here fails non-fast-forward on push once gitops has advanced that
-	// branch's remote tip (update-branch / squash-merge), so the Scribe needs
-	// its own branch with no remote counterpart yet.
-	EnsureDocs(issue store.Issue) (string, error)
-
-	// Remove tears down the workspace for issue. This is the Phase-3
-	// terminal-cleanup primitive: design decision F calls for removing the
-	// worktree + local branch when an issue reaches 'done' (or is
-	// cancelled), i.e. after merge. Phase 1 is coder-only and never drives an
-	// issue to a 'done' transition, so no caller invokes Remove yet — wiring
-	// it into the terminal transition is Phase-3 scope. It is kept (not
-	// called speculatively) because a Phase-1 call site would be unreachable
-	// and untestable.
-	Remove(issue store.Issue) error
 }
 
 // inflightRun tracks one runID the dispatcher has spawned but not yet

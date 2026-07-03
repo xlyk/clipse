@@ -30,7 +30,6 @@ caps:
     coder: 4
     reviewer: 2
     git_operator: 1
-    scribe: 1
 
 # turn_cap: maximum continuation turns a single issue may consume before the
 # dispatcher parks it in Blocked. Bounds token spend on stuck issues.

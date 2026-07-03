@@ -247,8 +247,8 @@ func seedOrphanColumnRun(t *testing.T, s *store.Store, issueID, column, lane, ru
 }
 
 // TestRecoverOrphans_DownstreamColumnRequeuesToItsOwnColumn asserts R2: an
-// orphaned run claimed via ClaimColumn (review/rework/documentation/
-// merging, not ClaimReady's ready->running) requeues to its OWN column —
+// orphaned run claimed via ClaimColumn (review/rework/merging, not
+// ClaimReady's ready->running) requeues to its OWN column —
 // not to 'ready' — via the same store.ReleaseTargetColumn rule
 // ReleaseStaleClaims uses, so the two release paths cannot drift apart.
 func TestRecoverOrphans_DownstreamColumnRequeuesToItsOwnColumn(t *testing.T) {
@@ -316,14 +316,14 @@ func TestRecoverOrphans_DownstreamColumnBlocksWhenAttemptAtMax(t *testing.T) {
 	s := openTestStore(t)
 	boardDir := t.TempDir()
 
-	handle := spawnRealOrphan(t, boardDir, "issue-1", "scribe")
+	handle := spawnRealOrphan(t, boardDir, "issue-1", "reviewer")
 	pid := handle.PID()
 	startedAt := handle.ProcStartedAt()
 
 	cfg := testConfig()
 	cfg.MaxAttempts = 2
 	const runID = "orphan-run"
-	seedOrphanColumnRun(t, s, "issue-1", "documentation", "scribe", runID, pid, startedAt, cfg.MaxAttempts, 1000)
+	seedOrphanColumnRun(t, s, "issue-1", "review", "reviewer", runID, pid, startedAt, cfg.MaxAttempts, 1000)
 
 	lc := &linear.MockClient{}
 	spawner := newFakeSpawner()

@@ -10,9 +10,10 @@ graph raises. The dispatcher parses only stdout; anything diagnostic
 (tracebacks, etc) goes to stderr, which the kernel already redirects to a
 per-issue log file rather than reading itself.
 
-The Coder, Reviewer, and Scribe lanes are wired to real graphs. The
-Git-operator lane is a real `Lane` member the kernel deliberately never
-dispatches here: per decision O/J amendment, it runs as deterministic Go
+The Coder and Reviewer lanes are wired to real graphs (documentation is a
+step inside the Coder graph, not a separate lane). The Git-operator lane is a
+real `Lane` member the kernel deliberately never dispatches here: per decision
+O/J amendment, it runs as deterministic Go
 (`internal/gitops`), never a DAC worker -- so it, and any garbage string
 that isn't a Lane member at all, are handled the same way: outcome=blocked,
 block_kind=transient, no graph ever built or run.
@@ -33,7 +34,6 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs.coder import build_coder_graph
 from clipse_agent.graphs.reviewer import build_reviewer_graph
-from clipse_agent.graphs.scribe import build_scribe_graph
 
 _ZERO_TOKENS = Tokens(**{"in": 0, "out": 0})
 
@@ -105,8 +105,8 @@ def _blocked_transient(args: argparse.Namespace, *, lane: Lane, summary: str) ->
 async def _run_lane_graph(args: argparse.Namespace, build_graph: Any, *, lane: Lane) -> WorkerResult:
     """Drive one turn of `build_graph`'s graph and return its result.
 
-    Shared by every lane `_dispatch` knows how to route to (coder/reviewer/
-    scribe): every lane's graph is invoked with the exact same input-state
+    Shared by every lane `_dispatch` knows how to route to (coder/
+    reviewer): every lane's graph is invoked with the exact same input-state
     shape (issue_id/run_id/thread_id/workspace/max_tokens -- issue_text is
     covered separately, by the dispatcher's own $CLIPSE_ISSUE_TEXT env
     injection that every lane's `load_context` already falls back to) and
@@ -122,13 +122,13 @@ async def _run_lane_graph(args: argparse.Namespace, build_graph: Any, *, lane: L
     `lane` is `_dispatch`'s own already-matched Lane for this call, used
     ONLY to namespace the OUTER wrapping-graph's checkpoint thread_id below
     -- a fresh claim passes the identical raw `--thread` regardless of
-    lane, so coder/reviewer/scribe runs against the same issue would
+    lane, so coder/reviewer runs against the same issue would
     otherwise collide on this wrapping graph's own checkpoint the moment
     they shared a physical checkpointer (design doc: "one checkpointer
     database per issue", not one per lane). This mirrors each lane graph's
     own inner-DAC-thread namespace one level down (graphs/coder.py's
-    `_DAC_THREAD_NAMESPACE_SUFFIX` == "::dac", and the reviewer/scribe
-    analogues) -- same problem, same fix, one layer higher. `input_state`'s
+    `_DAC_THREAD_NAMESPACE_SUFFIX` == "::dac", and the reviewer
+    analogue) -- same problem, same fix, one layer higher. `input_state`'s
     own "thread_id" stays the raw, un-namespaced value: it flows straight
     through to the emitted WorkerResult.thread_id, which the dispatcher
     reuses verbatim as `--thread` on a later continuation spawn, so it must
@@ -155,11 +155,12 @@ async def _run_lane_graph(args: argparse.Namespace, build_graph: Any, *, lane: L
 
 
 async def _dispatch(args: argparse.Namespace) -> WorkerResult:
-    """Route to the named lane's graph. "coder"/"reviewer"/"scribe" are
-    implemented; any other Lane member (today: only "git_operator", which
-    by design never gets a Python graph -- see the module docstring), or a
-    string that isn't a Lane member at all, is reported as blocked/transient
-    without building or running a graph.
+    """Route to the named lane's graph. "coder"/"reviewer" are implemented
+    (documentation is a step inside the coder graph, not its own lane); any
+    other Lane member (today: only "git_operator", which by design never gets
+    a Python graph -- see the module docstring), or a string that isn't a Lane
+    member at all, is reported as blocked/transient without building or running
+    a graph.
 
     Each branch below references its `build_*_graph` function as a bare
     module-global name, resolved right here at call time rather than via
@@ -174,8 +175,6 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
         return await _run_lane_graph(args, build_coder_graph, lane=Lane.coder)
     if lane == Lane.reviewer:
         return await _run_lane_graph(args, build_reviewer_graph, lane=Lane.reviewer)
-    if lane == Lane.scribe:
-        return await _run_lane_graph(args, build_scribe_graph, lane=Lane.scribe)
     return _blocked_transient(
         args,
         lane=lane if lane is not None else Lane.coder,

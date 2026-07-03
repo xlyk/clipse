@@ -64,94 +64,13 @@ func TestTick_ReviewColumnClaim_DispatchesReviewerLane(t *testing.T) {
 	}
 }
 
-// TestTick_DocumentationColumnClaim_DispatchesScribeLane asserts an
-// unclaimed "documentation" card is claimed and dispatched to the Scribe
-// lane, and a "done" result reaches the terminal Done column with
-// rework_count reset to 0.
-func TestTick_DocumentationColumnClaim_DispatchesScribeLane(t *testing.T) {
-	s := openTestStore(t)
-	seedColumnIssue(t, s, "issue-1", "documentation", 1, 100)
-
-	spawner := newFakeSpawner()
-	spawner.Results["issue-1"] = spawn.Result{
-		Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeDone, Summary: "no docs needed"},
-	}
-	ws := newStubWorkspacer(t.TempDir())
-	lc := &linear.MockClient{}
-	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
-
-	if err := d.Tick(context.Background()); err != nil {
-		t.Fatalf("tick 1: unexpected error: %v", err)
-	}
-
-	specs := spawner.Specs()
-	if len(specs) != 1 {
-		t.Fatalf("SpawnCount = %d, want exactly 1", len(specs))
-	}
-	if specs[0].Lane != string(contract.LaneScribe) {
-		t.Errorf("spawn Lane = %q, want %q", specs[0].Lane, contract.LaneScribe)
-	}
-
-	if err := d.Tick(context.Background()); err != nil {
-		t.Fatalf("tick 2: unexpected error: %v", err)
-	}
-
-	issue, err := s.GetIssue(context.Background(), "issue-1")
-	if err != nil {
-		t.Fatalf("GetIssue: unexpected error: %v", err)
-	}
-	if issue.BoardStatus != string(contract.ColumnDone) {
-		t.Errorf("BoardStatus = %q, want done", issue.BoardStatus)
-	}
-	if issue.ClaimLock.Valid {
-		t.Errorf("ClaimLock.Valid = true, want cleared")
-	}
-	if issue.ReworkCount != 0 {
-		t.Errorf("ReworkCount = %d, want reset to 0 on done", issue.ReworkCount)
-	}
-}
-
-// TestTick_ScribeClaim_UsesDocsWorkspace asserts the Scribe lane is spawned
-// against a fresh docs worktree (Workspacer.EnsureDocs), NOT the Coder's
-// already-merged branch worktree (Ensure). Regression guard for the scribe
-// non-fast-forward push bug: committing docs onto the merged Coder branch is
-// rejected on push once gitops has advanced that branch's remote tip.
-func TestTick_ScribeClaim_UsesDocsWorkspace(t *testing.T) {
-	s := openTestStore(t)
-	seedColumnIssue(t, s, "issue-1", "documentation", 1, 100)
-
-	spawner := newFakeSpawner()
-	spawner.Results["issue-1"] = spawn.Result{
-		Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeDone, Summary: "docs"},
-	}
-	ws := newStubWorkspacer(t.TempDir())
-	lc := &linear.MockClient{}
-	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
-
-	if err := d.Tick(context.Background()); err != nil {
-		t.Fatalf("tick: unexpected error: %v", err)
-	}
-
-	if got := ws.DocsEnsured(); len(got) != 1 || got[0] != "issue-1" {
-		t.Errorf("EnsureDocs calls = %v, want [issue-1] (scribe must use a docs worktree)", got)
-	}
-	specs := spawner.Specs()
-	if len(specs) != 1 {
-		t.Fatalf("SpawnCount = %d, want 1", len(specs))
-	}
-	if want := ws.root + "/docs/issue-1"; specs[0].Workspace != want {
-		t.Errorf("scribe Workspace = %q, want docs path %q", specs[0].Workspace, want)
-	}
-}
-
 // TestTick_ColumnClaim_DoesNotMirrorLinearForTheClaimItself asserts R5: a
-// downstream column claim (review/rework/documentation) never enqueues a
-// Linear mirror write on its own — only a later Transition (once the
-// claimed lane's result comes back) does. Every scripted result hangs
-// forever so no transition ever fires, isolating the claim's own effect on
-// the outbox.
+// downstream column claim (review/rework) never enqueues a Linear mirror
+// write on its own — only a later Transition (once the claimed lane's result
+// comes back) does. Every scripted result hangs forever so no transition ever
+// fires, isolating the claim's own effect on the outbox.
 func TestTick_ColumnClaim_DoesNotMirrorLinearForTheClaimItself(t *testing.T) {
-	for _, column := range []string{"review", "rework", "documentation"} {
+	for _, column := range []string{"review", "rework"} {
 		t.Run(column, func(t *testing.T) {
 			s := openTestStore(t)
 			seedColumnIssue(t, s, "issue-1", column, 1, 100)
@@ -212,7 +131,7 @@ func TestTick_CoderPool_SharesCapAcrossReadyAndRework(t *testing.T) {
 	cfg := testConfig()
 	cfg.Caps = config.Caps{
 		Global:  1,
-		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0, Scribe: 0},
+		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0},
 	}
 	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
 
@@ -281,7 +200,7 @@ func TestTick_CoderPool_PrefersHigherPriorityAcrossColumns(t *testing.T) {
 	cfg.MaxRuntimeS = 3600
 	cfg.Caps = config.Caps{
 		Global:  1,
-		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0, Scribe: 0},
+		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0},
 	}
 	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
 

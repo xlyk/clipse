@@ -14,7 +14,6 @@ const (
 	defaultCapsPerLaneCoder  = 4
 	defaultCapsPerLaneReview = 2
 	defaultCapsPerLaneGitOp  = 1
-	defaultCapsPerLaneScribe = 1
 	defaultTurnCap           = 5
 	defaultMaxRuntimeS       = 3600
 	defaultLaneLabelPrefix   = "agent:"
@@ -88,7 +87,6 @@ type PerLaneCaps struct {
 	Coder       int `yaml:"coder"`
 	Reviewer    int `yaml:"reviewer"`
 	GitOperator int `yaml:"git_operator"`
-	Scribe      int `yaml:"scribe"`
 }
 
 // Caps bounds the dispatch loop's concurrency.
@@ -188,7 +186,6 @@ type rawPerLaneCaps struct {
 	Coder       *int `yaml:"coder"`
 	Reviewer    *int `yaml:"reviewer"`
 	GitOperator *int `yaml:"git_operator"`
-	Scribe      *int `yaml:"scribe"`
 }
 
 // rawCaps mirrors Caps with a pointer Global field for the same reason.
@@ -268,7 +265,6 @@ func Load(path string) (*Config, error) {
 				Coder:       intOrDefault(raw.Caps.PerLane.Coder, defaultCapsPerLaneCoder),
 				Reviewer:    intOrDefault(raw.Caps.PerLane.Reviewer, defaultCapsPerLaneReview),
 				GitOperator: intOrDefault(raw.Caps.PerLane.GitOperator, defaultCapsPerLaneGitOp),
-				Scribe:      intOrDefault(raw.Caps.PerLane.Scribe, defaultCapsPerLaneScribe),
 			},
 		},
 	}
@@ -341,9 +337,6 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Caps.PerLane.GitOperator < 0 {
 		return fmt.Errorf("caps.per_lane.git_operator must not be negative, got %d", cfg.Caps.PerLane.GitOperator)
-	}
-	if cfg.Caps.PerLane.Scribe < 0 {
-		return fmt.Errorf("caps.per_lane.scribe must not be negative, got %d", cfg.Caps.PerLane.Scribe)
 	}
 	if len(cfg.EnvAllowlist) == 0 {
 		return fmt.Errorf("env_allowlist must not be empty")
