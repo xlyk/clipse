@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
 )
@@ -16,14 +17,34 @@ import (
 // result back on d.results. turn is the turn number this attempt represents
 // (used to seed/refresh the inflight record's turn counter).
 //
+// reviewFeedback, when non-empty, is the most recent review/rework feedback
+// for a Coder re-run claimed out of the rework column; it is injected into
+// the worker's environment as CLIPSE_REVIEW_FEEDBACK (see that constant) so
+// the Coder lane can address it. Every other spawn (a fresh coder claim from
+// ready, reviewer, scribe, a continuation) passes "" and injects nothing.
+//
 // On a Spawn failure (workspace or exec-level, not a worker-process
 // failure), the issue is transitioned straight to blocked: there is no
 // process to Wait on, so this can't flow through the normal
 // applyResult/runResult path.
-func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID, lane, threadID string, turn int) error {
-	workspace, err := d.ws.Ensure(issue)
+func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID, lane, threadID string, turn int, reviewFeedback string) error {
+	// The Scribe lane needs its own docs worktree cut from origin/<base>, not
+	// the issue's already-merged Coder branch (which fails non-fast-forward on
+	// push once gitops has advanced its remote tip). Every other spawned lane
+	// (coder/reviewer) operates on the issue's own branch via Ensure.
+	ensure := d.ws.Ensure
+	if lane == string(contract.LaneScribe) {
+		ensure = d.ws.EnsureDocs
+	}
+	workspace, err := ensure(issue)
 	if err != nil {
-		return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, fmt.Errorf("preparing workspace: %w", err))
+		// A workspace/spawn failure is transient by nature, so it is eligible
+		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
+		// to blockOnSpawnFailure once the budget is spent (or RecoverCap is 0).
+		cause := fmt.Errorf("preparing workspace: %w", err)
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+		})
 	}
 
 	// d.envFor is always set (New defaults it to defaultEnvFor;
@@ -31,6 +52,15 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	// nil WorkerSpec.Env, which exec.Cmd.Env would treat as "inherit the
 	// dispatcher's full environment".
 	env := d.envFor(issue)
+
+	// A rework re-run carries the review feedback that routed the card back to
+	// the Coder lane. Injected here (not via envFor) so it rides alongside
+	// CLIPSE_ISSUE_TEXT without ever touching the host-env allow-list, and so
+	// only the rework path — the only caller that passes it non-empty — pays
+	// for the store read that produced it.
+	if reviewFeedback != "" {
+		env = append(env, clipseReviewFeedbackEnvVar+"="+reviewFeedback)
+	}
 
 	spec := spawn.WorkerSpec{
 		Issue:        issue.Identifier,
@@ -53,7 +83,10 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	handle, err := d.spawner.Spawn(spawnCtx, spec)
 	if err != nil {
 		cancel()
-		return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, fmt.Errorf("spawning worker: %w", err))
+		cause := fmt.Errorf("spawning worker: %w", err)
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+		})
 	}
 
 	if err := d.store.SetRunProcess(ctx, runID, handle.PID(), handle.ProcStartedAt()); err != nil {
@@ -109,7 +142,7 @@ func (d *Dispatcher) blockOnSpawnFailure(ctx context.Context, issueID, runID, la
 		RunStatus:       "blocked",
 		RunError:        cause.Error(),
 		EnqueueSetState: true,
-		Comment:         fmt.Sprintf("blocked: %s", cause.Error()),
+		Comment:         blockedComment("", cause.Error()),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),

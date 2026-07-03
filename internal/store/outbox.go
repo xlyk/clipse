@@ -15,6 +15,48 @@ type TransitionReq struct {
 	NewStatus  string // target board column
 	ClearClaim bool   // null out claim_lock/claim_expires (terminal/blocked/requeue)
 
+	// SkipReworkBump suppresses the automatic rework_count increment that
+	// NewStatus=="rework" would otherwise apply (see applyIssueTransition).
+	// Set only by dispatcher.requeueOrphan: an orphaned claim's release
+	// re-asserts whatever column the card was ALREADY sitting in
+	// (store.ReleaseTargetColumn never changes a downstream column), which
+	// for a card orphaned mid-rework means NewStatus=="rework" again — but
+	// that is the SAME column, not a fresh review/merging->rework edge, so
+	// it must not double-count against amendment C1's rework_cap.
+	SkipReworkBump bool
+
+	// ResetReworkCount forces rework_count back to 0 regardless of
+	// NewStatus, taking priority over the "rework"/"done" NewStatus-keyed
+	// rules in applyIssueTransition. Set only by dispatcher.adoptLinearMove's
+	// blocked->{ready,todo} human-requeue path: once a human has put a
+	// Blocked issue back into play, whatever rework_count it accumulated on
+	// its prior review/rework cycle no longer bounds anything relevant —
+	// amendment C1's cap is meant to catch a live Reviewer<->Coder (or
+	// gitops<->Coder) loop, not to follow the issue around forever.
+	ResetReworkCount bool
+
+	// BumpRecoverAttempts increments issues.recover_attempts by 1. Set by
+	// dispatcher.scheduleRetry (auto-unblock layer 1) when it re-queues an
+	// issue after a transient failure, so the next transient failure counts
+	// against cfg.RecoverCap. Mutually exclusive with ResetRecoverAttempts (a
+	// single UPDATE cannot both bump and reset the same column); the two are
+	// set by disjoint code paths (retry vs. normal advance).
+	BumpRecoverAttempts bool
+
+	// ResetRecoverAttempts forces recover_attempts back to 0 AND clears
+	// blocked_until to 0 (a clean recovery slate). Set on any normal
+	// (non-block) terminal advance (dispatcher.applyTerminalWorkerOutcome), so
+	// a later, independent transient failure gets a full retry budget rather
+	// than inheriting a spent one. Takes priority over BumpRecoverAttempts.
+	ResetRecoverAttempts bool
+
+	// SetBlockedUntil, when > 0, sets issues.blocked_until to this unix time:
+	// the backoff deadline before an auto-retried card is claimable again
+	// (dispatcher.scheduleRetry sets it to retry-time + RecoverBackoffS). 0
+	// leaves blocked_until untouched (ResetRecoverAttempts is how it gets
+	// cleared).
+	SetBlockedUntil int64
+
 	CloseRunID string // if non-empty, close this run
 	RunStatus  string // status to set on the closed run (e.g. "done","blocked","stale","orphaned")
 	RunError   string // optional; stored NULL if empty
@@ -74,6 +116,43 @@ func applyIssueTransition(ctx context.Context, tx *sql.Tx, req TransitionReq) er
 	args := []any{req.NewStatus}
 	if req.ClearClaim {
 		q += `, claim_lock = NULL, claim_expires = NULL`
+	}
+	switch {
+	case req.ResetReworkCount:
+		// A genuine human-driven requeue out of Blocked (see
+		// TransitionReq.ResetReworkCount) — takes priority over the
+		// NewStatus-keyed rules below since it can fire on a target column
+		// ("ready"/"todo") neither of them matches at all.
+		q += `, rework_count = 0`
+	case req.NewStatus == "rework":
+		// Every genuine path into rework -- the Reviewer lane's
+		// changes_requested from review, and the Git-operator lane's
+		// stale-base-conflict route from merging -- means "the Coder lane
+		// gets another attempt", so amendment C1's rework_cap can bound the
+		// count regardless of which lane routed it here. SkipReworkBump
+		// opts out for a claim-release re-assert of a column the issue was
+		// already sitting in (see its own doc comment) -- never a fresh
+		// edge into rework.
+		if !req.SkipReworkBump {
+			q += `, rework_count = rework_count + 1`
+		}
+	case req.NewStatus == "done":
+		// The count is scoped to one review<->rework cycle, not the
+		// issue's lifetime.
+		q += `, rework_count = 0`
+	}
+	// Auto-unblock layer 1's recover_attempts, independent of rework_count:
+	// reset (normal advance) takes priority over bump (transient re-queue);
+	// the two are never set together (see the field docs).
+	switch {
+	case req.ResetRecoverAttempts:
+		q += `, recover_attempts = 0, blocked_until = 0`
+	case req.BumpRecoverAttempts:
+		q += `, recover_attempts = recover_attempts + 1`
+	}
+	if req.SetBlockedUntil > 0 {
+		q += `, blocked_until = ?`
+		args = append(args, req.SetBlockedUntil)
 	}
 	q += ` WHERE id = ?`
 	args = append(args, req.IssueID)

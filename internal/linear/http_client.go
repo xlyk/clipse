@@ -21,8 +21,16 @@ const apiKeyEnvVar = "LINEAR_API_KEY"
 
 // CandidateIssuesQuery fetches active-state issues on the configured team
 // along with the fields NormalizeCandidateIssues needs: title, description,
-// workflow state name, agent:<lane> labels, blocks/blocked-by relations,
-// priority, branch name, and updatedAt.
+// workflow state name, agent:<lane> labels, inverse blocking relations (the
+// issues that block this one — see below), priority, branch name, and
+// updatedAt.
+//
+// It fetches inverseRelations, NOT relations: a dependency of an issue is an
+// issue that blocks it, and Linear records a blocking relationship once, on
+// the blocker's source side (type "blocks"). The blocked issue therefore sees
+// it in inverseRelations (issue = the blocker). Fetching source-side relations
+// instead inverted the dependency graph — a dependent issue looked
+// dependency-free and promoted immediately while its blocker waited on it.
 //
 // title/description are the task text a Coder-lane worker actually needs to
 // do the work (the dispatcher injects them into the worker's environment as
@@ -54,10 +62,10 @@ const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
           name
         }
       }
-      relations {
+      inverseRelations {
         nodes {
           type
-          relatedIssue {
+          issue {
             id
           }
         }

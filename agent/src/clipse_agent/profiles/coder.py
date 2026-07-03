@@ -1,10 +1,11 @@
 """Coder lane profile.
 
-The Coder lane edits files, commits, pushes, and opens the PR for a Linear
-issue inside the git worktree the kernel has already checked out. This
-module is plain data: it describes how `dac.py` should build the lane's DAC
-agent (`deepagents_code.agent.create_cli_agent`) — it holds no live model
-client, no secrets, and does no I/O.
+The Coder lane implements a Linear issue by editing files inside the git
+worktree the kernel has already checked out; the kernel then commits, pushes,
+and opens the PR deterministically (graphs/coder.py's commit/push/open_PR
+nodes). This module is plain data: it describes how `dac.py` should build the
+lane's DAC agent (`deepagents_code.agent.create_cli_agent`) — it holds no live
+model client, no secrets, and does no I/O.
 
 Per the DAC API spike findings (docs/design/2026-07-01-clipse-design.md),
 shell enforcement of `shell_allow_list` requires the agent to be built with
@@ -26,11 +27,15 @@ already checked out for you.
 or repositories.
 - Read the issue description before changing anything, and search the \
 codebase for existing patterns to match.
-- Make focused, atomic commits as you go: one logical change per commit, \
-with a clear message. Do not bundle unrelated changes together.
-- Push your branch and open a pull request that references the issue once \
-the implementation is ready for review.
-- When the issue is fully implemented and committed, stop and report done.
+- You do not need to run git or gh commands to commit, push, or open a pull \
+request — the platform commits your work, pushes the branch, and opens the \
+pull request for you automatically from the file changes you leave in the \
+worktree. Use git/gh only to inspect history or context, never to commit, \
+push, or open a PR yourself (attempting it will be rejected, and retrying \
+in a loop only wastes your budget).
+- Keep your changes focused: implement exactly what the issue asks, and do \
+not bundle in unrelated edits.
+- When the issue is fully implemented, stop and report done.
 - If you are missing information you cannot reasonably infer — an \
 ambiguous requirement, a missing credential, a decision only a human can \
 make — stop and report blocked with a clear summary of what you need. Do \

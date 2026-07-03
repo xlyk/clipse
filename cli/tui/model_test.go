@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"database/sql"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,6 +23,10 @@ func buildSnapshot() store.Snapshot {
 			"ready":   1,
 			"todo":    1,
 		},
+		// Board-wide cumulative token totals (store.ReadSnapshot's SUM over all
+		// runs); the TUI header reads these directly.
+		TotalTokensIn:  15,
+		TotalTokensOut: 27,
 		Issues: []store.IssueSnapshot{
 			{
 				Issue: store.Issue{ID: "issue-1", Identifier: "CLP-1", LaneLabel: "agent:coder", BoardStatus: "running"},
@@ -29,6 +34,7 @@ func buildSnapshot() store.Snapshot {
 					RunID: "run-1", IssueID: "issue-1", Status: "running",
 					StartedAt: 100, TurnCount: 2, Attempt: 1, TokensIn: 10, TokensOut: 20,
 				},
+				TokensInTotal: 10, TokensOutTotal: 20,
 			},
 			{
 				Issue: store.Issue{ID: "issue-2", Identifier: "CLP-2", LaneLabel: "agent:reviewer", BoardStatus: "blocked"},
@@ -36,6 +42,7 @@ func buildSnapshot() store.Snapshot {
 					RunID: "run-2", IssueID: "issue-2", Status: "blocked",
 					StartedAt: 50, TurnCount: 1, Attempt: 1, TokensIn: 5, TokensOut: 7,
 				},
+				TokensInTotal: 5, TokensOutTotal: 7,
 			},
 			{
 				Issue:     store.Issue{ID: "issue-3", Identifier: "CLP-3", LaneLabel: "agent:coder", BoardStatus: "ready"},
@@ -97,6 +104,108 @@ func TestUpdate_SnapshotMsg_FoldsGroupsAndTotals(t *testing.T) {
 
 	if updated.Err() != nil {
 		t.Errorf("Err() = %v, want nil after a clean snapshotMsg", updated.Err())
+	}
+}
+
+// TestFold_DownstreamColumnsAppearInInFlightBucket asserts that issues
+// sitting in review/rework/merging/documentation — active downstream
+// columns a spawned worker or gitops is (or will be) working through — are
+// visible in the TUI via a dedicated in-flight bucket, rather than silently
+// dropped the way fold's original running/blocked/queued-only switch left
+// them (none of those three cases match any of the four). A "done" issue
+// (terminal, nothing left to watch) still shows up nowhere, exactly as
+// before — this must be an explicit set of active columns, not a catch-all
+// default that would also sweep in "done".
+func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			{Issue: store.Issue{ID: "i-review", Identifier: "CLP-10", LaneLabel: "agent:reviewer", BoardStatus: "review"}},
+			{Issue: store.Issue{ID: "i-rework", Identifier: "CLP-11", LaneLabel: "agent:coder", BoardStatus: "rework"}},
+			{Issue: store.Issue{ID: "i-merging", Identifier: "CLP-12", LaneLabel: "agent:git_operator", BoardStatus: "merging"}},
+			{Issue: store.Issue{ID: "i-docs", Identifier: "CLP-13", LaneLabel: "agent:scribe", BoardStatus: "documentation"}},
+			{Issue: store.Issue{ID: "i-done", Identifier: "CLP-14", LaneLabel: "agent:coder", BoardStatus: "done"}},
+		},
+	}
+
+	m := tui.NewModel()
+	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
+
+	inFlight := updated.InFlight()
+	if got, want := len(inFlight), 4; got != want {
+		t.Fatalf("InFlight() len = %d, want %d (review/rework/merging/documentation); got %+v", got, want, inFlight)
+	}
+	gotIDs := make(map[string]bool, len(inFlight))
+	for _, row := range inFlight {
+		gotIDs[row.Identifier] = true
+	}
+	for _, want := range []string{"CLP-10", "CLP-11", "CLP-12", "CLP-13"} {
+		if !gotIDs[want] {
+			t.Errorf("InFlight() missing %q, got %+v", want, inFlight)
+		}
+	}
+	if gotIDs["CLP-14"] {
+		t.Errorf("done issue CLP-14 leaked into InFlight(), want it to stay invisible (terminal)")
+	}
+
+	if got := len(updated.Running()); got != 0 {
+		t.Errorf("Running() len = %d, want 0", got)
+	}
+	if got := len(updated.Blocked()); got != 0 {
+		t.Errorf("Blocked() len = %d, want 0", got)
+	}
+	if got := len(updated.Queued()); got != 0 {
+		t.Errorf("Queued() len = %d, want 0", got)
+	}
+}
+
+// TestFold_ActiveClaimMarksRowLiveWithWorkingLane asserts that liveness is
+// per-row and keyed off the active claim, NOT the board_status: any card the
+// dispatcher currently holds a claim on (a worker running in ANY lane) is
+// Live, and its ActiveLane reports the lane actually working it — which for a
+// downstream column differs from the issue's coder home label. A card parked
+// in a downstream column with no active claim is not Live. This is what lets
+// the dashboard show a spinner + the reviewer/scribe/git_operator badge +
+// elapsed for every working agent, not just the coder-lane "running" one.
+func TestFold_ActiveClaimMarksRowLiveWithWorkingLane(t *testing.T) {
+	claimed := sql.NullString{String: "claim-tok", Valid: true}
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			// Coder actively running (claimed): live, working lane = coder.
+			{
+				Issue:     store.Issue{ID: "i-run", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "running", ClaimLock: claimed},
+				LatestRun: &store.Run{RunID: "r1", Lane: "coder", Status: "running", StartedAt: 100},
+			},
+			// Reviewer actively working a review card (claimed): live, working
+			// lane = reviewer, even though the issue's home label is coder.
+			{
+				Issue:     store.Issue{ID: "i-rev", Identifier: "CLP-2", LaneLabel: "coder", BoardStatus: "review", ClaimLock: claimed},
+				LatestRun: &store.Run{RunID: "r2", Lane: "reviewer", Status: "running", StartedAt: 100},
+			},
+			// Review card parked with no active claim (its latest run is the
+			// completed coder handoff): NOT live.
+			{
+				Issue:     store.Issue{ID: "i-park", Identifier: "CLP-3", LaneLabel: "coder", BoardStatus: "review"},
+				LatestRun: &store.Run{RunID: "r3", Lane: "coder", Status: "needs_review", StartedAt: 100},
+			},
+		},
+	}
+
+	m := tui.NewModel()
+	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
+
+	byID := make(map[string]tui.Row)
+	for _, r := range append(append([]tui.Row{}, updated.Running()...), updated.InFlight()...) {
+		byID[r.Identifier] = r
+	}
+
+	if r := byID["CLP-1"]; !r.Live || r.ActiveLane != "coder" {
+		t.Errorf("CLP-1 (running, claimed): Live=%v ActiveLane=%q, want true/\"coder\"", r.Live, r.ActiveLane)
+	}
+	if r := byID["CLP-2"]; !r.Live || r.ActiveLane != "reviewer" {
+		t.Errorf("CLP-2 (review, claimed): Live=%v ActiveLane=%q, want true/\"reviewer\" (the working lane, not the coder home label)", r.Live, r.ActiveLane)
+	}
+	if r := byID["CLP-3"]; r.Live || r.ActiveLane != "" {
+		t.Errorf("CLP-3 (review, unclaimed): Live=%v ActiveLane=%q, want false/\"\"", r.Live, r.ActiveLane)
 	}
 }
 
@@ -190,6 +299,142 @@ func TestUpdate_QuitKey_ReturnsTeaQuit(t *testing.T) {
 				t.Errorf("Update(key %q) cmd() = %T, want tea.QuitMsg", key, msg)
 			}
 		})
+	}
+}
+
+// down/up/enter/esc/tab/help are keystroke constructors for the navigation
+// tests, mirroring how bubbletea delivers them.
+var (
+	keyDown  = tea.KeyMsg{Type: tea.KeyDown}
+	keyUp    = tea.KeyMsg{Type: tea.KeyUp}
+	keyEnter = tea.KeyMsg{Type: tea.KeyEnter}
+	keyEsc   = tea.KeyMsg{Type: tea.KeyEsc}
+	keyTab   = tea.KeyMsg{Type: tea.KeyTab}
+	keyHelp  = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")}
+)
+
+// TestSelectionNavigation_Clamps asserts j/k (down/up) walk the flattened
+// ordered rows — running → in flight → blocked → queued — clamping at both
+// ends rather than wrapping, and that the initial selection is the first row.
+func TestSelectionNavigation_Clamps(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+
+	// ordered = [CLP-1 (running), CLP-2 (blocked), CLP-3 (ready), CLP-4 (todo)].
+	if got, want := m.Selected(), "CLP-1"; got != want {
+		t.Fatalf("initial Selected() = %q, want %q", got, want)
+	}
+
+	wantDownSeq := []string{"CLP-2", "CLP-3", "CLP-4", "CLP-4"} // last press clamps
+	for i, want := range wantDownSeq {
+		m, _ = m.Update(keyDown)
+		if got := m.Selected(); got != want {
+			t.Errorf("after %d down presses Selected() = %q, want %q", i+1, got, want)
+		}
+	}
+
+	wantUpSeq := []string{"CLP-3", "CLP-2", "CLP-1", "CLP-1"} // last press clamps
+	for i, want := range wantUpSeq {
+		m, _ = m.Update(keyUp)
+		if got := m.Selected(); got != want {
+			t.Errorf("after %d up presses Selected() = %q, want %q", i+1, got, want)
+		}
+	}
+}
+
+// TestSelectionSurvivesRefresh asserts the cursor stays pinned to the same
+// issue identifier across a re-fold (a fresh SnapshotMsg), not to a slice
+// index that reordering could shift out from under it.
+func TestSelectionSurvivesRefresh(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+	m, _ = m.Update(keyDown) // -> CLP-2
+	if got, want := m.Selected(), "CLP-2"; got != want {
+		t.Fatalf("Selected() = %q, want %q", got, want)
+	}
+
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+	if got, want := m.Selected(), "CLP-2"; got != want {
+		t.Errorf("after refresh Selected() = %q, want preserved %q", got, want)
+	}
+}
+
+// TestViewModeToggling drives the mode/help transitions through Update key
+// messages: tab flips dashboard↔kanban, enter opens detail and esc leaves it,
+// ? toggles the help overlay, and esc closes help before backing out a view.
+func TestViewModeToggling(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot()})
+
+	if got, want := m.ViewMode(), "dashboard"; got != want {
+		t.Fatalf("initial ViewMode() = %q, want %q", got, want)
+	}
+
+	// dashboard -> kanban -> dashboard
+	m, _ = m.Update(keyTab)
+	if got, want := m.ViewMode(), "kanban"; got != want {
+		t.Errorf("after tab ViewMode() = %q, want %q", got, want)
+	}
+	m, _ = m.Update(keyTab)
+	if got, want := m.ViewMode(), "dashboard"; got != want {
+		t.Errorf("after 2nd tab ViewMode() = %q, want %q", got, want)
+	}
+
+	// dashboard -> detail -> (esc) dashboard
+	m, _ = m.Update(keyEnter)
+	if got, want := m.ViewMode(), "detail"; got != want {
+		t.Errorf("after enter ViewMode() = %q, want %q", got, want)
+	}
+	m, _ = m.Update(keyEsc)
+	if got, want := m.ViewMode(), "dashboard"; got != want {
+		t.Errorf("after esc ViewMode() = %q, want %q", got, want)
+	}
+
+	// help overlay toggles independently of mode
+	m, _ = m.Update(keyHelp)
+	if !m.HelpVisible() {
+		t.Error("after ? HelpVisible() = false, want true")
+	}
+	m, _ = m.Update(keyHelp)
+	if m.HelpVisible() {
+		t.Error("after 2nd ? HelpVisible() = true, want false")
+	}
+
+	// esc closes the help overlay first, without also leaving the view
+	m, _ = m.Update(keyTab) // -> kanban
+	m, _ = m.Update(keyHelp)
+	if !m.HelpVisible() || m.ViewMode() != "kanban" {
+		t.Fatalf("setup: HelpVisible=%v ViewMode=%q, want true/kanban", m.HelpVisible(), m.ViewMode())
+	}
+	m, _ = m.Update(keyEsc)
+	if m.HelpVisible() {
+		t.Error("esc did not close help overlay")
+	}
+	if got, want := m.ViewMode(), "kanban"; got != want {
+		t.Errorf("esc closing help also changed ViewMode() to %q, want %q (unchanged)", got, want)
+	}
+}
+
+// TestView_RendersWithoutPanicAcrossModes is a smoke test: View must produce
+// non-empty output in every mode without panicking, including before any
+// snapshot (empty board) and after one.
+func TestView_RendersWithoutPanicAcrossModes(t *testing.T) {
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
+
+	// empty board (no snapshot yet)
+	if m.View() == "" {
+		t.Error("View() on empty model returned empty string")
+	}
+
+	m, _ = m.Update(tui.SnapshotMsg{Snap: buildSnapshot(), Live: true})
+	for _, msg := range []tea.KeyMsg{keyEnter, keyEsc, keyTab, keyHelp} {
+		m, _ = m.Update(msg)
+		if m.View() == "" {
+			t.Errorf("View() returned empty after key %v", msg)
+		}
 	}
 }
 

@@ -1,0 +1,886 @@
+"""Tests for the Reviewer lane's LangGraph graph (`clipse_agent.graphs.reviewer`).
+
+DAC (`dac.build_coder_agent` / `dac.drive_turn`) and git/gh are always faked
+here via the graph's own dependency-injection seams (`agent_factory`,
+`turn_driver`, `run_command`) -- these tests never touch a real model, a
+real DAC agent, or a real subprocess/network call. `run_DAC` is the graph's
+only async node, so the compiled graph must be driven with `.ainvoke`/
+`.astream`; per `test_dac.py`'s convention, plain `asyncio.run` drives it
+(no pytest-asyncio in this repo's approved dev deps). Fixtures mirror
+`test_coder_graph.py`'s, adapted for the Reviewer lane's own gh call shapes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any
+
+import pytest
+from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import InMemorySaver
+
+from clipse_agent import dac
+from clipse_agent.contract import BlockKind, Lane, Outcome, WorkerResult
+from clipse_agent.dac import DacTurnResult
+from clipse_agent.graphs import coder, reviewer
+
+# ---------------------------------------------------------------------------
+# Fakes / fixtures
+# ---------------------------------------------------------------------------
+
+
+def _worktree(tmp_path: Path) -> str:
+    """Build a fake worktree dir: just a directory with a `.git` marker.
+
+    `ensure_worktree` (reused from `graphs.coder`) only ever checks for
+    existence + a `.git` entry -- it never shells out to `git` to verify a
+    real repo -- so no real git repo is needed here.
+    """
+    work = tmp_path / "worktree"
+    work.mkdir()
+    (work / ".git").write_text("gitdir: /fake/main/.git/worktrees/spac-1\n")
+    return str(work)
+
+
+class _RunCall:
+    __slots__ = ("argv", "cwd")
+
+    def __init__(self, argv: list[str], cwd: str) -> None:
+        self.argv = argv
+        self.cwd = cwd
+
+    def __repr__(self) -> str:
+        return f"_RunCall(argv={self.argv!r}, cwd={self.cwd!r})"
+
+
+def _starts_with(*prefix: str) -> Callable[[list[str]], bool]:
+    return lambda argv: argv[: len(prefix)] == list(prefix)
+
+
+class FakeRunner:
+    """Injectable stand-in for `coder.CommandRunner` (reused type).
+
+    Matches each call against `rules` (checked in order); the first
+    matching predicate wins. A call matching nothing gets `default` -- a
+    clean no-output success -- so a test only has to script the calls it
+    actually cares about. Every call is recorded in `calls`, in order.
+    """
+
+    def __init__(
+        self,
+        rules: Sequence[tuple[Callable[[list[str]], bool], coder.CommandResult]] = (),
+        default: coder.CommandResult | None = None,
+    ) -> None:
+        self.rules = list(rules)
+        self.default = default or coder.CommandResult(returncode=0, stdout="", stderr="")
+        self.calls: list[_RunCall] = []
+
+    def __call__(self, argv: Sequence[str], cwd: str) -> coder.CommandResult:
+        argv_list = list(argv)
+        self.calls.append(_RunCall(argv_list, cwd))
+        for predicate, result in self.rules:
+            if predicate(argv_list):
+                return result
+        return self.default
+
+
+def _base_runner(
+    *,
+    branch: str = "clipse/spac-1",
+    pr_number: int = 42,
+    commit_sha: str = "abc123",
+    pr_url: str = "https://github.com/acme/widgets/pull/42",
+) -> FakeRunner:
+    return FakeRunner(
+        rules=[
+            (
+                _starts_with("git", "rev-parse", "--abbrev-ref", "HEAD"),
+                coder.CommandResult(0, f"{branch}\n", ""),
+            ),
+            (
+                _starts_with("gh", "pr", "view"),
+                coder.CommandResult(
+                    0,
+                    json.dumps({"number": pr_number, "headRefOid": commit_sha, "url": pr_url}),
+                    "",
+                ),
+            ),
+        ],
+    )
+
+
+def _fake_agent_factory(calls: list[dict[str, Any]]) -> Callable[..., tuple[str, str]]:
+    def factory(profile: Any, checkpointer: Any, cwd: str) -> tuple[str, str]:
+        calls.append({"profile": profile, "checkpointer": checkpointer, "cwd": cwd})
+        return "fake-agent-graph", "fake-backend"
+
+    return factory
+
+
+def _fake_turn_driver(result: DacTurnResult, calls: list[dict[str, Any]]) -> Callable[..., Any]:
+    async def driver(agent_graph: Any, config: Any, **kwargs: Any) -> DacTurnResult:
+        calls.append({"agent_graph": agent_graph, "config": config, **kwargs})
+        return result
+
+    return driver
+
+
+async def _drive(graph: Any, input_state: dict[str, Any], config: dict[str, Any]) -> tuple[list[str], WorkerResult]:
+    """Run `graph` once via `.astream(..., stream_mode="updates")`.
+
+    Returns (node execution order, the WorkerResult `emit_result`
+    produced). Only `emit_result` ever writes the `result` key.
+    """
+    order: list[str] = []
+    result: WorkerResult | None = None
+    async for update in graph.astream(input_state, config, stream_mode="updates"):
+        node, partial = next(iter(update.items()))
+        order.append(node)
+        if partial and "result" in partial:
+            result = partial["result"]
+    assert result is not None, f"emit_result never ran; node order was {order}"
+    return order, result
+
+
+def _assert_valid_result(result: WorkerResult, *, blocked: bool) -> None:
+    """Every emitted result must validate as contract.WorkerResult, and
+    block_kind must be present iff outcome == blocked (amendment X2) --
+    both on the object itself and after a `by_alias, exclude_none` dump,
+    which is exactly how `worker.py` serializes a result to stdout.
+    """
+    assert isinstance(result, WorkerResult)
+    dumped = result.model_dump_json(by_alias=True, exclude_none=True)
+    raw = json.loads(dumped)
+    reparsed = WorkerResult.model_validate_json(dumped)
+    assert reparsed == result
+
+    if blocked:
+        assert result.outcome == Outcome.blocked
+        assert result.block_kind is not None
+        assert raw["block_kind"] == result.block_kind.value
+    else:
+        assert result.outcome != Outcome.blocked
+        assert result.block_kind is None
+        assert "block_kind" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Happy path: PASS verdict -> done, full node order, no gh calls at all
+# ---------------------------------------------------------------------------
+
+
+def test_pass_verdict_runs_full_node_order_and_emits_done(tmp_path):
+    runner = _base_runner()
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Checked the diff; the implementation is correct and well-tested.\n\nVERDICT: PASS",
+        tokens_in=120,
+        tokens_out=340,
+    )
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+
+    workspace = _worktree(tmp_path)
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "workspace": workspace,
+        "issue_text": "Build the widget factory.",
+    }
+    config = {"configurable": {"thread_id": "thread-1"}}
+
+    order, result = asyncio.run(_drive(graph, input_state, config))
+
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "emit_result"]
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.done
+    assert result.lane == Lane.reviewer
+    assert result.run_id == "run-1"
+    assert result.issue_id == "SPAC-1"
+    assert result.thread_id == "thread-1"
+    assert result.turn_count == 1
+    assert result.tokens.in_ == 120
+    assert result.tokens.out == 340
+    assert result.artifacts == []
+
+    # A PASS never touches gh itself -- only DAC's own (mocked-away) shell
+    # tool reviews the diff; the wrapping graph posts nothing.
+    gh_calls = [c for c in runner.calls if c.argv[0] == "gh"]
+    assert gh_calls == []
+
+
+# ---------------------------------------------------------------------------
+# load_diff: the PR diff is pre-computed into task_text (so the reviewer sees
+# it in-context, never depending on the agent shelling out `git diff` -- the
+# live Phase-3 smoke rejected that via the read-mostly allow-list and passed
+# a PR blind).
+# ---------------------------------------------------------------------------
+
+
+def test_load_diff_injects_pr_diff_into_task_text(tmp_path):
+    diff_text = (
+        "diff --git a/HELLO.md b/HELLO.md\n"
+        "--- /dev/null\n+++ b/HELLO.md\n@@ -0,0 +1 @@\n"
+        "+Clipse turns Linear issues into merged PRs.\n"
+    )
+    runner = _base_runner()
+    runner.rules.insert(0, (_starts_with("git", "diff"), coder.CommandResult(0, diff_text, "")))
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-9",
+        "run_id": "run-1",
+        "thread_id": "thread-9",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "Add HELLO.md with the tagline.",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-9"}}))
+
+    # load_diff ran the diff command (default base "main")...
+    assert any(c.argv[:2] == ["git", "diff"] and "main...HEAD" in c.argv for c in runner.calls)
+    # ...and the DAC turn was driven with a task_text that carries BOTH the
+    # original issue text AND the diff content, in a ```diff fence.
+    task_text = turn_calls[0]["task_text"]
+    assert "Add HELLO.md with the tagline." in task_text
+    assert "Clipse turns Linear issues into merged PRs." in task_text
+    assert "```diff" in task_text
+
+
+def test_load_diff_degrades_gracefully_when_git_diff_fails(tmp_path):
+    runner = _base_runner()
+    runner.rules.insert(0, (_starts_with("git", "diff"), coder.CommandResult(128, "", "fatal: bad revision 'main...HEAD'")))
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-9b",
+        "run_id": "run-1",
+        "thread_id": "thread-9b",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    # A failing `git diff` must NOT raise -- the review still runs, with a note.
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-9b"}}))
+    assert "load_diff" in order
+    assert "could not compute" in turn_calls[0]["task_text"]
+    assert result.outcome == Outcome.done
+
+
+# ---------------------------------------------------------------------------
+# changes_requested: inline comments posted via gh + a summary review
+# ---------------------------------------------------------------------------
+
+
+def test_changes_requested_posts_inline_comments_and_a_summary_comment(tmp_path):
+    runner = _base_runner(pr_number=7, commit_sha="deadbeef", pr_url="https://github.com/acme/widgets/pull/7")
+    final_text = (
+        "Found a couple of issues.\n\n"
+        "VERDICT: CHANGES_REQUESTED\n"
+        "- src/thing.py:12: Missing null check before dereferencing user.\n"
+        "- src/other.py:30: This mutates the input list; copy it first.\n"
+    )
+    turn_result = DacTurnResult(outcome_hint="completed", final_text=final_text, tokens_in=10, tokens_out=50)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-2",
+        "run_id": "run-1",
+        "thread_id": "thread-2",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-2"}}))
+
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "post_comments", "emit_result"]
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.changes_requested
+    assert result.pr_url == "https://github.com/acme/widgets/pull/7"
+    assert result.artifacts == []
+
+    api_calls = [c for c in runner.calls if c.argv[:2] == ["gh", "api"]]
+    assert len(api_calls) == 2
+    assert any("path=src/thing.py" in c.argv for c in api_calls)
+    assert any("line=12" in c.argv for c in api_calls)
+    assert any("path=src/other.py" in c.argv for c in api_calls)
+    assert any("line=30" in c.argv for c in api_calls)
+    assert all(any("commit_id=deadbeef" in a for a in c.argv) for c in api_calls)
+
+    # No FORMAL gh review: the coder and reviewer share one gh identity, and
+    # GitHub forbids approving/requesting-changes on your own PR. The verdict
+    # flows via the JSON result (drives merging->rework); the summary is posted
+    # as a plain PR comment, which IS allowed on your own PR.
+    assert not [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "review"]]
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
+
+
+def test_changes_requested_posts_summary_comment_when_no_structured_comments_found(tmp_path):
+    # The model gave a verdict but no machine-parseable bullet lines -- the PR
+    # must still get the summary as a plain comment; it just has no inline
+    # per-line comments attached.
+    runner = _base_runner()
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="This isn't quite right yet.\n\nVERDICT: CHANGES_REQUESTED",
+        tokens_in=5,
+        tokens_out=5,
+    )
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-2b",
+        "run_id": "run-1",
+        "thread_id": "thread-2b",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-2b"}}))
+
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "post_comments", "emit_result"]
+    assert result.outcome == Outcome.changes_requested
+
+    api_calls = [c for c in runner.calls if c.argv[:2] == ["gh", "api"]]
+    assert api_calls == []
+    assert not [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "review"]]
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Missing/unparseable verdict -> conservative changes_requested, never PASS
+# ---------------------------------------------------------------------------
+
+
+def test_missing_verdict_is_treated_as_changes_requested_not_pass(tmp_path):
+    runner = _base_runner()
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="I looked at the diff but forgot to give a verdict.",
+        tokens_in=5,
+        tokens_out=5,
+    )
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-2c",
+        "run_id": "run-1",
+        "thread_id": "thread-2c",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-2c"}}))
+
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "post_comments", "emit_result"]
+    assert result.outcome == Outcome.changes_requested
+
+
+# ---------------------------------------------------------------------------
+# Interrupt -> blocked(needs_input); skips classify and every gh call
+# ---------------------------------------------------------------------------
+
+
+def test_interrupt_emits_blocked_needs_input_and_skips_classify_and_gh(tmp_path):
+    runner = _base_runner()
+    turn_result = DacTurnResult(
+        outcome_hint="interrupted",
+        final_text="paused, needs a decision",
+        tokens_in=10,
+        tokens_out=5,
+        interrupt_payload=[{"action_requests": [{"name": "shell", "args": {"command": "rm -rf /"}}]}],
+    )
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-3",
+        "run_id": "run-1",
+        "thread_id": "thread-3",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-3"}}))
+
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "emit_result"]
+    _assert_valid_result(result, blocked=True)
+    assert result.block_kind == BlockKind.needs_input
+    assert result.pr_url is None
+    assert result.tokens.in_ == 10
+    assert result.tokens.out == 5
+
+    gh_calls = [c for c in runner.calls if c.argv[0] == "gh"]
+    assert gh_calls == []
+
+
+def test_token_ceiling_exceeded_emits_blocked_capability_even_if_interrupted(tmp_path):
+    # token_ceiling_exceeded must win over interrupt_payload (dac.py's own
+    # documented precedence -- see graphs/coder.py's identical rule).
+    runner = _base_runner()
+    turn_result = DacTurnResult(
+        outcome_hint="interrupted",
+        final_text="ran out of budget",
+        tokens_in=900,
+        tokens_out=200,
+        interrupt_payload=[{"some": "payload"}],
+        token_ceiling_exceeded=True,
+    )
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-4",
+        "run_id": "run-1",
+        "thread_id": "thread-4",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+        "max_tokens": 1000,
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-4"}}))
+
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "emit_result"]
+    _assert_valid_result(result, blocked=True)
+    assert result.block_kind == BlockKind.capability
+    assert "1100" in result.summary
+
+
+# ---------------------------------------------------------------------------
+# Resume (continuation after a prior interrupt)
+# ---------------------------------------------------------------------------
+
+
+def test_resume_turn_drives_dac_with_resume_payload_not_task_text(tmp_path):
+    runner = _base_runner()
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(
+        outcome_hint="completed", final_text="resumed and finished.\n\nVERDICT: PASS", tokens_in=5, tokens_out=5
+    )
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-6",
+        "run_id": "run-2",
+        "thread_id": "thread-6",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+        "resume_payload": {"int-1": {"decisions": [{"type": "approve"}]}},
+        "turn_count": 1,
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-6"}}))
+
+    assert order[:4] == ["load_context", "ensure_worktree", "load_diff", "run_DAC"]
+    assert turn_calls[0]["resume"] == {"int-1": {"decisions": [{"type": "approve"}]}}
+    assert "task_text" not in turn_calls[0]
+    assert result.turn_count == 2
+
+
+# ---------------------------------------------------------------------------
+# DAC agent build: default wiring reaches the real clipse_agent.dac module,
+# reusing the same safety-critical create_cli_agent invariants as the Coder
+# lane, with the Reviewer's own (distinct, read-mostly) profile.
+# ---------------------------------------------------------------------------
+
+
+def test_build_reviewer_graph_default_wiring_uses_real_dac_module_with_safety_invariants(tmp_path, monkeypatch):
+    class _FakeAgentGraph:
+        async def astream(self, stream_input: Any, **kwargs: Any):
+            yield (
+                (),
+                "messages",
+                (
+                    AIMessage(
+                        content=[{"type": "text", "text": "Looks good.\n\nVERDICT: PASS"}],
+                        usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                    ),
+                    {},
+                ),
+            )
+
+    captured: dict[str, Any] = {}
+
+    def fake_create_cli_agent(model: Any, assistant_id: Any, **kwargs: Any) -> tuple[Any, Any]:
+        captured["model"] = model
+        captured["assistant_id"] = assistant_id
+        captured["kwargs"] = kwargs
+        return _FakeAgentGraph(), "fake-backend"
+
+    monkeypatch.setattr(dac, "create_cli_agent", fake_create_cli_agent)
+
+    runner = _base_runner()
+    graph = reviewer.build_reviewer_graph(run_command=runner)
+
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-10",
+        "run_id": "run-1",
+        "thread_id": "thread-10",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "Build the thing.",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-10"}}))
+
+    assert order == ["load_context", "ensure_worktree", "load_diff", "run_DAC", "classify", "emit_result"]
+    assert result.outcome == Outcome.done
+    assert result.tokens.in_ == 7
+    assert result.tokens.out == 3
+
+    assert captured["assistant_id"] == "clipse-reviewer"
+    # Safety invariant enforced inside dac.build_coder_agent must never be
+    # bypassed just because reviewer.py is doing the calling.
+    assert captured["kwargs"]["auto_approve"] is False
+    assert captured["kwargs"]["interrupt_shell_only"] is True
+    assert captured["kwargs"]["enable_ask_user"] is True
+    assert set(captured["kwargs"]["shell_allow_list"]) == {"git", "gh", "cat", "ls", "grep", "rg", "find"}
+    assert "sed" not in captured["kwargs"]["shell_allow_list"]
+
+
+def test_run_dac_forwards_profile_and_checkpointer(tmp_path):
+    agent_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory(agent_calls),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=_base_runner(),
+    )
+    workspace = _worktree(tmp_path)
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-11",
+        "run_id": "run-1",
+        "thread_id": "thread-11",
+        "workspace": workspace,
+        "issue_text": "x",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-11"}}))
+
+    assert len(agent_calls) == 1
+    assert agent_calls[0]["checkpointer"] is None
+    assert agent_calls[0]["cwd"] == str(Path(workspace).resolve())
+    assert agent_calls[0]["profile"].assistant_id == "clipse-reviewer"
+
+
+# ---------------------------------------------------------------------------
+# Cross-lane checkpoint-thread safety: the Reviewer's own inner DAC thread
+# must never collide with the Coder's, even when both lanes' runs share one
+# physical checkpoint DB and the same outer thread_id for a given issue
+# (see graphs/coder.py's _DAC_THREAD_NAMESPACE_SUFFIX docstring for why the
+# collision matters: two structurally different graphs' DAC agents sharing
+# one raw thread_id would have the Reviewer's agent resume the Coder's
+# entire message history under the Reviewer's own, different system
+# prompt).
+# ---------------------------------------------------------------------------
+
+
+def test_run_dac_uses_a_reviewer_specific_dac_thread_namespace_distinct_from_coder(tmp_path):
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=_base_runner(),
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-5",
+        "run_id": "run-1",
+        "thread_id": "shared-thread",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "shared-thread"}}))
+
+    dac_thread_id = turn_calls[0]["config"]["configurable"]["thread_id"]
+    assert dac_thread_id == "shared-thread::review-dac"
+    # Compare against graphs.coder's *actual* suffix (not a hardcoded copy of
+    # it), so this guard can't silently go stale if Coder's own suffix ever
+    # changes.
+    coder_dac_thread_id = f"shared-thread{coder._DAC_THREAD_NAMESPACE_SUFFIX}"
+    assert dac_thread_id != coder_dac_thread_id
+
+
+# ---------------------------------------------------------------------------
+# ensure_worktree validation (reused from graphs.coder; smoke-tested here to
+# prove it is actually wired into this graph)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_worktree_raises_when_workspace_missing(tmp_path):
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(
+            DacTurnResult(outcome_hint="completed", final_text="", tokens_in=0, tokens_out=0), []
+        ),
+        run_command=_base_runner(),
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-8",
+        "run_id": "run-1",
+        "thread_id": "thread-8",
+        "workspace": str(tmp_path / "does-not-exist"),
+        "issue_text": "x",
+    }
+    with pytest.raises(reviewer.ReviewerGraphError, match="does not exist"):
+        asyncio.run(graph.ainvoke(input_state, {"configurable": {"thread_id": "thread-8"}}))
+
+
+# ---------------------------------------------------------------------------
+# classify (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_pass_verdict():
+    out = reviewer.classify({"dac_summary": "Looks correct.\n\nVERDICT: PASS"})
+    assert out["review_passed"] is True
+    assert out["review_comments"] == []
+
+
+def test_classify_changes_requested_parses_inline_comments():
+    text = (
+        "VERDICT: CHANGES_REQUESTED\n"
+        "- a/b.py:5: fix this\n"
+        "some unrelated prose line\n"
+        "- badline-without-colon\n"
+        "- c/d.py:9: also fix this\n"
+    )
+    out = reviewer.classify({"dac_summary": text})
+    assert out["review_passed"] is False
+    assert [c.path for c in out["review_comments"]] == ["a/b.py", "c/d.py"]
+    assert [c.line for c in out["review_comments"]] == [5, 9]
+    assert [c.body for c in out["review_comments"]] == ["fix this", "also fix this"]
+
+
+def test_classify_missing_verdict_is_conservative_changes_requested():
+    out = reviewer.classify({"dac_summary": "I looked at the diff but forgot to give a verdict."})
+    assert out["review_passed"] is False
+    assert out["review_comments"] == []
+
+
+def test_classify_does_not_misread_passing_as_pass():
+    # The unanchored regex matched "PASS" as a prefix of "PASSING", so
+    # "VERDICT: PASSING" was misread as an actual PASS. A word-boundary
+    # anchor must reject it and fall back to the conservative
+    # changes_requested default (no verdict recognized).
+    out = reviewer.classify({"dac_summary": "Notes.\n\nVERDICT: PASSING for now, will revisit."})
+    assert out["review_passed"] is False
+    assert out["review_comments"] == []
+
+
+def test_classify_ignores_bullets_that_appear_before_the_verdict_line():
+    text = "- notes/file.py:1: not a real finding, just brainstorming\n\nVERDICT: PASS"
+    out = reviewer.classify({"dac_summary": text})
+    assert out["review_passed"] is True
+    assert out["review_comments"] == []
+
+
+def test_classify_last_verdict_line_wins():
+    # A model that quotes the protocol back before its real decision must
+    # not be misread from the earlier, quoted occurrence.
+    text = "Reminder to self: end with VERDICT: PASS or VERDICT: CHANGES_REQUESTED.\n\nVERDICT: CHANGES_REQUESTED\n- a.py:1: needs work"
+    out = reviewer.classify({"dac_summary": text})
+    assert out["review_passed"] is False
+    assert len(out["review_comments"]) == 1
+
+
+def test_classify_tolerates_empty_dac_summary():
+    out = reviewer.classify({})
+    assert out["review_passed"] is False
+    assert out["review_comments"] == []
+
+
+# ---------------------------------------------------------------------------
+# route_after_dac / route_after_classify (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_route_after_dac_proceeds_to_classify_when_completed_cleanly():
+    state = {"interrupt_payload": None, "token_ceiling_exceeded": False}
+    assert reviewer.route_after_dac(state) == "classify"
+
+
+def test_route_after_dac_routes_to_emit_result_on_interrupt():
+    state = {"interrupt_payload": [{"x": 1}], "token_ceiling_exceeded": False}
+    assert reviewer.route_after_dac(state) == "emit_result"
+
+
+def test_route_after_dac_routes_to_emit_result_on_token_ceiling():
+    state = {"interrupt_payload": None, "token_ceiling_exceeded": True}
+    assert reviewer.route_after_dac(state) == "emit_result"
+
+
+def test_route_after_classify_to_emit_result_when_passed():
+    assert reviewer.route_after_classify({"review_passed": True}) == "emit_result"
+
+
+def test_route_after_classify_to_post_comments_when_not_passed():
+    assert reviewer.route_after_classify({"review_passed": False}) == "post_comments"
+
+
+# ---------------------------------------------------------------------------
+# emit_result (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_emit_result_done_shape():
+    state = {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "turn_count": 0,
+        "tokens_in": 10,
+        "tokens_out": 20,
+        "review_passed": True,
+        "review_comments": [],
+        "dac_summary": "looks good",
+    }
+    out = reviewer.emit_result(state)
+    result = out["result"]
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.done
+    assert result.lane == Lane.reviewer
+    assert result.turn_count == 1
+    assert out["prior_summary"] == "looks good"
+
+
+def test_emit_result_changes_requested_shape():
+    state = {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "turn_count": 1,
+        "tokens_in": 1,
+        "tokens_out": 1,
+        "review_passed": False,
+        "review_comments": [reviewer.InlineComment(path="a.py", line=1, body="fix")],
+        "dac_summary": "needs work",
+        "pr_url": "https://github.com/acme/widgets/pull/1",
+    }
+    out = reviewer.emit_result(state)
+    result = out["result"]
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.changes_requested
+    assert result.pr_url == "https://github.com/acme/widgets/pull/1"
+    assert result.turn_count == 2
+
+
+def test_emit_result_blocked_needs_input_shape():
+    state = {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "turn_count": 2,
+        "tokens_in": 1,
+        "tokens_out": 1,
+        "interrupt_payload": [{"action": "ask"}],
+        "dac_summary": "need a decision",
+    }
+    out = reviewer.emit_result(state)
+    result = out["result"]
+    _assert_valid_result(result, blocked=True)
+    assert result.block_kind == BlockKind.needs_input
+    assert result.pr_url is None
+    assert result.turn_count == 3
+    assert result.artifacts == []
+
+
+def test_emit_result_blocked_capability_shape_takes_priority_over_interrupt():
+    state = {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "turn_count": 0,
+        "tokens_in": 900,
+        "tokens_out": 200,
+        "token_ceiling_exceeded": True,
+        "interrupt_payload": [{"action": "ask"}],
+    }
+    out = reviewer.emit_result(state)
+    result = out["result"]
+    _assert_valid_result(result, blocked=True)
+    assert result.block_kind == BlockKind.capability
+
+
+def test_emit_result_requires_issue_run_and_thread_ids():
+    with pytest.raises(KeyError):
+        reviewer.emit_result({})
+
+
+# ---------------------------------------------------------------------------
+# Checkpointer-driven state carryover (compiled with a checkpointer)
+# ---------------------------------------------------------------------------
+
+
+def test_checkpointer_scopes_state_by_thread_id(tmp_path):
+    async def turn_driver(agent_graph: Any, config: Any, **kwargs: Any) -> DacTurnResult:
+        return DacTurnResult(outcome_hint="completed", final_text="turn output.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    checkpointer = InMemorySaver()
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=turn_driver,
+        run_command=_base_runner(),
+        checkpointer=checkpointer,
+    )
+    workspace = _worktree(tmp_path)
+    base_input: reviewer.ReviewerState = {
+        "issue_id": "SPAC-7",
+        "run_id": "run-1",
+        "thread_id": "thread-7",
+        "workspace": workspace,
+        "issue_text": "Review X.",
+    }
+
+    async def drive() -> tuple[WorkerResult, WorkerResult]:
+        first = await graph.ainvoke(base_input, {"configurable": {"thread_id": "thread-7"}})
+        other_issue = {**base_input, "issue_id": "SPAC-8", "thread_id": "thread-8"}
+        second = await graph.ainvoke(other_issue, {"configurable": {"thread_id": "thread-8"}})
+        return first["result"], second["result"]
+
+    first_result, second_result = asyncio.run(drive())
+    assert first_result.turn_count == 1
+    assert second_result.turn_count == 1  # a fresh thread never sees issue-7's history

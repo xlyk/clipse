@@ -39,6 +39,9 @@ caps:
     scribe: 2
 turn_cap: 7
 max_runtime_s: 1800
+rework_cap: 6
+recover_cap: 5
+recover_backoff_s: 90
 max_tokens_per_run: 250000
 lane_label_prefix: "lane:"
 max_attempts: 4
@@ -101,6 +104,15 @@ board_dir: "/abs/path/board"
 	}
 	if cfg.MaxRuntimeS != 1800 {
 		t.Errorf("MaxRuntimeS = %d, want 1800", cfg.MaxRuntimeS)
+	}
+	if cfg.ReworkCap != 6 {
+		t.Errorf("ReworkCap = %d, want 6", cfg.ReworkCap)
+	}
+	if cfg.RecoverCap != 5 {
+		t.Errorf("RecoverCap = %d, want 5", cfg.RecoverCap)
+	}
+	if cfg.RecoverBackoffS != 90 {
+		t.Errorf("RecoverBackoffS = %d, want 90", cfg.RecoverBackoffS)
 	}
 	if cfg.LaneLabelPrefix != "lane:" {
 		t.Errorf("LaneLabelPrefix = %q, want %q", cfg.LaneLabelPrefix, "lane:")
@@ -169,6 +181,17 @@ worker:
 	if cfg.MaxRuntimeS != 3600 {
 		t.Errorf("MaxRuntimeS = %d, want default 3600", cfg.MaxRuntimeS)
 	}
+	if cfg.ReworkCap != 3 {
+		t.Errorf("ReworkCap = %d, want default 3", cfg.ReworkCap)
+	}
+	if cfg.RecoverCap != 5 {
+		t.Errorf("RecoverCap = %d, want default 5", cfg.RecoverCap)
+	}
+	// recover_backoff_s defaults to the resolved poll_interval_s (30 here,
+	// since poll_interval_s is also absent from this minimal config).
+	if cfg.RecoverBackoffS != 30 {
+		t.Errorf("RecoverBackoffS = %d, want default 30 (poll_interval_s)", cfg.RecoverBackoffS)
+	}
 	if cfg.LaneLabelPrefix != "agent:" {
 		t.Errorf("LaneLabelPrefix = %q, want default %q", cfg.LaneLabelPrefix, "agent:")
 	}
@@ -179,14 +202,66 @@ worker:
 	if !slices.Equal(cfg.EnvAllowlist, wantDefaultAllowlist) {
 		t.Errorf("EnvAllowlist = %v, want default %v", cfg.EnvAllowlist, wantDefaultAllowlist)
 	}
-	if cfg.MaxTokensPerRun != 200000 {
-		t.Errorf("MaxTokensPerRun = %d, want default 200000", cfg.MaxTokensPerRun)
+	if cfg.MaxTokensPerRun != 1000000 {
+		t.Errorf("MaxTokensPerRun = %d, want default 1000000", cfg.MaxTokensPerRun)
 	}
 	if cfg.CheckpointsDir != "./.clipse/checkpoints" {
 		t.Errorf("CheckpointsDir = %q, want default %q", cfg.CheckpointsDir, "./.clipse/checkpoints")
 	}
 	if cfg.BoardDir != "./.clipse" {
 		t.Errorf("BoardDir = %q, want default %q", cfg.BoardDir, "./.clipse")
+	}
+}
+
+// TestLoad_RecoverBackoffDefaultsToPollInterval asserts recover_backoff_s
+// tracks a *custom* poll_interval_s when the former is absent — the retry
+// backoff should land roughly one poll later regardless of the poll cadence.
+func TestLoad_RecoverBackoffDefaultsToPollInterval(t *testing.T) {
+	path := writeYAML(t, `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+poll_interval_s: 60
+worker:
+  command:
+    - clipse-worker
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RecoverBackoffS != 60 {
+		t.Errorf("RecoverBackoffS = %d, want 60 (follows custom poll_interval_s)", cfg.RecoverBackoffS)
+	}
+}
+
+// TestLoad_RecoverCapZeroIsValid asserts a recover_cap of 0 loads cleanly: it
+// is the documented kill switch that disables auto-recovery entirely, unlike
+// max_attempts/rework_cap which must be >= 1.
+func TestLoad_RecoverCapZeroIsValid(t *testing.T) {
+	path := writeYAML(t, `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+recover_cap: 0
+worker:
+  command:
+    - clipse-worker
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.RecoverCap != 0 {
+		t.Errorf("RecoverCap = %d, want 0 (kill switch)", cfg.RecoverCap)
 	}
 }
 
@@ -305,6 +380,17 @@ max_attempts: 0
 			wantErrSubstr: "max_attempts",
 		},
 		{
+			name: "non-positive rework_cap",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+rework_cap: 0
+`,
+			wantErrSubstr: "rework_cap",
+		},
+		{
 			name: "missing team_key",
 			yaml: `
 repo:
@@ -403,6 +489,28 @@ worker:
     - ""
 `,
 			wantErrSubstr: "worker.command",
+		},
+		{
+			name: "negative recover_cap",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+recover_cap: -1
+`,
+			wantErrSubstr: "recover_cap",
+		},
+		{
+			name: "negative recover_backoff_s",
+			yaml: `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+recover_backoff_s: -5
+`,
+			wantErrSubstr: "recover_backoff_s",
 		},
 		{
 			name: "non-positive max_tokens_per_run",

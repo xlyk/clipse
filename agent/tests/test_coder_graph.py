@@ -617,6 +617,39 @@ def test_load_context_tolerates_completely_empty_state():
     assert out["task_text"] == ""
 
 
+def test_load_context_folds_review_feedback_into_task_text():
+    out = coder.load_context(
+        {"issue_text": "Fix the bug.", "review_feedback": "Remove the fabricated config section."}
+    )
+    assert "Fix the bug." in out["task_text"]
+    assert "The previous review requested these changes" in out["task_text"]
+    assert "Remove the fabricated config section." in out["task_text"]
+
+
+def test_load_context_falls_back_to_review_feedback_env_var(monkeypatch):
+    monkeypatch.setenv("CLIPSE_REVIEW_FEEDBACK", "address the review")
+    out = coder.load_context({"issue_text": "Fix the bug."})
+    assert "Fix the bug." in out["task_text"]
+    assert "address the review" in out["task_text"]
+
+
+def test_load_context_folds_both_prior_summary_and_review_feedback():
+    out = coder.load_context(
+        {
+            "issue_text": "Fix the bug.",
+            "prior_summary": "Already found the root cause.",
+            "review_feedback": "Remove the config section.",
+        }
+    )
+    task_text = out["task_text"]
+    assert "Fix the bug." in task_text
+    assert "Already found the root cause." in task_text
+    assert "Remove the config section." in task_text
+    # Review feedback is the most recent, most actionable instruction: it comes
+    # after the coder's own prior-turn progress.
+    assert task_text.index("Already found the root cause.") < task_text.index("Remove the config section.")
+
+
 # ---------------------------------------------------------------------------
 # route_after_dac (pure)
 # ---------------------------------------------------------------------------

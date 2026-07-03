@@ -59,6 +59,13 @@ func TestTick_StaleClaimReleasedAndRequeued(t *testing.T) {
 // pending and is retried on the next tick, so Linear eventually records
 // exactly one successful SetState for the final state — no lost transition,
 // no duplicate.
+//
+// Caps.PerLane.Reviewer is zeroed so a same-tick reviewer claim on the
+// freshly-opened review card can't spawn issue-1 again and reuse this fake
+// Spawner's single scripted needs_review result (illegal from "review",
+// which would defensively block the issue instead of leaving it at review
+// for this test's outbox assertions) — see happy_test.go's
+// TestTick_HappyPath_NeedsReviewMovesToReview for the same isolation.
 func TestTick_OutboxDrainRetriesFailedWrite(t *testing.T) {
 	s := openTestStore(t)
 	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
@@ -72,7 +79,9 @@ func TestTick_OutboxDrainRetriesFailedWrite(t *testing.T) {
 		// Fail every SetState on the first drain.
 		SetStateErr: errFakeLinearDown,
 	}
-	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
+	cfg := testConfig()
+	cfg.Caps.PerLane.Reviewer = 0
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
 
 	// Tick 1: claim + spawn + enqueue the running mirror; the drain attempts
 	// the running SetState and fails (stays pending). This is the outage.

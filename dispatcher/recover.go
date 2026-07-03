@@ -73,16 +73,33 @@ func (d *Dispatcher) reapRunProcess(run store.Run) (spawn.Reaped, error) {
 	return spawn.ReapOrphan(int(run.WorkerPID.Int64), expectedProcStartedAt)
 }
 
-// requeueOrphan closes run as 'orphaned' and moves its issue back to ready
-// (clearing the claim), so the next tick's selectAndClaim can re-claim it —
-// ClaimReady computes the new attempt as prior-max+1, so the re-claim
-// naturally becomes attempt+1.
+// requeueOrphan closes run as 'orphaned' and returns its issue to a
+// claimable state (clearing the claim) so a later tick's selectAndClaim can
+// re-claim it — the re-claim's next attempt is computed as prior-max+1
+// (issue-global, R5), so it naturally becomes attempt+1 regardless of which
+// column/lane re-claims it.
+//
+// The target column is column-aware (R2), via the exact same
+// store.ReleaseTargetColumn rule ReleaseStaleClaims uses, so the two release
+// paths cannot drift apart: an orphaned 'running' (Coder) claim returns to
+// 'ready', while an orphaned downstream claim (review/rework/documentation/
+// merging, entered via ClaimColumn) keeps its own column — it never left
+// that column in the first place, only claim_lock did.
 func (d *Dispatcher) requeueOrphan(ctx context.Context, issue store.Issue, run store.Run) error {
 	now := d.now()
+	target := store.ReleaseTargetColumn(issue.BoardStatus)
 	req := store.TransitionReq{
-		IssueID:         issue.ID,
-		NewStatus:       "ready",
-		ClearClaim:      true,
+		IssueID:    issue.ID,
+		NewStatus:  target,
+		ClearClaim: true,
+		// requeueOrphan's target is always either "ready" (released from
+		// "running") or issue.BoardStatus unchanged (every downstream
+		// column, via ReleaseTargetColumn) — never a genuine edge INTO
+		// rework from some other column. When target=="rework" this is a
+		// claim-release re-assert of a column the card was already sitting
+		// in, so it must not double-count against amendment C1's
+		// rework_cap (see TransitionReq.SkipReworkBump).
+		SkipReworkBump:  true,
 		CloseRunID:      run.RunID,
 		RunStatus:       "orphaned",
 		EnqueueSetState: true,
@@ -91,13 +108,13 @@ func (d *Dispatcher) requeueOrphan(ctx context.Context, issue store.Issue, run s
 			IssueID: nullString(issue.ID),
 			RunID:   nullString(run.RunID),
 			Kind:    "orphan_requeue",
-			Detail:  fmt.Sprintf("orphaned by dispatcher restart; requeued (attempt %d/%d)", run.Attempt, d.cfg.MaxAttempts),
+			Detail:  fmt.Sprintf("orphaned by dispatcher restart; requeued to %s (attempt %d/%d)", target, run.Attempt, d.cfg.MaxAttempts),
 		},
 	}
 	if err := d.store.Transition(ctx, req); err != nil {
 		return fmt.Errorf("requeuing orphaned issue %s: %w", issue.ID, err)
 	}
-	d.logger.Warn("orphan run requeued", "issue_id", issue.ID, "run_id", run.RunID, "attempt", run.Attempt)
+	d.logger.Warn("orphan run requeued", "issue_id", issue.ID, "run_id", run.RunID, "attempt", run.Attempt, "target", target)
 	return nil
 }
 
@@ -115,7 +132,7 @@ func (d *Dispatcher) blockOrphan(ctx context.Context, issue store.Issue, run sto
 		CloseRunID:      run.RunID,
 		RunStatus:       "orphaned",
 		EnqueueSetState: true,
-		Comment:         reason,
+		Comment:         blockedComment("", reason),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),
