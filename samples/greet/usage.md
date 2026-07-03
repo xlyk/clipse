@@ -81,16 +81,3 @@ $ greet --name Claude --locale fr --format loud
 BONJOUR, CLAUDE!
 ```
 
-## Configuration
-
-`greet` can also be driven from a `greet` block in `clipse.yaml`:
-
-```yaml
-greet:
-  template: "Hello, {name}!"
-  default_name: "World"
-  locale: "en"
-```
-
-Flags passed at the command line take precedence over config file values. See
-[`config.md`](config.md) for a full field reference.
