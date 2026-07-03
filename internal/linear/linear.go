@@ -13,6 +13,15 @@ type Issue struct {
 	// Identifier is the human-facing key, e.g. "CLP-12".
 	Identifier string
 
+	// Title is the issue's Linear title. Together with Description, this is
+	// the task text a Coder-lane worker actually needs to do the work --
+	// without it, the worker drives its agent with an empty prompt (see the
+	// dispatcher's CLIPSE_ISSUE_TEXT env injection).
+	Title string
+
+	// Description is the issue's Linear description (may be empty).
+	Description string
+
 	// Status is the Linear workflow-state name mapped to our board
 	// Column enum (contract.Column), e.g. "todo", "review".
 	Status string

@@ -62,6 +62,13 @@ func findRepoRoot(t *testing.T) string {
 // and zero real network. It proves the whole path — claim, spawn a real
 // subprocess, parse its typed JSON result, map through board.Next, transition
 // to review, and mirror to the mock Linear — end to end.
+//
+// Caps.PerLane.Reviewer is zeroed for the same reason happy_test.go's
+// TestTick_HappyPath_NeedsReviewMovesToReview zeroes it: without it, a
+// same-tick reviewer claim on the freshly-opened review card would spawn
+// testworker again under WithEnvFor's fixed TESTWORKER_SCENARIO=needs_review
+// override — an outcome illegal from "review" — defensively blocking the
+// issue instead of leaving it at review for this test to observe.
 func TestTick_EndToEnd_RealSpawnerNeedsReview(t *testing.T) {
 	bin := buildTestworker(t)
 	boardDir := t.TempDir()
@@ -69,11 +76,12 @@ func TestTick_EndToEnd_RealSpawnerNeedsReview(t *testing.T) {
 	s := openTestStore(t)
 	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
 
-	spawner := spawn.NewLocalSpawner(bin, boardDir)
+	spawner := spawn.NewLocalSpawner([]string{bin}, boardDir)
 	ws := newStubWorkspacer(t.TempDir())
 	lc := &linear.MockClient{}
 	cfg := testConfig()
 	cfg.MaxRuntimeS = 30 // generous per-worker deadline for the real subprocess
+	cfg.Caps.PerLane.Reviewer = 0
 
 	d := dispatcher.New(cfg, s, lc, spawner, ws,
 		dispatcher.WithClock(fixedClock(1000)),

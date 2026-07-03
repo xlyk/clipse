@@ -22,7 +22,7 @@ func spawnRealOrphan(t *testing.T, boardDir, issueID, lane string) spawn.RunHand
 	ctx := context.Background()
 
 	bin := buildTestworker(t)
-	spawner := spawn.NewLocalSpawner(bin, boardDir)
+	spawner := spawn.NewLocalSpawner([]string{bin}, boardDir)
 	spec := spawn.WorkerSpec{
 		Issue:     issueID,
 		Lane:      lane,
@@ -219,6 +219,134 @@ func TestRecoverOrphans_BlocksWhenAttemptAtMax(t *testing.T) {
 	}
 }
 
+// seedOrphanColumnRun mirrors seedOrphanRun for a downstream lane-entry
+// column (claimed via ClaimColumn, not ClaimReady): seeds issueID sitting in
+// column, claims it for lane, and records the run's pid/procStartedAt/attempt
+// exactly as a real dispatcher would mid-run.
+func seedOrphanColumnRun(t *testing.T, s *store.Store, issueID, column, lane, runID string, pid int, procStartedAt int64, attempt int, now int64) {
+	t.Helper()
+	ctx := context.Background()
+	seedColumnIssue(t, s, issueID, column, 1, now)
+
+	claim, err := s.ClaimColumn(ctx, column, lane, runID, now, 3600)
+	if err != nil {
+		t.Fatalf("ClaimColumn: unexpected error: %v", err)
+	}
+	if claim.Issue.ID != issueID {
+		t.Fatalf("ClaimColumn claimed %q, want %q", claim.Issue.ID, issueID)
+	}
+
+	if err := s.SetRunProcess(ctx, runID, pid, procStartedAt); err != nil {
+		t.Fatalf("SetRunProcess: unexpected error: %v", err)
+	}
+	if attempt != 1 {
+		if _, err := s.DB().ExecContext(ctx, `UPDATE runs SET attempt = ? WHERE run_id = ?`, attempt, runID); err != nil {
+			t.Fatalf("bumping seeded run attempt: unexpected error: %v", err)
+		}
+	}
+}
+
+// TestRecoverOrphans_DownstreamColumnRequeuesToItsOwnColumn asserts R2: an
+// orphaned run claimed via ClaimColumn (review/rework/documentation/
+// merging, not ClaimReady's ready->running) requeues to its OWN column —
+// not to 'ready' — via the same store.ReleaseTargetColumn rule
+// ReleaseStaleClaims uses, so the two release paths cannot drift apart.
+func TestRecoverOrphans_DownstreamColumnRequeuesToItsOwnColumn(t *testing.T) {
+	s := openTestStore(t)
+	boardDir := t.TempDir()
+
+	handle := spawnRealOrphan(t, boardDir, "issue-1", "reviewer")
+	pid := handle.PID()
+	startedAt := handle.ProcStartedAt()
+	if startedAt <= 0 {
+		t.Fatalf("precondition: ProcStartedAt() = %d, want > 0", startedAt)
+	}
+
+	const runID = "orphan-run"
+	seedOrphanColumnRun(t, s, "issue-1", "review", "reviewer", runID, pid, startedAt, 1, 1000)
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	cfg := testConfig()
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(context.Background()); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+	_, _ = handle.Wait()
+
+	if !isProcessGone(t, pid) {
+		t.Errorf("orphaned process %d still alive after RecoverOrphans", pid)
+	}
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != "review" {
+		t.Errorf("BoardStatus = %q, want unchanged %q (downstream orphan requeues to its own column, not ready)", issue.BoardStatus, "review")
+	}
+	if issue.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+
+	run := getRunStatus(t, s, runID)
+	if run != "orphaned" {
+		t.Errorf("run status = %q, want orphaned", run)
+	}
+
+	pending, err := s.DrainPendingLinearWrites(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending linear writes = %d, want exactly 1 (review setstate)", len(pending))
+	}
+	if pending[0].Kind != "setstate" || pending[0].Target != "review" {
+		t.Errorf("pending write = %+v, want setstate -> review", pending[0])
+	}
+}
+
+// TestRecoverOrphans_DownstreamColumnBlocksWhenAttemptAtMax mirrors
+// TestRecoverOrphans_BlocksWhenAttemptAtMax for a downstream column: the
+// attempt cap still applies (and still blocks, not requeues) regardless of
+// which column the orphaned claim was in.
+func TestRecoverOrphans_DownstreamColumnBlocksWhenAttemptAtMax(t *testing.T) {
+	s := openTestStore(t)
+	boardDir := t.TempDir()
+
+	handle := spawnRealOrphan(t, boardDir, "issue-1", "scribe")
+	pid := handle.PID()
+	startedAt := handle.ProcStartedAt()
+
+	cfg := testConfig()
+	cfg.MaxAttempts = 2
+	const runID = "orphan-run"
+	seedOrphanColumnRun(t, s, "issue-1", "documentation", "scribe", runID, pid, startedAt, cfg.MaxAttempts, 1000)
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(context.Background()); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+	_, _ = handle.Wait()
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnBlocked) {
+		t.Errorf("BoardStatus = %q, want blocked (max attempts reached, even from a downstream column)", issue.BoardStatus)
+	}
+	if issue.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+}
+
 // TestRecoverOrphans_AlreadyDeadPIDRequeuesWithoutError asserts that a run
 // whose worker_pid is already gone (the process exited or was never
 // recorded) is requeued (or blocked, per the attempt cap) without
@@ -251,6 +379,57 @@ func TestRecoverOrphans_AlreadyDeadPIDRequeuesWithoutError(t *testing.T) {
 	run := getRunStatus(t, s, "dead-run")
 	if run != "orphaned" {
 		t.Errorf("run status = %q, want orphaned", run)
+	}
+}
+
+// TestRecoverOrphans_ReworkColumnRequeue_DoesNotDoubleCountReworkCount
+// asserts the fix for requeueOrphan's interaction with rework_count: an
+// issue that was ALREADY sitting in the "rework" column (a genuine prior
+// review->rework edge already bumped rework_count once) when its
+// ClaimColumn claim orphaned must not have rework_count bumped AGAIN just
+// because requeueOrphan's Transition re-asserts NewStatus="rework" (the
+// SAME column, per store.ReleaseTargetColumn) — that is a claim release,
+// not a fresh review/merging->rework edge, and must not count against
+// amendment C1's rework_cap.
+func TestRecoverOrphans_ReworkColumnRequeue_DoesNotDoubleCountReworkCount(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	const runID = "orphan-run"
+	// A bogus/already-dead pid (mirrors
+	// TestRecoverOrphans_AlreadyDeadPIDRequeuesWithoutError) keeps this test
+	// process-free — the double-count reproduces regardless of whether the
+	// orphaned worker process itself is still alive.
+	seedOrphanColumnRun(t, s, "issue-1", "rework", "coder", runID, 999999, 12345, 1, 1000)
+
+	// Simulate the issue having already cycled into rework once for real
+	// (rework_count=1) before this now-orphaned claim was ever taken.
+	if _, err := s.DB().ExecContext(ctx, `UPDATE issues SET rework_count = 1 WHERE id = ?`, "issue-1"); err != nil {
+		t.Fatalf("seeding rework_count: unexpected error: %v", err)
+	}
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	cfg := testConfig()
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(ctx); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+
+	issue, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != "rework" {
+		t.Errorf("BoardStatus = %q, want unchanged rework (orphan requeue re-asserts its own column)", issue.BoardStatus)
+	}
+	if issue.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+	if issue.ReworkCount != 1 {
+		t.Errorf("ReworkCount = %d, want unchanged 1 (orphan requeue must not double-count)", issue.ReworkCount)
 	}
 }
 

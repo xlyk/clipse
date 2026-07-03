@@ -37,7 +37,7 @@ with per-lane LangGraph workers wrapping Deep Agents Code (DAC) as the engine.**
   leases, heartbeats, dependency promotion, stale/crash recovery, concurrency
   caps, a SQLite coordination kernel.
 - **Deep Agents Code (DAC / LangChain `deepagents_code`)** — the coding engine.
-  `create_cli_agent(interactive=False, auto_approve=True, ...)`. Wrapped in a
+  `create_cli_agent(assistant_id=…, interactive=False, auto_approve=False, interrupt_shell_only=True, shell_allow_list=[…], checkpointer=…)` (see the DAC spike findings under "Open questions / to verify" — `auto_approve` must stay `False` or the allow-list is silently dropped). Wrapped in a
   LangGraph graph for fine-grained control (checkpointed resume, interrupts,
   typed state).
 
@@ -298,7 +298,9 @@ Linear issue content is **untrusted input** to a shell-enabled agent running
 its lane allow-lists.
 
 - **Mitigations**: per-lane shell allow-lists (a lane can only run the
-  commands its job requires); the worker env carries only the secrets that
+  commands its job requires — enforced only when the worker sets
+  `auto_approve=False, interrupt_shell_only=True`, per the DAC spike findings;
+  `auto_approve=True` silently drops the allow-list); the worker env carries only the secrets that
   lane needs (`ANTHROPIC_API_KEY`, a scoped `gh` token) — never
   `LINEAR_API_KEY`, which is kernel-only and never passed to a worker; merge is
   gated by CI + branch protection, so injected code cannot land without
@@ -395,9 +397,8 @@ Notes:
 
 ## Open questions / to verify
 
-- **DAC ↔ LangGraph resume specifics** — confirm the exact API for resuming a
-  checkpointed thread non-interactively and surfacing stop-reason / token usage
-  from a headless run (verify against `deepagents_code` source, not docs alone).
+- **DAC ↔ LangGraph resume specifics** — ✅ **RESOLVED by the spike (2026-07-01,
+  `deepagents_code` 0.1.22)**; see "DAC API spike findings" below.
 - **Linear workflow-state setup** — create the custom columns (`Rework`,
   `Merging`, `Documentation`) and the `agent:<lane>` labels; confirm the
   candidate-issue GraphQL query and branch-name auto-link behavior.
@@ -405,6 +406,48 @@ Notes:
   configuration on the target repo so auto-merge is safe.
 - **Continuation vs Blocked boundary** — final turn-cap value and what a worker
   returns as `continue` vs `blocked`.
+
+### DAC API spike findings (verified 2026-07-01, `deepagents_code` 0.1.22)
+
+Source-verified against the installed package (`file:line` cites are in
+`deepagents_code`), not docs. Net: wrap DAC as an **in-process LangGraph graph**;
+do **not** shell out to `dcode -n`.
+
+1. **Headless invocation** — `from deepagents_code.agent import create_cli_agent`
+   returns `(Pregel, CompositeBackend)`: an already-compiled LangGraph the worker
+   `.ainvoke`/`.astream`s in-process (DAC's own ACP mode does exactly this at
+   `main.py:1889`). `assistant_id: str` is a **required positional** (the earlier
+   design snippet omitted it). Kwargs `interactive`, `auto_approve`, `enable_shell`,
+   `shell_allow_list`, `model`, `checkpointer` all exist.
+2. **Shell safety — design change.** `auto_approve=True` silently disables the
+   allow-list: `restrictive_shell_allow_list` is set only under
+   `if interrupt_shell_only and not auto_approve` (`agent.py:1336`),
+   `ShellAllowListMiddleware` is installed only when that list is non-nil
+   (`agent.py:1597`), and `auto_approve` forces `interrupt_on={}` (`agent.py:1612`).
+   So the original `create_cli_agent(auto_approve=True, shell_allow_list=[…])`
+   would run with **no shell enforcement** on an unsandboxed `LocalShellBackend`.
+   The worker **must** use `auto_approve=False, interrupt_shell_only=True,
+   shell_allow_list=[…]` — that path installs the middleware, which rejects
+   disallowed commands inline as error `ToolMessage`s (no HITL stall). This
+   supersedes every doc mention of `auto_approve=True`.
+3. **Resume** — DAC uses upstream LangGraph `AsyncSqliteSaver` (`sessions.py:1239`);
+   `create_cli_agent(checkpointer=…)` is caller-supplied (`agent.py:1196`), so the
+   kernel owns the checkpoint-db path and passes `thread_id` via
+   `config={"configurable": {"thread_id": …}}`. But the bundled headless runner
+   `run_non_interactive` has **no `thread_id`/resume parameter** (verified
+   signature) — it always starts a fresh thread. Non-interactive resume works
+   **only** through the direct in-process graph call, never DAC's own CLI.
+4. **Result / stop-reason / tokens** — DAC exposes **no** `stop_reason` /
+   `finish_reason`. Completion-vs-interrupt is inferred from a `"__interrupt__"`
+   key in an `updates`-mode stream chunk; token usage is per-`AIMessage`
+   `usage_metadata` (`non_interactive.py:377`) the worker must aggregate itself
+   (DAC's `SessionStats` is CLI-internal). A turn-cap overrun raises
+   `HITLIterationLimitError` (exit 124), not a structured field. Interrupts are
+   one generic HITL shape — the worker classifies `needs_input` vs `blocked`.
+5. **API stability** — every symbol the worker imports is internal (no `__all__`,
+   not re-exported from `__init__.py`), pre-1.0; `deepagents_code` itself pins
+   `deepagents==0.6.11` exactly. **Pin `deepagents-code==0.1.22`** in
+   `agent/pyproject.toml` so a routine upgrade can't silently rename these imports.
 
 ## Decision log
 
@@ -428,4 +471,5 @@ Notes:
 | M | v1 = kernel-first, tested against a fake worker |
 | N | Secrets via `op`/env (`LINEAR_API_KEY` v1; `ANTHROPIC_API_KEY` + `gh` phase 2) |
 | O | Dispatcher-restart orphans are requeued to `ready` with an incremented `attempt` (bounded by `max_attempts`), not parked in `Blocked` by default — refines H, which governs worker failures; a dispatcher restart is infrastructure |
+| P | **Cross-lane claiming = per-column claim, not handoff-spawn** (Phase 3): a downstream card is claimed *in place* in its entry column via `store.ClaimColumn` (CAS-lock, `board_status` unchanged), so the claim — not a fire-after-transition spawn — is the restart-safe source of truth (a crash after the transition still leaves a claimable card). `review`→reviewer, `rework`→coder, `documentation`→scribe run as DAC workers; `merging` runs `internal/gitops` inline. Stale-release/orphan-recover return a card to `ready` only when it was `running` (coder), else keep its own column (shared `ColumnAfterRelease` helper). Downstream claims don't mirror Linear (the column didn't change). |
 | Repo | Single Go module; one `clipse` binary (subcommands); JSON Schema → codegen both sides |

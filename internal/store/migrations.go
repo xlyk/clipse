@@ -12,8 +12,13 @@ var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS issues (
 		id            TEXT PRIMARY KEY,
 		identifier    TEXT NOT NULL,
+		title         TEXT NOT NULL DEFAULT '',
+		description   TEXT NOT NULL DEFAULT '',
 		lane_label    TEXT NOT NULL DEFAULT '',
 		board_status  TEXT NOT NULL DEFAULT '',
+		rework_count  INTEGER NOT NULL DEFAULT 0,
+		recover_attempts INTEGER NOT NULL DEFAULT 0,
+		blocked_until    INTEGER NOT NULL DEFAULT 0,
 		deps          TEXT NOT NULL DEFAULT '[]',
 		priority      INTEGER NOT NULL DEFAULT 0,
 		branch_name   TEXT NOT NULL DEFAULT '',
@@ -79,6 +84,33 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	if err := addColumnIfMissing(db, "runs", "proc_started_at", "INTEGER"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	// title/description (Phase-2 issue-text plumbing): the CREATE TABLE
+	// above already carries both for a fresh database; these retrofit a
+	// database migrated before either column existed.
+	if err := addColumnIfMissing(db, "issues", "title", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	if err := addColumnIfMissing(db, "issues", "description", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	// rework_count (Phase-3 cross-lane claiming, amendment C1): the CREATE
+	// TABLE above already carries it for a fresh database; this retrofits a
+	// database migrated before it existed. Existing rows default to 0, same
+	// as a freshly inserted issue.
+	if err := addColumnIfMissing(db, "issues", "rework_count", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	// recover_attempts / blocked_until (auto-unblock layer 1): the CREATE
+	// TABLE above already carries both for a fresh database; these retrofit a
+	// database migrated before they existed. Existing rows default to 0
+	// (recover_attempts) and 0 (blocked_until = not blocked), same as a
+	// freshly inserted issue.
+	if err := addColumnIfMissing(db, "issues", "recover_attempts", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("applying migration: %w", err)
+	}
+	if err := addColumnIfMissing(db, "issues", "blocked_until", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("applying migration: %w", err)
 	}
 	return nil

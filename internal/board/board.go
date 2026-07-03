@@ -119,6 +119,14 @@ var transitions = map[transitionKey]transitionResult{
 	{outcome: string(contract.WorkerResultOutcomeBlocked), current: string(contract.ColumnMerging)}: {
 		next: string(contract.ColumnBlocked), action: ActionCommentBlock,
 	},
+	// Merging -> Rework: internal/gitops's stale-base-conflict route (a
+	// base update landed a real, unresolvable conflict) maps to
+	// changes_requested from merging, the same action tag (and cap-checked
+	// rework_count bump) as the Reviewer lane's own changes_requested from
+	// review -- both mean "the Coder lane gets another attempt".
+	{outcome: string(contract.WorkerResultOutcomeChangesRequested), current: string(contract.ColumnMerging)}: {
+		next: string(contract.ColumnRework), action: ActionRequestChanges,
+	},
 
 	// Documentation (Scribe lane).
 	{outcome: string(contract.WorkerResultOutcomeDone), current: string(contract.ColumnDocumentation)}: {

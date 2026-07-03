@@ -17,7 +17,7 @@ import (
 func TestReapOrphan_KillsLiveMatchingProcess(t *testing.T) {
 	bin := buildTestworker(t)
 	boardDir := t.TempDir()
-	s := spawn.NewLocalSpawner(bin, boardDir)
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -93,7 +93,7 @@ func TestReapOrphan_ZeroOrNegativePIDIsAlreadyGone(t *testing.T) {
 func TestReapOrphan_IdentityMismatchDoesNotKill(t *testing.T) {
 	bin := buildTestworker(t)
 	boardDir := t.TempDir()
-	s := spawn.NewLocalSpawner(bin, boardDir)
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()

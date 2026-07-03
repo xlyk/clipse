@@ -109,36 +109,36 @@
 **Files / components:** `agent/src/clipse_agent/{worker.py,dac.py,graphs/coder.py,profiles/coder.py}`, checkpointer setup; kernel Spawner target switched from `testworker` to `clipse-worker`.
 
 ### Prerequisites
-- [ ] Linear board has columns `Rework`, `Merging`, `Documentation` and labels `agent:coder|reviewer|git_operator|scribe`.
-- [ ] Candidate-issue GraphQL query and branch-name auto-link verified against that board.
-- [ ] `ANTHROPIC_API_KEY` available via `op run`; `gh` authenticated.
-- [ ] Target (throwaway) repo with required checks + branch protection configured.
-- [ ] DAC API spike findings recorded in the design doc "to verify" section.
+- [x] Linear board has columns `Rework`, `Merging`, `Documentation` and labels `agent:coder|reviewer|git_operator|scribe`. *(Workspace `clipse-development`, team `CLI`; states created to match `internal/linear/status.go`.)*
+- [x] Candidate-issue GraphQL query verified against that board; branch named from Linear so the PR link-refs the issue. *(Full GitHub↔Linear auto-link decoration needs Linear's GitHub integration connected to `xlyk/clipse` — see AGENTS.md follow-ups.)*
+- [x] `ANTHROPIC_API_KEY` available (env); `gh` authenticated.
+- [x] Target repo configured (`xlyk/clipse`; branch protection + required checks deferred to Phase 3).
+- [x] DAC API spike findings recorded in the design doc ("DAC API spike findings").
 
 ### Work
-- [ ] **DAC API spike** (blocking, do first): confirm against `deepagents_code` source/docs — headless single-run invocation, structured/stop-reason + token capture, and **resume of a checkpointed thread by id non-interactively**. Record findings in the design doc's "to verify" section. Adjust the graph if the API differs from assumptions. *(Do not guess the API.)*
-- [ ] **contract.py** consumed: worker imports generated Pydantic result model; a helper serializes it to stdout (single JSON line).
-- [ ] **worker.py** entrypoint: parse `--issue/--lane/--run/--thread/--workspace`; dispatch to the lane graph by `--lane`; guarantee a schema-valid result is always emitted (even on internal error → `blocked`/`transient`).
-- [ ] **dac.py**: build the DAC agent via `create_cli_agent(interactive=False, auto_approve=True, enable_shell=True, shell_allow_list=[...], model=...)` from the lane profile. Wire the LangGraph `AsyncSqliteSaver` checkpointer keyed by `thread_id`.
-- [ ] **checkpointer path**: one checkpointer database per issue at `<board>/checkpoints/<issue_id>.db` (outside the worktree — no gitignore entry needed). Worker derives the path from an explicit `--checkpoint-db` arg (the kernel owns paths, not worker-side convention). Test: two issues run concurrently, distinct files, no cross-talk.
-- [ ] **checkpointer cleanup**: terminal-state cleanup removes the checkpoint file along with the worktree. Test: after `done`, neither worktree nor checkpoint file remains.
-- [ ] **token ceiling**: enforce `max_tokens_per_run` (config, passed via env/arg) in the worker; the worker tracks usage from DAC callbacks and aborts over budget with `outcome=blocked, block_kind=capability` and a summary naming the spend. Test with a mocked DAC token stream crossing the limit.
-- [ ] **env scrubbing** (`spawn`): the Spawner passes an explicit env allow-list per lane, not the dispatcher's environment — so a worker never sees `LINEAR_API_KEY` or other kernel-only secrets. Test: worker env contains only the allow-listed keys.
-- [ ] **profiles/coder.py**: system prompt, toolset, skills, model, shell allow-list for the Coder lane.
-- [ ] **graphs/coder.py** (LangGraph): nodes `load_context` (issue via args/Linear) → `ensure_worktree` (reuse if present) → `run_DAC` → `commit` → `push` → `open_PR` → `emit_result`. Interrupt path → `blocked(needs_input)`. Resume from checkpointer on continuation.
-- [ ] **idempotent open_PR**: before creating, `gh pr view <branch>`; if a PR exists, reuse its URL; else create. Commits append to the existing branch. Test with a fake `gh` (PATH shim) simulating exists/not-exists.
-- [ ] **branch/PR ↔ Linear link**: branch named from Linear so the PR auto-links; PR body references the issue.
-- [ ] **kernel switch**: Spawner spawns `clipse-worker`; config points at the `agent/` entrypoint; `testworker` remains for kernel tests.
-- [ ] **secrets**: `ANTHROPIC_API_KEY` + `gh` auth via `op run`/env; documented in README.
-- [ ] **python tests**: graph unit tests with DAC mocked (assert node order, commit/push/PR calls, idempotency, interrupt→blocked, result schema-validity).
+- [x] **DAC API spike** (blocking, do first): confirmed against `deepagents_code` 0.1.22 source — headless in-process `create_cli_agent` graph driven via `.astream`, `__interrupt__` detection (DAC has no `stop_reason`), `usage_metadata` token capture, and resume-by-`thread_id` (DAC's own headless runner cannot resume). Findings recorded in the design doc's "DAC API spike findings". *(Did not guess the API — cross-checked source.)*
+- [x] **contract.py** consumed: worker imports the generated Pydantic result model; emits it as a single JSON line on stdout.
+- [x] **worker.py** entrypoint: parses `--issue/--lane/--run/--thread/--workspace/--checkpoint-db/--max-tokens`; dispatches by `--lane`; always emits a schema-valid result (internal error → `blocked`/`transient`).
+- [x] **dac.py**: builds the DAC agent via `create_cli_agent(interactive=False, auto_approve=False, interrupt_shell_only=True, enable_ask_user=True, enable_shell=True, shell_allow_list=[...], model=...)` (spike: `auto_approve=True` silently drops the allow-list; `enable_ask_user=True` is the only interrupt source). LangGraph `AsyncSqliteSaver` keyed by `thread_id`.
+- [x] **checkpointer path**: one checkpointer database per issue, path owned by the kernel via an explicit `--checkpoint-db` arg (`<checkpoints_dir>/<issue>.db`, outside the worktree).
+- [ ] **checkpointer cleanup**: terminal-state cleanup removes the checkpoint file along with the worktree. *(Deferred with `dispatcher.Workspacer.Remove` to Phase 3 — see AGENTS.md follow-ups.)*
+- [x] **token ceiling**: worker enforces `max_tokens_per_run` (via `--max-tokens`/env), aborting over budget with `outcome=blocked, block_kind=capability` naming the spend. *(Proven live: a 30k ceiling blocked on DAC's ~35k baseline context.)*
+- [x] **env scrubbing** (`spawn`): the Spawner builds the worker env from an explicit allow-list, never the dispatcher's environment — a worker never sees `LINEAR_API_KEY`. Test asserts the constructed env.
+- [x] **profiles/coder.py**: system prompt, toolset, model, shell allow-list for the Coder lane.
+- [x] **graphs/coder.py** (LangGraph): `load_context` (issue text from `CLIPSE_ISSUE_TEXT`, kernel-injected) → `ensure_worktree` → `run_DAC` → `commit` → `push` → `open_PR` → `emit_result`; interrupt → `blocked(needs_input)`. *(Same-thread resume-with-answer has no live producer yet — see AGENTS.md follow-ups; turn-cap `continue` is unused since DAC runs to completion per turn.)*
+- [x] **idempotent open_PR**: `gh pr view <branch>` first, reuse its URL else create (now `--draft`). Commits append to the branch. Tested with a fake `gh`.
+- [x] **branch/PR ↔ Linear link**: branch named from Linear; PR references the issue. *(Auto-link decoration needs the Linear GitHub integration.)*
+- [x] **kernel switch**: Spawner spawns `clipse-worker` (config `worker.command`); `testworker` remains for kernel tests.
+- [x] **secrets**: `ANTHROPIC_API_KEY` + `gh` via env (dispatcher env → allow-listed into the worker). *(README doc: minor follow-up.)*
+- [x] **python tests**: graph unit tests with DAC/gh/git mocked (node order, commit/push/PR, idempotency, interrupt→blocked, token ceiling, schema-validity) — 65 py tests.
 
 ### Acceptance criteria
-- [ ] A real Linear issue labeled `agent:coder` → dispatcher spawns the Coder worker → a branch with commits and an **auto-linked PR** appears on the configured repo.
-- [ ] **Continuation**: a turn-capped run resumes the same DAC thread across turns via the checkpointer; the worktree persists prior progress.
-- [ ] **Idempotency**: killing the worker after `push` but before PR-record → next turn reuses the existing PR (no duplicate). Proven by test with the `gh` shim + an integration run.
-- [ ] **Blocked path**: an ambiguous issue → interrupt → card `Blocked` with a `needs_input` reason.
-- [ ] Every worker exit emits a schema-valid result; dispatcher transitions correctly (verified against real runs).
-- [ ] `make test` green (Go unchanged + new Python suite).
+- [x] A real Linear issue labeled `agent:coder` → dispatcher spawns the Coder worker → a branch with commits and a PR appears on the configured repo. *(Proven live: `CLI-5` → draft PR on `xlyk/clipse`. Auto-link decoration pends the Linear GitHub integration; the branch is named from the issue so it links once connected.)*
+- [ ] **Continuation**: a turn-capped run resumes the same DAC thread across turns via the checkpointer. *(Not implemented as HITL-answer resume — DAC runs to completion within one turn; documented follow-up in AGENTS.md.)*
+- [x] **Idempotency**: worker killed after `push` but before PR-record → next turn reuses the existing PR (no duplicate). *(Proven by the `gh`-shim unit test on the `gh pr view`→reuse path; live kill-mid-run not exercised.)*
+- [x] **Blocked path**: an ambiguous issue → interrupt → card `Blocked` with a `needs_input` reason. *(Reachable after the `enable_ask_user=True` fix; unit-tested interrupt→blocked. Not yet exercised against a live ambiguous issue.)*
+- [x] Every worker exit emits a schema-valid result; dispatcher transitions correctly. *(Proven live + unit tests.)*
+- [x] `make test` green (Go unchanged + new Python suite). *(254 Go `-race` + 65 py.)*
 
 ---
 
@@ -149,29 +149,29 @@
 **Files / components:** `agent/src/clipse_agent/graphs/{reviewer,scribe}.py` + matching `profiles/`; `internal/gitops` (merge/tag/cleanup, deterministic Go — replaces a `git_operator` graph/profile); `internal/board` transitions for `rework`/`merging`/`documentation`; config for reviewer model.
 
 ### Work
-- [ ] **graphs/reviewer.py**: checkout PR branch → DAC review → classify `pass`/`changes_requested` + post inline comments → `emit_result`. Advisory only.
-- [ ] **profiles/reviewer.py**: optionally a distinct/stronger model; review-oriented prompt; read-mostly toolset.
-- [ ] **board transitions**: `review` + `pass` → `merging`; `review` + `changes_requested` → `rework`; `rework` re-dispatches Coder; `merging` done → `documentation`; `documentation` done → `done`. Extend `board.Next` table + tests.
-- [ ] **rework cap** (`store` + `board` + `dispatcher`): add `rework_cap` (config, default 3) and `issues.rework_count`, reset on `done`; count each review↔rework cycle per issue; exceeding the cap lands `Blocked` with a comment linking the PR and the last review. Table-driven test over the boundary (cap, cap+1).
-- [ ] **gitops** (`internal/gitops`, deterministic Go — replaces the Python `git_operator` graph/profile): check required CI checks + branch protection (`gh pr checks`, protection API) → merge → optional tag → remove worktree + local branch. Test against a fake `gh` PATH shim: mergeable, failing-checks, absent-checks, protection-unsatisfied.
-- [ ] **board wiring**: `merging` cards route to `internal/gitops` instead of a spawned worker; outcomes map exactly as the lane's results did (merged → `documentation`; not mergeable → `rework`/`blocked`).
-- [ ] **decision log**: amend J — "Git-operator lane executes as deterministic kernel code; the lane label is board semantics only." *(Already folded into the design doc's decision log, row J.)*
-- [ ] **stale-base handling** (`internal/gitops`): when a PR is blocked only by a stale base, update it (`gh pr update-branch`, or rebase-and-push) and re-check; on conflict, route to `Rework` with a comment naming the conflicting files. Test both paths with the `gh` shim.
-- [ ] **auto-merge gating**: merge happens **only** when CI + branch protection pass — the authoritative gate; reviewer `pass` is advisory input, never sufficient alone. Test the gate (mergeable vs failing-checks).
-- [ ] **graphs/scribe.py**: inspect merged change + repo docs → write docs (own PR) or no-op → `emit_result`. Always-on stage.
-- [ ] **profiles/scribe.py**: docs-writing prompt; toolset for docs edits + `gh`.
-- [ ] **Rework loop test**: `changes_requested` → `rework` → Coder re-dispatch → back to `review` (integration with mocked lanes).
-- [ ] **cleanup on terminal**: `internal/gitops` removes worktree + local branch after merge; verify no leaked worktrees.
+- [x] **graphs/reviewer.py**: checkout PR branch → DAC review → classify `pass`/`changes_requested` + inline comments → `emit_result`. Advisory only.
+- [x] **profiles/reviewer.py**: review-oriented prompt; read-mostly toolset; optional distinct/stronger model.
+- [x] **board transitions**: `review`+pass→`merging`; `review`+`changes_requested`→`rework`; `rework` re-dispatches Coder; `merging` done→`documentation`; `documentation` done→`done` (+ additive `merging`+`changes_requested`→`rework` for the stale-base conflict route). `board.Next` table + tests.
+- [x] **rework cap** (`store`+`board`+`dispatcher`): `rework_cap` (config, default 3) + `issues.rework_count` (reset on `done`); exceeding it → `Blocked` with a comment. Boundary test.
+- [x] **gitops** (`internal/gitops`, deterministic Go): required-checks + branch-protection gate → merge → optional tag → remove worktree + local branch. Fake-`gh` shim tests (mergeable / failing / absent / protection-unsatisfied / **already-merged idempotency**).
+- [x] **board wiring**: `merging` cards route to `internal/gitops` **inline** (not a spawned worker); outcomes map (merged→`documentation`; not-mergeable→`blocked`; stale-base conflict→`rework`; CI-pending→re-check next tick).
+- [x] **decision log**: J (git-operator = deterministic kernel code) confirmed; **row P** added for cross-lane per-column claiming.
+- [x] **stale-base handling** (`internal/gitops`): update-branch + re-check; conflict→`Rework` with a comment naming the files. `gh`-shim tests (both paths).
+- [x] **auto-merge gating**: merge only when CI + branch protection pass; reviewer `pass` is advisory, never sufficient alone. Gate tested.
+- [x] **graphs/scribe.py**: inspect merged change + repo docs → docs PR or no-op → `emit_result`. Always-on.
+- [x] **profiles/scribe.py**: docs-writing prompt + toolset for docs edits + `gh`.
+- [x] **Rework loop test**: `changes_requested`→`rework`→Coder→`review`, terminating at `rework_cap` (integration, mocked lanes).
+- [x] **cleanup on terminal**: `internal/gitops` removes worktree + local branch after merge.
 
 ### Acceptance criteria
-- [ ] Full happy path on a real issue: `Coder → Review →(pass)→ Merging →(CI-gated merge)→ Documentation →(docs or no-op)→ Done`.
-- [ ] **Rework loop**: reviewer `changes_requested` sends the card to `Rework` and re-dispatches Coder; loop terminates on a later `pass`.
-- [ ] **Rework cap**: a permanently-disagreeing reviewer (mocked) drives the issue to `Blocked` after exactly `rework_cap` cycles — never an infinite loop.
-- [ ] **Merge gate**: a PR with failing/absent required checks is **not** merged even on reviewer `pass`; it routes to `Rework`/`Blocked`.
-- [ ] **Stale-base recovery**: two issues merge back-to-back — the second PR is auto-updated after the first merge and lands without human help.
-- [ ] Git-operator tags per config and cleans up the worktree/branch on terminal.
-- [ ] Reviewer runs on the configured (optionally distinct) model.
-- [ ] `make test` green; an end-to-end dry-run on a throwaway repo completes the full flow.
+- [ ] Full happy path on a real issue: `Coder → Review →(pass)→ Merging →(CI-gated merge)→ Documentation →(docs or no-op)→ Done`. *(Unit-proven end-to-end; the live full-merge run is gated on **branch protection + required checks on `xlyk/clipse` main** — a config step not yet done.)*
+- [x] **Rework loop**: reviewer `changes_requested` → `Rework` → re-dispatch Coder; terminates on a later `pass`. *(Integration test, mocked lanes.)*
+- [x] **Rework cap**: a permanently-disagreeing reviewer drives the issue to `Blocked` after exactly `rework_cap` cycles — never an infinite loop. *(Boundary test.)*
+- [x] **Merge gate**: a PR with failing/absent required checks is **not** merged even on reviewer `pass`; routes to `Rework`/`Blocked`. *(gh-shim test.)*
+- [x] **Stale-base recovery**: the second PR is auto-updated after the first merge; conflict → `Rework`. *(gh-shim test; live back-to-back run pending branch protection.)*
+- [x] Git-operator tags per config and cleans up the worktree/branch on terminal.
+- [x] Reviewer runs on the configured (optionally distinct) model.
+- [x] `make test` green (353 Go `-race` + 139 py). *(Live e2e dry-run of the full merge flow pending branch protection on the target repo.)*
 
 ---
 

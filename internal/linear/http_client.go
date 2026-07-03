@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -18,18 +19,38 @@ const apiURL = "https://api.linear.app/graphql"
 // API key from.
 const apiKeyEnvVar = "LINEAR_API_KEY"
 
-// CandidateIssuesQuery fetches active-state issues along with the fields
-// NormalizeCandidateIssues needs: workflow state name, agent:<lane> labels,
-// blocks/blocked-by relations, priority, branch name, and updatedAt.
+// CandidateIssuesQuery fetches active-state issues on the configured team
+// along with the fields NormalizeCandidateIssues needs: title, description,
+// workflow state name, agent:<lane> labels, inverse blocking relations (the
+// issues that block this one — see below), priority, branch name, and
+// updatedAt.
 //
-// Filtering to "active" issues (Linear's built-in state-type filter) keeps
-// completed/cancelled work out of the candidate set; the dispatcher decides
-// dispatchability from Status/Deps, not from this query.
-const CandidateIssuesQuery = `query CandidateIssues {
-  issues(filter: { state: { type: { eq: "active" } } }) {
+// It fetches inverseRelations, NOT relations: a dependency of an issue is an
+// issue that blocks it, and Linear records a blocking relationship once, on
+// the blocker's source side (type "blocks"). The blocked issue therefore sees
+// it in inverseRelations (issue = the blocker). Fetching source-side relations
+// instead inverted the dependency graph — a dependent issue looked
+// dependency-free and promoted immediately while its blocker waited on it.
+//
+// title/description are the task text a Coder-lane worker actually needs to
+// do the work (the dispatcher injects them into the worker's environment as
+// CLIPSE_ISSUE_TEXT) -- without them here, that env var is always empty
+// regardless of anything downstream.
+//
+// Excluding the terminal state types (Linear has no "active" type; the real
+// types are backlog/unstarted/started/completed/canceled/triage, plus
+// duplicate) keeps completed/cancelled/duplicate work out of the candidate
+// set; the dispatcher decides dispatchability from Status/Deps, not from this
+// query. Filtering to team.key scopes the candidate set to the single team
+// clipse is configured against (config.Config.TeamKey), so a workspace with
+// other teams' issues never surfaces them as candidates.
+const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
+  issues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } }, team: { key: { eq: $teamKey } } }) {
     nodes {
       id
       identifier
+      title
+      description
       priority
       branchName
       updatedAt
@@ -41,10 +62,10 @@ const CandidateIssuesQuery = `query CandidateIssues {
           name
         }
       }
-      relations {
+      inverseRelations {
         nodes {
           type
-          relatedIssue {
+          issue {
             id
           }
         }
@@ -81,11 +102,13 @@ type graphqlResponse struct {
 	} `json:"errors"`
 }
 
-// BuildCandidateIssuesRequest builds the request body for CandidateIssuesQuery.
-// Factored out from the HTTP call so tests can assert the exact payload
-// without sending anything.
-func BuildCandidateIssuesRequest() ([]byte, error) {
-	return marshalGraphQLRequest(CandidateIssuesQuery, map[string]any{})
+// BuildCandidateIssuesRequest builds the request body for CandidateIssuesQuery,
+// scoped to teamKey. Factored out from the HTTP call so tests can assert the
+// exact payload without sending anything.
+func BuildCandidateIssuesRequest(teamKey string) ([]byte, error) {
+	return marshalGraphQLRequest(CandidateIssuesQuery, map[string]any{
+		"teamKey": teamKey,
+	})
 }
 
 // BuildSetStateRequest builds the request body for SetStateMutation.
@@ -116,29 +139,41 @@ func marshalGraphQLRequest(query string, variables map[string]any) ([]byte, erro
 
 // HTTPClient is the real Client implementation: it talks to Linear's
 // GraphQL API over net/http, authenticating with the API key read from
-// the LINEAR_API_KEY environment variable.
+// the LINEAR_API_KEY environment variable, scoped to a single configured
+// team.
 type HTTPClient struct {
 	apiKey     string
 	baseURL    string
+	teamKey    string
+	teamID     string
 	httpClient *http.Client
+
+	// mu guards stateIDs, the lazily-resolved and cached name(lowercase)->id
+	// map for teamID (see state_resolver.go). The dispatch loop is
+	// single-goroutine (AGENTS.md), so this is defense in depth rather than
+	// a load-bearing requirement.
+	mu       sync.Mutex
+	stateIDs map[string]string
 }
 
 // NewHTTPClient builds an HTTPClient using the API key from LINEAR_API_KEY,
-// pointed at Linear's real GraphQL endpoint.
+// pointed at Linear's real GraphQL endpoint and scoped to the Linear team
+// identified by teamKey (candidate-issues filter) and teamID (workflow-state
+// resolution for SetState).
 // Returns an error if the environment variable is unset or empty.
-func NewHTTPClient() (*HTTPClient, error) {
-	return newHTTPClient(apiURL)
+func NewHTTPClient(teamKey, teamID string) (*HTTPClient, error) {
+	return newHTTPClient(apiURL, teamKey, teamID)
 }
 
 // NewHTTPClientWithBaseURL builds an HTTPClient like NewHTTPClient, but
 // against baseURL instead of Linear's real API. Intended for tests that
 // point the client at a local httptest.Server; production code should use
 // NewHTTPClient.
-func NewHTTPClientWithBaseURL(baseURL string) (*HTTPClient, error) {
-	return newHTTPClient(baseURL)
+func NewHTTPClientWithBaseURL(baseURL, teamKey, teamID string) (*HTTPClient, error) {
+	return newHTTPClient(baseURL, teamKey, teamID)
 }
 
-func newHTTPClient(baseURL string) (*HTTPClient, error) {
+func newHTTPClient(baseURL, teamKey, teamID string) (*HTTPClient, error) {
 	apiKey := os.Getenv(apiKeyEnvVar)
 	if apiKey == "" {
 		return nil, fmt.Errorf("building linear http client: %s is not set", apiKeyEnvVar)
@@ -146,13 +181,16 @@ func newHTTPClient(baseURL string) (*HTTPClient, error) {
 	return &HTTPClient{
 		apiKey:     apiKey,
 		baseURL:    baseURL,
+		teamKey:    teamKey,
+		teamID:     teamID,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
-// CandidateIssues runs CandidateIssuesQuery and normalizes the response.
+// CandidateIssues runs CandidateIssuesQuery, scoped to c's configured team,
+// and normalizes the response.
 func (c *HTTPClient) CandidateIssues(ctx context.Context) ([]Issue, error) {
-	reqBody, err := BuildCandidateIssuesRequest()
+	reqBody, err := BuildCandidateIssuesRequest(c.teamKey)
 	if err != nil {
 		return nil, fmt.Errorf("candidate issues: %w", err)
 	}
@@ -169,12 +207,17 @@ func (c *HTTPClient) CandidateIssues(ctx context.Context) ([]Issue, error) {
 	return issues, nil
 }
 
-// SetState runs SetStateMutation to move issueID to targetColumn's Linear
-// workflow state. targetColumn is expected to already be the Linear state
-// id the caller resolved for that column (state-id resolution/caching is
-// the caller's concern; this method just performs the mutation).
+// SetState moves issueID to targetColumn's Linear workflow state: it
+// resolves targetColumn (a bare board Column string, e.g. "review") to that
+// state's Linear id on c's configured team (state_resolver.go, cached after
+// the first resolve), then runs SetStateMutation with the resolved id.
 func (c *HTTPClient) SetState(ctx context.Context, issueID, targetColumn string) error {
-	reqBody, err := BuildSetStateRequest(issueID, targetColumn)
+	stateID, err := c.resolveStateID(ctx, targetColumn)
+	if err != nil {
+		return fmt.Errorf("set state: %w", err)
+	}
+
+	reqBody, err := BuildSetStateRequest(issueID, stateID)
 	if err != nil {
 		return fmt.Errorf("set state: %w", err)
 	}

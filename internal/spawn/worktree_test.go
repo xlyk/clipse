@@ -137,6 +137,47 @@ func TestEnsureWorktree_ReusesExisting(t *testing.T) {
 	}
 }
 
+// TestEnsureWorktree_PrunesAndRetriesOnMissingButRegisteredCollision asserts
+// that when a worktree's directory was removed directly (e.g. os.RemoveAll,
+// bypassing `git worktree remove`/RemoveWorktree) rather than through the
+// normal cleanup path, a later EnsureWorktree call for the same branch
+// recovers instead of failing forever. git's own .git/worktrees
+// administrative metadata still claims the path even though the directory
+// itself is gone, so a bare retry of `git worktree add` fails with "is a
+// missing but already registered worktree" (exit 128) every time; the fix is
+// `git worktree prune` on the primary clone, then one retry of the same add.
+func TestEnsureWorktree_PrunesAndRetriesOnMissingButRegisteredCollision(t *testing.T) {
+	primary := newPrimaryRepo(t, "main")
+	worktreeRoot := t.TempDir()
+
+	path, err := spawn.EnsureWorktree(ctxWithTimeout(t), primary, "clp-999-recover", "main", worktreeRoot)
+	if err != nil {
+		t.Fatalf("EnsureWorktree (first call): unexpected error: %v", err)
+	}
+
+	// Simulate the directory vanishing without going through
+	// RemoveWorktree (a crashed cleanup, a clobbered disk, an operator's
+	// stray rm -rf): git's own worktree registration survives even though
+	// the directory doesn't.
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("os.RemoveAll(%s): unexpected error: %v", path, err)
+	}
+
+	path2, err := spawn.EnsureWorktree(ctxWithTimeout(t), primary, "clp-999-recover", "main", worktreeRoot)
+	if err != nil {
+		t.Fatalf("EnsureWorktree (second call, after directory removed): unexpected error: %v", err)
+	}
+	if path2 != path {
+		t.Errorf("recovered worktree path = %q, want same as first call's %q", path2, path)
+	}
+	if _, statErr := os.Stat(path2); statErr != nil {
+		t.Errorf("recovered worktree path %s does not exist: %v", path2, statErr)
+	}
+	if got := currentBranch(t, path2); got != "clp-999-recover" {
+		t.Errorf("recovered worktree checked-out branch = %q, want %q", got, "clp-999-recover")
+	}
+}
+
 // TestRemoveWorktree_DeletesWorktreeAndBranch asserts RemoveWorktree removes
 // the worktree directory and deletes the local branch.
 func TestRemoveWorktree_DeletesWorktreeAndBranch(t *testing.T) {
@@ -179,6 +220,89 @@ func TestRemoveWorktree_AlreadyRemovedIsNotError(t *testing.T) {
 	// Second call: worktree dir and branch are already gone.
 	if err := spawn.RemoveWorktree(ctxWithTimeout(t), primary, path, "clp-789-cleanup"); err != nil {
 		t.Errorf("RemoveWorktree (second call, already removed): unexpected error: %v", err)
+	}
+}
+
+// newPrimaryRepoWithRemote creates a bare "origin" repo plus a primary clone
+// of it on baseBranch (one initial commit pushed), returning both paths. The
+// primary has `origin` configured, so EnsureDocsWorktree can fetch and branch
+// off origin/<base>. The Scribe-lane docs-worktree tests need this (unlike the
+// plain-worktree tests' remote-less repo) precisely because the whole point of
+// the docs worktree is that it is cut from the *remote* (post-merge) base.
+func newPrimaryRepoWithRemote(t *testing.T, baseBranch string) (primary, origin string) {
+	t.Helper()
+	origin = t.TempDir()
+	runGit(t, origin, "init", "--bare")
+
+	primary = t.TempDir()
+	runGit(t, primary, "clone", origin, ".")
+	runGit(t, primary, "config", "user.name", "Clipse Test")
+	runGit(t, primary, "config", "user.email", "clipse-test@example.com")
+	runGit(t, primary, "checkout", "-b", baseBranch)
+
+	readme := filepath.Join(primary, "README.md")
+	if err := os.WriteFile(readme, []byte("clipse test fixture\n"), 0o644); err != nil {
+		t.Fatalf("writing README.md: %v", err)
+	}
+	runGit(t, primary, "add", "README.md")
+	runGit(t, primary, "commit", "-m", "initial commit")
+	runGit(t, primary, "push", "-u", "origin", baseBranch)
+
+	return primary, origin
+}
+
+// pushCommitToOrigin lands a new commit on origin/<baseBranch> from a throwaway
+// clone, simulating a merge that reaches the remote without the primary clone
+// having fetched it yet -- so the primary's local base is now stale relative to
+// origin/base, exactly the post-merge situation the Scribe lane runs in.
+func pushCommitToOrigin(t *testing.T, origin, baseBranch, filename, content string) {
+	t.Helper()
+	other := t.TempDir()
+	runGit(t, other, "clone", origin, ".")
+	runGit(t, other, "config", "user.name", "Other Contributor")
+	runGit(t, other, "config", "user.email", "other@example.com")
+	runGit(t, other, "checkout", baseBranch)
+
+	if err := os.WriteFile(filepath.Join(other, filename), []byte(content), 0o644); err != nil {
+		t.Fatalf("writing %s: %v", filename, err)
+	}
+	runGit(t, other, "add", filename)
+	runGit(t, other, "commit", "-m", "merged: "+filename)
+	runGit(t, other, "push", "origin", baseBranch)
+}
+
+// TestEnsureDocsWorktree_CutsFromRemoteBaseNotStaleLocal asserts the Scribe
+// lane's docs worktree is cut from origin/<base> (the just-merged state),
+// after fetching -- NOT from the primary clone's own possibly-stale local
+// base. This is the regression test for the scribe non-fast-forward push bug:
+// the Scribe previously reused the Coder's already-merged branch (whose remote
+// tip gitops had advanced via update-branch/squash-merge), so its docs push
+// was rejected non-fast-forward. A fresh docs branch off origin/<base> both
+// carries the merged change (so the Scribe can document it) and has no remote
+// counterpart yet (so its first push is always a clean fast-forward).
+func TestEnsureDocsWorktree_CutsFromRemoteBaseNotStaleLocal(t *testing.T) {
+	primary, origin := newPrimaryRepoWithRemote(t, "main")
+	worktreeRoot := t.TempDir()
+
+	// A merge lands on origin/main from elsewhere; the primary has not fetched
+	// it, so its local main is stale.
+	pushCommitToOrigin(t, origin, "main", "HELLO.md", "hi\n")
+
+	path, err := spawn.EnsureDocsWorktree(ctxWithTimeout(t), primary, "clp-1-add-widget-docs", "main", worktreeRoot)
+	if err != nil {
+		t.Fatalf("EnsureDocsWorktree: unexpected error: %v", err)
+	}
+
+	if got := currentBranch(t, path); got != "clp-1-add-widget-docs" {
+		t.Errorf("checked-out branch = %q, want %q", got, "clp-1-add-widget-docs")
+	}
+	// The merged file must be present: this proves the docs branch was cut from
+	// origin/main (post-merge), not from the primary's stale local main.
+	if _, statErr := os.Stat(filepath.Join(path, "HELLO.md")); statErr != nil {
+		t.Errorf("HELLO.md missing from docs worktree: it was not cut from origin/main: %v", statErr)
+	}
+	if !strings.HasPrefix(path, worktreeRoot) {
+		t.Errorf("worktree path %s is not under worktreeRoot %s", path, worktreeRoot)
 	}
 }
 

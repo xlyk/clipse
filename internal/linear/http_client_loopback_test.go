@@ -12,6 +12,14 @@ import (
 	"github.com/xlyk/clipse/internal/linear"
 )
 
+// testTeamKey/testTeamID are the Linear team clipse's loopback tests pretend
+// to operate against — the real values named in the Phase-2 task (team key
+// "CLI"), reused here purely as fixed test constants (no real network).
+const (
+	testTeamKey = "CLI"
+	testTeamID  = "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+)
+
 // newLoopbackClient points an HTTPClient at a local httptest.Server instead
 // of Linear's real API. httptest.Server binds to 127.0.0.1 on an ephemeral
 // port and never leaves the machine, so this stays "zero network" in the
@@ -23,7 +31,7 @@ func newLoopbackClient(t *testing.T, handler http.HandlerFunc) *linear.HTTPClien
 	t.Cleanup(srv.Close)
 
 	t.Setenv("LINEAR_API_KEY", "test-key")
-	c, err := linear.NewHTTPClientWithBaseURL(srv.URL)
+	c, err := linear.NewHTTPClientWithBaseURL(srv.URL, testTeamKey, testTeamID)
 	if err != nil {
 		t.Fatalf("NewHTTPClientWithBaseURL: unexpected error: %v", err)
 	}
@@ -34,7 +42,7 @@ func TestNewHTTPClient_MissingAPIKey(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "")
 	os.Unsetenv("LINEAR_API_KEY")
 
-	_, err := linear.NewHTTPClient()
+	_, err := linear.NewHTTPClient(testTeamKey, testTeamID)
 	if err == nil {
 		t.Fatal("NewHTTPClient: expected error when LINEAR_API_KEY is unset, got nil")
 	}
@@ -46,9 +54,15 @@ func TestHTTPClient_CandidateIssues_ParsesLoopbackResponse(t *testing.T) {
 		t.Fatalf("reading fixture: %v", err)
 	}
 
+	var gotBody []byte
 	c := newLoopbackClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "test-key" {
 			t.Errorf("Authorization header = %q, want %q", got, "test-key")
+		}
+		var err error
+		gotBody, err = readAll(r)
+		if err != nil {
+			t.Fatalf("reading request body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(fixture)
@@ -61,29 +75,35 @@ func TestHTTPClient_CandidateIssues_ParsesLoopbackResponse(t *testing.T) {
 	if len(issues) != 4 {
 		t.Fatalf("len(issues) = %d, want 4", len(issues))
 	}
-}
 
-func TestHTTPClient_SetState_SendsExactBody(t *testing.T) {
-	var gotBody []byte
-	c := newLoopbackClient(t, func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		gotBody, err = readAll(r)
-		if err != nil {
-			t.Fatalf("reading request body: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"data":{"issueUpdate":{"success":true}}}`))
-	})
-
-	if err := c.SetState(context.Background(), "issue-1", "state-1"); err != nil {
-		t.Fatalf("SetState: unexpected error: %v", err)
-	}
-
-	want, err := linear.BuildSetStateRequest("issue-1", "state-1")
+	// The candidate-issues query must filter to the client's configured
+	// team, not the whole Linear workspace.
+	want, err := linear.BuildCandidateIssuesRequest(testTeamKey)
 	if err != nil {
-		t.Fatalf("BuildSetStateRequest: unexpected error: %v", err)
+		t.Fatalf("BuildCandidateIssuesRequest: unexpected error: %v", err)
 	}
 	assertJSONEqual(t, gotBody, want)
+
+	// title/description must round-trip end to end through the real
+	// HTTPClient (query -> loopback response -> NormalizeCandidateIssues),
+	// not just through NormalizeCandidateIssues in isolation -- this is the
+	// worker's task text (CLIPSE_ISSUE_TEXT), so a query missing these
+	// fields would silently empty it in production.
+	var got12 *linear.Issue
+	for i := range issues {
+		if issues[i].Identifier == "CLP-12" {
+			got12 = &issues[i]
+		}
+	}
+	if got12 == nil {
+		t.Fatalf("issues = %+v, want an entry for CLP-12", issues)
+	}
+	if got12.Title != "Add the thing" {
+		t.Errorf("CLP-12 Title = %q, want %q", got12.Title, "Add the thing")
+	}
+	if got12.Description != "Implement the thing that does the stuff." {
+		t.Errorf("CLP-12 Description = %q, want %q", got12.Description, "Implement the thing that does the stuff.")
+	}
 }
 
 func TestHTTPClient_Comment_SendsExactBody(t *testing.T) {
@@ -113,12 +133,15 @@ func TestHTTPClient_GraphQLErrors_ReturnsError(t *testing.T) {
 	c := newLoopbackClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		resp, _ := json.Marshal(map[string]any{
-			"errors": []map[string]any{{"message": "issue not found"}},
+			"errors": []map[string]any{{"message": "team not found"}},
 		})
 		w.Write(resp)
 	})
 
-	err := c.SetState(context.Background(), "missing-issue", "state-1")
+	// SetState's first network call is always the workflow-states query
+	// (resolving "review" -> a state id), so a graphql-level error there
+	// must propagate just like it would from the mutation itself.
+	err := c.SetState(context.Background(), "missing-issue", "review")
 	if err == nil {
 		t.Fatal("SetState: expected error for graphql-level error response, got nil")
 	}

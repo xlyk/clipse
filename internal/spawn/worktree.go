@@ -22,6 +22,52 @@ import (
 // local branch off baseBranch when branch doesn't already exist locally, or
 // checking out the existing local branch into the new worktree otherwise.
 func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, worktreeRoot string) (string, error) {
+	return ensureWorktreeFrom(ctx, primaryClonePath, branch, baseBranch, worktreeRoot)
+}
+
+// EnsureDocsWorktree is the Scribe lane's worktree primitive: it creates (or
+// reuses) a worktree for a documentation branch cut fresh from the tip of
+// origin/<baseBranch> -- the just-merged state -- fetching origin first so that
+// tip reflects the merge the Scribe is documenting rather than the primary
+// clone's possibly-stale local base.
+//
+// It must NOT reuse or branch from the Coder's own branch: by the time the
+// Scribe runs, gitops has squash-merged (and often update-branch'd) that
+// branch, so its remote tip has advanced past whatever the local worktree
+// holds -- committing docs onto it and pushing fails non-fast-forward (the
+// exact bug this exists to prevent). A brand-new docs branch off origin/<base>
+// instead has no remote counterpart yet, so its first push is always a clean
+// fast-forward, while still carrying the merged change so the Scribe can
+// inspect and document it.
+func EnsureDocsWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, worktreeRoot string) (string, error) {
+	// Reuse short-circuits before the fetch: a re-run's docs worktree already
+	// exists on disk (and its branch already exists on the remote from the
+	// prior turn's push), so re-fetching/re-basing would be both wasteful and
+	// wrong -- ensureWorktreeFrom's own reuse check handles it, but fetching
+	// only matters when we are about to create the branch below.
+	path := worktreePathFor(worktreeRoot, branch)
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("checking for existing docs worktree at %s: %w", path, err)
+	}
+
+	// Fetch so origin/<base> reflects the merge the Scribe documents. A branch
+	// that already exists locally (a prior turn) is checked out as-is by
+	// ensureWorktreeFrom, so the fetch only feeds the origin/<base> start point
+	// used when the branch is created for the first time.
+	if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", baseBranch); err != nil {
+		return "", fmt.Errorf("fetching origin/%s for docs worktree: %w", baseBranch, err)
+	}
+	return ensureWorktreeFrom(ctx, primaryClonePath, branch, "origin/"+baseBranch, worktreeRoot)
+}
+
+// ensureWorktreeFrom is the shared body behind EnsureWorktree (startPoint =
+// the local base branch) and EnsureDocsWorktree (startPoint = origin/<base>):
+// reuse an existing worktree for branch if present, else create one, branching
+// a new local branch off startPoint when branch doesn't already exist locally,
+// or checking out the existing local branch otherwise.
+func ensureWorktreeFrom(ctx context.Context, primaryClonePath, branch, startPoint, worktreeRoot string) (string, error) {
 	path := worktreePathFor(worktreeRoot, branch)
 
 	if _, err := os.Stat(path); err == nil {
@@ -46,10 +92,25 @@ func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, w
 	if branchExistsLocally {
 		args = []string{"worktree", "add", path, branch}
 	} else {
-		args = []string{"worktree", "add", "-b", branch, path, baseBranch}
+		args = []string{"worktree", "add", "-b", branch, path, startPoint}
 	}
 	if err := runGitCmd(ctx, primaryClonePath, args...); err != nil {
-		return "", fmt.Errorf("creating worktree for branch %s at %s: %w", branch, path, err)
+		if !isMissingButRegisteredWorktreeErr(err) {
+			return "", fmt.Errorf("creating worktree for branch %s at %s: %w", branch, path, err)
+		}
+		// The target directory was removed directly (e.g. os.RemoveAll,
+		// bypassing RemoveWorktree/`git worktree remove`), but git's own
+		// .git/worktrees administrative metadata still claims path, so the
+		// add above fails with "is a missing but already registered
+		// worktree" every time until that stale registration is pruned.
+		// Prune once and retry the exact same add; a failure past that point
+		// is a real error, not this recoverable collision.
+		if pruneErr := runGitCmd(ctx, primaryClonePath, "worktree", "prune"); pruneErr != nil {
+			return "", fmt.Errorf("pruning stale worktree registrations for branch %s at %s: %w", branch, path, pruneErr)
+		}
+		if retryErr := runGitCmd(ctx, primaryClonePath, args...); retryErr != nil {
+			return "", fmt.Errorf("creating worktree for branch %s at %s (retry after prune): %w", branch, path, retryErr)
+		}
 	}
 
 	return path, nil
@@ -111,6 +172,16 @@ func runGitCmd(ctx context.Context, dir string, args ...string) error {
 		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// isMissingButRegisteredWorktreeErr reports whether a `git worktree add`
+// failure is git's "missing but already registered worktree" error (exit
+// 128): the target path's on-disk directory is gone, but git's own
+// .git/worktrees metadata still has it registered, so EnsureWorktree can
+// recover by pruning that stale registration and retrying once, rather than
+// treating this the same as any other add failure.
+func isMissingButRegisteredWorktreeErr(err error) bool {
+	return strings.Contains(err.Error(), "is a missing but already registered worktree")
 }
 
 // isAlreadyGoneWorktreeErr reports whether a `git worktree remove` failure

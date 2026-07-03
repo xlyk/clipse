@@ -54,7 +54,15 @@ func TestNormalizeCandidateIssues_FromFixture(t *testing.T) {
 		}
 	})
 
-	t.Run("deps parsed from blocks/blocked-by relations", func(t *testing.T) {
+	// A dependency of X is an issue that BLOCKS X. In Linear's canonical data
+	// model a blocking relationship is one record on the *blocker's* source
+	// side (type "blocks", relatedIssue = the blocked issue); from the blocked
+	// issue's perspective it appears in inverseRelations (type "blocks", issue
+	// = the blocker). So Deps are read from inverseRelations, NOT the
+	// source-side `relations` the query used to fetch — that inverted the
+	// direction (a dependent looked dependency-free and promoted immediately,
+	// while its blocker waited on it), which the live smoke exposed.
+	t.Run("deps parsed from inverse blocks relations (the blockers)", func(t *testing.T) {
 		got := byIdentifier["CLP-12"]
 		wantDeps := []string{"22222222-2222-2222-2222-222222222222"}
 		if len(got.Deps) != len(wantDeps) || got.Deps[0] != wantDeps[0] {
@@ -71,6 +79,14 @@ func TestNormalizeCandidateIssues_FromFixture(t *testing.T) {
 		if len(got13.Deps) != 0 {
 			t.Errorf("CLP-13 Deps = %v, want empty", got13.Deps)
 		}
+
+		// CLP-15's only inverse relation is "related", not "blocks" — a
+		// related/duplicate/similar link is not a dependency, so it must not
+		// gate promotion.
+		got15 := byIdentifier["CLP-15"]
+		if len(got15.Deps) != 0 {
+			t.Errorf("CLP-15 Deps = %v, want empty (a 'related' link is not a blocker)", got15.Deps)
+		}
 	})
 
 	t.Run("priority, branch name, id, identifier populated", func(t *testing.T) {
@@ -86,6 +102,26 @@ func TestNormalizeCandidateIssues_FromFixture(t *testing.T) {
 		}
 		if got.UpdatedAt != 1782907200 {
 			t.Errorf("UpdatedAt = %d, want unix %d", got.UpdatedAt, 1782907200)
+		}
+	})
+
+	t.Run("title and description parsed", func(t *testing.T) {
+		got := byIdentifier["CLP-12"]
+		if got.Title != "Add the thing" {
+			t.Errorf("Title = %q, want %q", got.Title, "Add the thing")
+		}
+		if got.Description != "Implement the thing that does the stuff." {
+			t.Errorf("Description = %q, want %q", got.Description, "Implement the thing that does the stuff.")
+		}
+
+		// CLP-13's fixture description is an explicit empty string -- must
+		// parse as "", not be mistaken for a missing/omitted field.
+		got13 := byIdentifier["CLP-13"]
+		if got13.Title != "Review the thing" {
+			t.Errorf("CLP-13 Title = %q, want %q", got13.Title, "Review the thing")
+		}
+		if got13.Description != "" {
+			t.Errorf("CLP-13 Description = %q, want empty", got13.Description)
 		}
 	})
 

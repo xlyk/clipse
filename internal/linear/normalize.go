@@ -19,12 +19,14 @@ type candidateIssuesResponse struct {
 
 // issueNode mirrors one issue node as shaped by candidateIssuesQuery.
 type issueNode struct {
-	ID         string `json:"id"`
-	Identifier string `json:"identifier"`
-	Priority   int    `json:"priority"`
-	BranchName string `json:"branchName"`
-	UpdatedAt  string `json:"updatedAt"`
-	State      struct {
+	ID          string `json:"id"`
+	Identifier  string `json:"identifier"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Priority    int    `json:"priority"`
+	BranchName  string `json:"branchName"`
+	UpdatedAt   string `json:"updatedAt"`
+	State       struct {
 		Name string `json:"name"`
 	} `json:"state"`
 	Labels struct {
@@ -32,14 +34,20 @@ type issueNode struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
 	} `json:"labels"`
-	Relations struct {
+	// InverseRelations, not Relations: a dependency of this issue is an issue
+	// that BLOCKS it. Linear stores a blocking relationship as one record on
+	// the blocker's source side (type "blocks"), so from the blocked issue's
+	// perspective it surfaces here in inverseRelations, with `issue` being the
+	// blocker. Reading the source-side `relations` instead inverted the whole
+	// dependency graph (see normalizeIssueNode).
+	InverseRelations struct {
 		Nodes []struct {
-			Type         string `json:"type"`
-			RelatedIssue struct {
+			Type  string `json:"type"`
+			Issue struct {
 				ID string `json:"id"`
-			} `json:"relatedIssue"`
+			} `json:"issue"`
 		} `json:"nodes"`
-	} `json:"relations"`
+	} `json:"inverseRelations"`
 }
 
 // NormalizeCandidateIssues parses a candidate-issues GraphQL response body
@@ -71,11 +79,14 @@ func normalizeIssueNode(n issueNode) (Issue, error) {
 		labelNames = append(labelNames, l.Name)
 	}
 
-	deps := make([]string, 0, len(n.Relations.Nodes))
-	for _, r := range n.Relations.Nodes {
-		switch r.Type {
-		case "blocks", "blocked-by":
-			deps = append(deps, r.RelatedIssue.ID)
+	// Deps = the issues that block this one. Only a "blocks" inverse relation
+	// is a dependency; "related"/"duplicate"/"similar" links are not and must
+	// not gate promotion. r.Issue is the blocker (the source of the blocks
+	// relation), which is exactly the issue this one must wait on.
+	deps := make([]string, 0, len(n.InverseRelations.Nodes))
+	for _, r := range n.InverseRelations.Nodes {
+		if r.Type == "blocks" {
+			deps = append(deps, r.Issue.ID)
 		}
 	}
 
@@ -85,13 +96,15 @@ func normalizeIssueNode(n issueNode) (Issue, error) {
 	}
 
 	return Issue{
-		ID:         n.ID,
-		Identifier: n.Identifier,
-		Status:     statusFromWorkflowName(n.State.Name),
-		Lane:       laneFromLabels(labelNames),
-		Deps:       deps,
-		Priority:   n.Priority,
-		BranchName: n.BranchName,
-		UpdatedAt:  updatedAt.Unix(),
+		ID:          n.ID,
+		Identifier:  n.Identifier,
+		Title:       n.Title,
+		Description: n.Description,
+		Status:      statusFromWorkflowName(n.State.Name),
+		Lane:        laneFromLabels(labelNames),
+		Deps:        deps,
+		Priority:    n.Priority,
+		BranchName:  n.BranchName,
+		UpdatedAt:   updatedAt.Unix(),
 	}, nil
 }

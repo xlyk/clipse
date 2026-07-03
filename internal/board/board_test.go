@@ -63,6 +63,13 @@ var legalTransitions = []legalCase{
 	// Merging: Git-operator lane lands the PR.
 	{outcome: "done", current: "merging", next: "documentation", action: ActionDocument},
 	{outcome: "blocked", current: "merging", next: "blocked", action: ActionCommentBlock},
+	// Merging -> Rework: the Git-operator lane's stale-base-conflict route
+	// (internal/gitops.OutcomeStaleBaseConflict maps to changes_requested
+	// from merging, the only board.Next entry that lands on rework from
+	// this column) -- a base update landed a real, unresolvable conflict,
+	// so the Coder lane gets another attempt rather than parking the issue
+	// in Blocked outright.
+	{outcome: "changes_requested", current: "merging", next: "rework", action: ActionRequestChanges},
 
 	// Documentation: Scribe lane writes docs (or no-ops).
 	{outcome: "done", current: "documentation", next: "done", action: ActionComplete},

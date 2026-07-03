@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -63,21 +66,53 @@ func runTUI(cmd *cobra.Command, boardDir string) error {
 		}
 	}()
 
+	lockPath := filepath.Join(boardDir, "clipse.lock")
 	refresh := func() tea.Msg {
 		snap, err := st.ReadSnapshot(context.Background())
 		if err != nil {
 			return tui.ErrMsg{Err: fmt.Errorf("reading snapshot: %w", err)}
 		}
-		return tui.SnapshotMsg{Snap: snap}
+		// Liveness is I/O (reading the lockfile), so it lives here in the
+		// refresh command rather than in the pure Update.
+		return tui.SnapshotMsg{Snap: snap, Live: dispatcherLive(lockPath)}
 	}
 
 	model := tui.NewModel(tui.WithRefreshCmd(refresh))
 
-	program := tea.NewProgram(programModel{model})
+	// WithAltScreen takes over the whole terminal (alternate screen buffer):
+	// the dashboard renders fullscreen, never bleeds into scrollback, and the
+	// terminal is restored on quit. It also fully repaints each frame, which
+	// eliminates the inline renderer's line-diff residue (stale cells from a
+	// taller/wider previous frame — e.g. the kanban columns — stranded behind
+	// a shorter one). WithMouseCellMotion lets the wheel scroll the viewports.
+	program := tea.NewProgram(programModel{model}, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running tui: %w", err)
 	}
 	return nil
+}
+
+// dispatcherLive reports whether a clipse dispatcher is currently running,
+// the authoritative "the pipeline is live" signal. It reads the PID the
+// dispatcher records in its singleton lockfile (see
+// dispatcher.AcquireSingleton) and probes that process with signal 0. Reading
+// is passive — unlike acquiring the flock, it cannot race a starting
+// dispatcher into an ErrAlreadyRunning failure. A missing/empty/garbled
+// lockfile, or a PID that no longer exists, all read as not-live.
+func dispatcherLive(lockPath string) bool {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	// signal 0 delivers nothing but still resolves the target: nil ⇒ the
+	// process is alive; EPERM ⇒ it exists but is owned by another user (still
+	// alive); ESRCH ⇒ it is gone.
+	err = syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // programModel adapts tui.Model to the tea.Model interface. tea.Model.Update

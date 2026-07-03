@@ -42,6 +42,36 @@ func statusFromWorkflowName(name string) string {
 	return "todo"
 }
 
+// canonicalWorkflowNameByColumn is the (single-valued) inverse of
+// statusByWorkflowName, keyed by the bare board Column string (e.g.
+// "review"): it names the one canonical Linear workflow-state NAME
+// HTTPClient.SetState resolves that column to when moving a card (see
+// state_resolver.go). Several Linear state names can fold onto the same
+// Column (e.g. "todo" and "backlog" both mean "todo"), so inverting
+// statusByWorkflowName mechanically would be ambiguous; this map picks one
+// canonical name per column instead. Keep in sync with statusByWorkflowName
+// and the workflow states actually configured on the Linear team driving
+// Clipse.
+var canonicalWorkflowNameByColumn = map[string]string{
+	"todo":          "Todo",
+	"ready":         "Ready",
+	"running":       "Running",
+	"review":        "Review",
+	"merging":       "Merging",
+	"documentation": "Documentation",
+	"done":          "Done",
+	"rework":        "Rework",
+	"blocked":       "Blocked",
+}
+
+// canonicalWorkflowName returns the canonical Linear workflow-state name for
+// column (a bare board Column string, e.g. "review"), and whether column
+// was recognized as one of our board columns.
+func canonicalWorkflowName(column string) (string, bool) {
+	name, ok := canonicalWorkflowNameByColumn[column]
+	return name, ok
+}
+
 // laneFromLabels scans Linear label names for an "agent:<lane>" label and
 // returns the bare lane with the prefix stripped. Returns "" if no such
 // label is present; callers must treat that as "no lane assigned" rather

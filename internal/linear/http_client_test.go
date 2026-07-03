@@ -2,6 +2,7 @@ package linear_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/xlyk/clipse/internal/linear"
@@ -14,7 +15,7 @@ type gqlRequest struct {
 }
 
 func TestBuildCandidateIssuesRequest(t *testing.T) {
-	body, err := linear.BuildCandidateIssuesRequest()
+	body, err := linear.BuildCandidateIssuesRequest("CLI")
 	if err != nil {
 		t.Fatalf("BuildCandidateIssuesRequest: unexpected error: %v", err)
 	}
@@ -27,9 +28,32 @@ func TestBuildCandidateIssuesRequest(t *testing.T) {
 	if req.Query != linear.CandidateIssuesQuery {
 		t.Errorf("Query = %q, want the exact candidate-issues query", req.Query)
 	}
-	if len(req.Variables) != 0 {
-		t.Errorf("Variables = %v, want empty (query takes no variables)", req.Variables)
+	// Deps must come from inverseRelations (the issues that block this one),
+	// not the source-side `relations` (the issues this one blocks) — reading
+	// the latter inverts the dependency graph on the live board.
+	if !strings.Contains(linear.CandidateIssuesQuery, "inverseRelations") {
+		t.Errorf("candidate query must fetch inverseRelations for dependency edges")
 	}
+	wantVars := map[string]any{"teamKey": "CLI"}
+	if len(req.Variables) != len(wantVars) || req.Variables["teamKey"] != wantVars["teamKey"] {
+		t.Errorf("Variables = %v, want %v (query filters to the configured team)", req.Variables, wantVars)
+	}
+}
+
+func TestBuildTeamWorkflowStatesRequest_ExactPayload(t *testing.T) {
+	body, err := linear.BuildTeamWorkflowStatesRequest("team-123")
+	if err != nil {
+		t.Fatalf("BuildTeamWorkflowStatesRequest: unexpected error: %v", err)
+	}
+
+	want := mustMarshal(t, gqlRequest{
+		Query: linear.TeamWorkflowStatesQuery,
+		Variables: map[string]any{
+			"teamId": "team-123",
+		},
+	})
+
+	assertJSONEqual(t, body, want)
 }
 
 func TestBuildSetStateRequest_ExactPayload(t *testing.T) {

@@ -30,7 +30,7 @@ func TestTick_PollCachesCandidatesFromLinear(t *testing.T) {
 	s := openTestStore(t)
 	lc := &linear.MockClient{
 		Issues: []linear.Issue{
-			{ID: "issue-1", Identifier: "CLP-1", Status: "ready", Lane: "coder", Priority: 1, BranchName: "clp-1", UpdatedAt: 100},
+			{ID: "issue-1", Identifier: "CLP-1", Title: "Add the thing", Description: "Implement the thing.", Status: "ready", Lane: "coder", Priority: 1, BranchName: "clp-1", UpdatedAt: 100},
 			{ID: "issue-2", Identifier: "CLP-2", Status: "todo", Lane: "", Deps: []string{"issue-1"}, Priority: 0, BranchName: "clp-2", UpdatedAt: 200},
 		},
 	}
@@ -65,6 +65,21 @@ func TestTick_PollCachesCandidatesFromLinear(t *testing.T) {
 	}
 	if byLane["issue-2"] != "" {
 		t.Errorf("issue-2 lane_label = %q, want empty", byLane["issue-2"])
+	}
+
+	// title/description must flow from Linear into the store (Phase-2
+	// issue-text plumbing): this is what lets a later claim carry them into
+	// the worker's CLIPSE_ISSUE_TEXT. ReadSnapshot's Issue projection
+	// doesn't select these columns, so read back via GetIssue instead.
+	got1, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue(issue-1): unexpected error: %v", err)
+	}
+	if got1.Title != "Add the thing" {
+		t.Errorf("issue-1 Title = %q, want %q", got1.Title, "Add the thing")
+	}
+	if got1.Description != "Implement the thing." {
+		t.Errorf("issue-1 Description = %q, want %q", got1.Description, "Implement the thing.")
 	}
 }
 
@@ -197,6 +212,113 @@ func TestTick_PollAdoptsHumanMoveWhenUnclaimed(t *testing.T) {
 	}
 	if got2.BoardStatus != "running" {
 		t.Errorf("BoardStatus after second tick = %q, want running (adopted issue was claimable)", got2.BoardStatus)
+	}
+}
+
+// TestTick_PollAdoptsHumanRequeueFromBlocked_ResetsReworkCount asserts the
+// fix for a stale rework_count surviving a human requeue: adopting a
+// blocked->ready move (A3, unclaimed) resets issues.rework_count to zero.
+// Without this, an issue blocked after tripping amendment C1's rework_cap
+// keeps whatever rework_count it accumulated on its PRIOR review/rework
+// cycle, so a human's very next requeue could immediately re-trip
+// blockIfReworkCapExceeded on the first subsequent changes_requested —
+// defeating the point of requeuing it by hand.
+func TestTick_PollAdoptsHumanRequeueFromBlocked_ResetsReworkCount(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// Seed issue-1 as 'blocked' with a stale rework_count left over from a
+	// prior rework-cap trip, and no active claim.
+	issue := store.Issue{
+		ID:          "issue-1",
+		Identifier:  "CLP-1",
+		LaneLabel:   "coder",
+		BoardStatus: "blocked",
+		ReworkCount: 3,
+		Deps:        `[]`,
+		Priority:    1,
+		BranchName:  "issue-1-branch",
+		UpdatedAt:   100,
+		LastSeen:    100,
+		CreatedAt:   100,
+	}
+	if err := s.UpsertIssue(ctx, issue); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	// A human moved the issue back to Ready in Linear.
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			{ID: "issue-1", Identifier: "CLP-1", Status: "ready", Lane: "coder", Priority: 1, BranchName: "issue-1-branch", UpdatedAt: 200},
+		},
+	}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Fatalf("BoardStatus = %q, want ready (adopted human move)", got.BoardStatus)
+	}
+	if got.ReworkCount != 0 {
+		t.Errorf("ReworkCount = %d, want reset to 0 on human requeue from blocked", got.ReworkCount)
+	}
+}
+
+// TestTick_PollAdoptsHumanMove_FromNonBlocked_DoesNotResetReworkCount
+// asserts the reset above is scoped to a blocked->{ready,todo} requeue
+// specifically: an ordinary human-adopted move that doesn't originate from
+// Blocked must leave rework_count untouched.
+func TestTick_PollAdoptsHumanMove_FromNonBlocked_DoesNotResetReworkCount(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	issue := store.Issue{
+		ID:          "issue-1",
+		Identifier:  "CLP-1",
+		LaneLabel:   "coder",
+		BoardStatus: "todo",
+		ReworkCount: 2,
+		Deps:        `[]`,
+		Priority:    1,
+		BranchName:  "issue-1-branch",
+		UpdatedAt:   100,
+		LastSeen:    100,
+		CreatedAt:   100,
+	}
+	if err := s.UpsertIssue(ctx, issue); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			{ID: "issue-1", Identifier: "CLP-1", Status: "ready", Lane: "coder", Priority: 1, BranchName: "issue-1-branch", UpdatedAt: 200},
+		},
+	}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Fatalf("BoardStatus = %q, want ready (adopted human move)", got.BoardStatus)
+	}
+	if got.ReworkCount != 2 {
+		t.Errorf("ReworkCount = %d, want unchanged 2 (adoption did not originate from blocked)", got.ReworkCount)
 	}
 }
 

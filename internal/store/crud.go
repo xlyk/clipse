@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -11,12 +12,21 @@ import (
 // issue.
 //
 // Conflict behavior (on a matching id): only the Linear-sourced intent
-// columns (identifier, lane_label, deps, priority, branch_name, updated_at)
-// plus last_seen are overwritten. board_status, claim_lock, and claim_expires
+// columns (identifier, title, description, lane_label, deps, priority,
+// branch_name, updated_at) plus last_seen are overwritten. board_status,
+// rework_count, recover_attempts, blocked_until, claim_lock, and claim_expires
 // are dispatcher-owned runtime state: they are set on the initial insert and
 // never touched on conflict, so a re-poll of Linear can neither clobber an
-// in-flight claim nor reset a dispatcher-driven status (e.g. running/review).
-// created_at is preserved from the original insert.
+// in-flight claim nor reset a dispatcher-driven status (e.g. running/review),
+// its rework_count, or an active auto-retry backoff (recover_attempts /
+// blocked_until) -- see amendment C1 / Transition, the only writer. created_at
+// is preserved from the original insert.
+//
+// title/description round-trip here purely as cached Linear content (the
+// dispatcher's CLIPSE_ISSUE_TEXT env injection reads them off a claimed
+// issue) -- they carry no special claim/board semantics of their own, so an
+// edited Linear title/description simply updates like identifier/priority
+// on every re-poll, even while the issue is running under an active claim.
 //
 // board_status transitions after insert are made only by dispatcher-owned
 // paths (the CAS claim + the state machine, added in later tasks). Reflecting
@@ -25,11 +35,13 @@ import (
 func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 	const q = `
 		INSERT INTO issues (
-			id, identifier, lane_label, board_status, deps, priority,
+			id, identifier, title, description, lane_label, board_status, rework_count, recover_attempts, blocked_until, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET
 			identifier   = excluded.identifier,
+			title        = excluded.title,
+			description  = excluded.description,
 			lane_label   = excluded.lane_label,
 			deps         = excluded.deps,
 			priority     = excluded.priority,
@@ -38,7 +50,7 @@ func (s *Store) UpsertIssue(ctx context.Context, issue Issue) error {
 			last_seen    = excluded.last_seen
 	`
 	_, err := s.db.ExecContext(ctx, q,
-		issue.ID, issue.Identifier, issue.LaneLabel, issue.BoardStatus, issue.Deps, issue.Priority,
+		issue.ID, issue.Identifier, issue.Title, issue.Description, issue.LaneLabel, issue.BoardStatus, issue.ReworkCount, issue.RecoverAttempts, issue.BlockedUntil, issue.Deps, issue.Priority,
 		issue.BranchName, issue.ClaimLock, issue.ClaimExpires, issue.UpdatedAt, issue.LastSeen, issue.CreatedAt,
 	)
 	if err != nil {
@@ -196,7 +208,7 @@ func (s *Store) ListOpenRuns(ctx context.Context) ([]Run, error) {
 // `clipse tui`.
 func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 	const issuesQ = `
-		SELECT id, identifier, lane_label, board_status, deps, priority,
+		SELECT id, identifier, lane_label, board_status, rework_count, recover_attempts, blocked_until, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
 		FROM issues
 		ORDER BY id
@@ -214,7 +226,7 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		for rows.Next() {
 			var is IssueSnapshot
 			if err = rows.Scan(
-				&is.ID, &is.Identifier, &is.LaneLabel, &is.BoardStatus, &is.Deps, &is.Priority,
+				&is.ID, &is.Identifier, &is.LaneLabel, &is.BoardStatus, &is.ReworkCount, &is.RecoverAttempts, &is.BlockedUntil, &is.Deps, &is.Priority,
 				&is.BranchName, &is.ClaimLock, &is.ClaimExpires, &is.UpdatedAt, &is.LastSeen, &is.CreatedAt,
 			); err != nil {
 				return
@@ -238,6 +250,18 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		snap.Issues[i].LatestRun = latest
 	}
 
+	tokensIn, tokensOut, err := s.tokenTotalsByIssue(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	for i := range snap.Issues {
+		id := snap.Issues[i].ID
+		snap.Issues[i].TokensInTotal = tokensIn[id]
+		snap.Issues[i].TokensOutTotal = tokensOut[id]
+		snap.TotalTokensIn += tokensIn[id]
+		snap.TotalTokensOut += tokensOut[id]
+	}
+
 	unmirrored, err := s.unmirroredIssueIDs(ctx)
 	if err != nil {
 		return Snapshot{}, err
@@ -249,7 +273,96 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		}
 	}
 
+	runs, err := s.runsByIssue(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	for i := range snap.Issues {
+		snap.Issues[i].Runs = runs[snap.Issues[i].ID]
+	}
+
+	events, err := s.recentEvents(ctx, recentEventLimit)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snap.RecentEvents = events
+	for _, e := range events {
+		if e.Ts > snap.LastEventAt {
+			snap.LastEventAt = e.Ts
+		}
+	}
+
 	return snap, nil
+}
+
+// recentEventLimit caps how many trailing events ReadSnapshot loads for the
+// TUI activity feed. Small enough to keep the read cheap on a busy board, big
+// enough to fill a feed panel.
+const recentEventLimit = 15
+
+// recentEvents returns the last `limit` events, newest-first (highest id
+// first). Unlike ListEvents (ascending, whole table) this is the tail read the
+// TUI activity feed wants; ordering by id — a monotonic AUTOINCREMENT — is a
+// stable proxy for append order even if two events share a ts.
+func (s *Store) recentEvents(ctx context.Context, limit int) ([]Event, error) {
+	const q = `
+		SELECT id, ts, issue_id, run_id, kind, detail
+		FROM events
+		ORDER BY id DESC
+		LIMIT ?
+	`
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("reading recent events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.ID, &e.Ts, &e.IssueID, &e.RunID, &e.Kind, &e.Detail); err != nil {
+			return nil, fmt.Errorf("scanning recent event row: %w", err)
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating recent event rows: %w", err)
+	}
+	return events, nil
+}
+
+// runsByIssue returns every run grouped by issue id, each issue's slice in
+// chronological order (oldest first, by started_at then run_id). One grouped
+// query rather than a per-issue lookup in ReadSnapshot's loop; an issue with
+// no runs is simply absent from the map (nil slice on lookup).
+func (s *Store) runsByIssue(ctx context.Context) (map[string][]Run, error) {
+	const q = `
+		SELECT run_id, issue_id, lane, worker_pid, proc_started_at, status, started_at, heartbeat_at,
+			attempt, turn_count, thread_id, result_json, error, tokens_in, tokens_out
+		FROM runs
+		ORDER BY issue_id, started_at, run_id
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("reading runs by issue: %w", err)
+	}
+	defer rows.Close()
+
+	byIssue := make(map[string][]Run)
+	for rows.Next() {
+		var r Run
+		if err := rows.Scan(
+			&r.RunID, &r.IssueID, &r.Lane, &r.WorkerPID, &r.ProcStartedAt, &r.Status, &r.StartedAt, &r.HeartbeatAt,
+			&r.Attempt, &r.TurnCount, &r.ThreadID, &r.ResultJSON, &r.Error, &r.TokensIn, &r.TokensOut,
+		); err != nil {
+			return nil, fmt.Errorf("scanning run-by-issue row: %w", err)
+		}
+		byIssue[r.IssueID] = append(byIssue[r.IssueID], r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating run-by-issue rows: %w", err)
+	}
+	return byIssue, nil
 }
 
 // unmirroredIssueIDs returns the set of issue ids that have at least one
@@ -277,19 +390,48 @@ func (s *Store) unmirroredIssueIDs(ctx context.Context) (map[string]bool, error)
 	return ids, nil
 }
 
+// tokenTotalsByIssue returns per-issue cumulative token sums across ALL runs
+// (every lane the issue has passed through), keyed by issue id, via one
+// grouped query rather than a per-issue lookup in ReadSnapshot's loop. A card
+// with no runs yet is simply absent from both maps (zero on lookup).
+func (s *Store) tokenTotalsByIssue(ctx context.Context) (in, out map[string]int, err error) {
+	const q = `SELECT issue_id, COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0) FROM runs GROUP BY issue_id`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading token totals: %w", err)
+	}
+	defer rows.Close()
+
+	in = make(map[string]int)
+	out = make(map[string]int)
+	for rows.Next() {
+		var id string
+		var ti, to int
+		if err := rows.Scan(&id, &ti, &to); err != nil {
+			return nil, nil, fmt.Errorf("scanning token totals row: %w", err)
+		}
+		in[id] = ti
+		out[id] = to
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterating token totals rows: %w", err)
+	}
+	return in, out, nil
+}
+
 // GetIssue fetches the single issue row for id, e.g. so the dispatcher can
 // read an issue's current board_status before computing a board.Next
 // transition without paying for a full ReadSnapshot.
 func (s *Store) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	const q = `
-		SELECT id, identifier, lane_label, board_status, deps, priority,
+		SELECT id, identifier, title, description, lane_label, board_status, rework_count, recover_attempts, blocked_until, deps, priority,
 			branch_name, claim_lock, claim_expires, updated_at, last_seen, created_at
 		FROM issues
 		WHERE id = ?
 	`
 	var issue Issue
 	err := s.db.QueryRowContext(ctx, q, id).Scan(
-		&issue.ID, &issue.Identifier, &issue.LaneLabel, &issue.BoardStatus, &issue.Deps, &issue.Priority,
+		&issue.ID, &issue.Identifier, &issue.Title, &issue.Description, &issue.LaneLabel, &issue.BoardStatus, &issue.ReworkCount, &issue.RecoverAttempts, &issue.BlockedUntil, &issue.Deps, &issue.Priority,
 		&issue.BranchName, &issue.ClaimLock, &issue.ClaimExpires, &issue.UpdatedAt, &issue.LastSeen, &issue.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -324,6 +466,54 @@ func (s *Store) BumpRunTurn(ctx context.Context, runID string) (int, error) {
 		return 0, fmt.Errorf("bumping turn for run %s: reading new turn_count: %w", runID, err)
 	}
 	return newTurn, nil
+}
+
+// LatestReworkFeedback returns the human-readable feedback that most
+// recently routed issueID to the rework column: the summary of the newest
+// run whose status is "changes_requested". That covers both edges the board
+// state machine treats identically (see dispatcher.applyTerminalWorkerOutcome):
+// the Reviewer lane's changes_requested from review, and the Git-operator
+// lane's stale-base-conflict route from merging (dispatcher.applyGitopsResult
+// builds an equivalent changes_requested WorkerResult) -- both close their run
+// with status "changes_requested" and their summary in runs.result_json.
+//
+// The summary is read out of result_json's "summary" field; when result_json
+// is absent or carries an empty summary, runs.error is used as a fallback. It
+// returns "" (and no error) when the issue has never had a changes_requested
+// run, so a fresh Coder claim from ready threads no feedback -- only a
+// re-run claimed out of the rework column does.
+func (s *Store) LatestReworkFeedback(ctx context.Context, issueID string) (string, error) {
+	const q = `
+		SELECT result_json, error
+		FROM runs
+		WHERE issue_id = ? AND status = 'changes_requested'
+		ORDER BY started_at DESC, run_id DESC
+		LIMIT 1
+	`
+	var resultJSON, runErr sql.NullString
+	err := s.db.QueryRowContext(ctx, q, issueID).Scan(&resultJSON, &runErr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading latest rework feedback for issue %s: %w", issueID, err)
+	}
+
+	if resultJSON.Valid && resultJSON.String != "" {
+		var payload struct {
+			Summary string `json:"summary"`
+		}
+		if err := json.Unmarshal([]byte(resultJSON.String), &payload); err != nil {
+			return "", fmt.Errorf("parsing rework feedback result_json for issue %s: %w", issueID, err)
+		}
+		if payload.Summary != "" {
+			return payload.Summary, nil
+		}
+	}
+	if runErr.Valid {
+		return runErr.String, nil
+	}
+	return "", nil
 }
 
 // latestRun returns the most recently started run for issueID, or nil if

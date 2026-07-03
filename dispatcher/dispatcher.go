@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/xlyk/clipse/internal/config"
-	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
@@ -22,8 +24,17 @@ import (
 // spawn.RemoveWorktree; tests substitute a stub that returns a t.TempDir.
 type Workspacer interface {
 	// Ensure returns the workspace directory for issue, creating it if
-	// necessary.
+	// necessary. Used by the Coder/Reviewer lanes and by the inline
+	// Git-operator: all three operate on the issue's own (coder) branch.
 	Ensure(issue store.Issue) (string, error)
+
+	// EnsureDocs returns a workspace for the Scribe lane: a fresh worktree on
+	// a dedicated docs branch, cut from origin/<base> (the just-merged state),
+	// NOT the issue's own already-merged Coder branch. Reusing the Coder
+	// branch here fails non-fast-forward on push once gitops has advanced that
+	// branch's remote tip (update-branch / squash-merge), so the Scribe needs
+	// its own branch with no remote counterpart yet.
+	EnsureDocs(issue store.Issue) (string, error)
 
 	// Remove tears down the workspace for issue. This is the Phase-3
 	// terminal-cleanup primitive: design decision F calls for removing the
@@ -77,6 +88,14 @@ type Dispatcher struct {
 	newRunID func() string
 	envFor   func(issue store.Issue) []string
 
+	// gitOps runs the deterministic Git-operator lane inline for a claimed
+	// "merging" card (design decision J amendment / O: the lane's executor
+	// is kernel code, never a spawned DAC worker). Defaults to
+	// defaultGitOpsRunner (a real gitops.Run call); tests substitute a fake
+	// via WithGitOpsRunner so the merging path never touches a real gh/git
+	// subprocess.
+	gitOps GitOpsRunner
+
 	logger *slog.Logger
 
 	// pollInterval overrides the Tick interval Run uses when set (via
@@ -105,8 +124,10 @@ func WithRunIDGenerator(gen func() string) Option {
 }
 
 // WithEnvFor sets the function used to build a spawned worker's environment
-// for a given issue. Defaults to nil (the worker inherits no extra env
-// beyond whatever the Spawner implementation itself sets).
+// for a given issue, overriding New's default (see defaultEnvFor). Tests use
+// this to substitute a fixed or scenario-specific environment (e.g. to drive
+// testworker's TESTWORKER_SCENARIO directly) without going through
+// cfg.EnvAllowlist.
 func WithEnvFor(envFor func(issue store.Issue) []string) Option {
 	return func(d *Dispatcher) { d.envFor = envFor }
 }
@@ -115,6 +136,13 @@ func WithEnvFor(envFor func(issue store.Issue) []string) Option {
 // logging.
 func WithLogger(logger *slog.Logger) Option {
 	return func(d *Dispatcher) { d.logger = logger }
+}
+
+// WithGitOpsRunner overrides the default Git-operator lane executor (see
+// Dispatcher.gitOps). Tests use this to substitute a fake that returns
+// scripted gitops.Result values instead of running gh/git for real.
+func WithGitOpsRunner(fn GitOpsRunner) Option {
+	return func(d *Dispatcher) { d.gitOps = fn }
 }
 
 // WithResultsBuffer overrides the default results channel buffer size.
@@ -130,7 +158,8 @@ const defaultResultsBuffer = 256
 
 // New constructs a Dispatcher from its required dependencies, applying any
 // Options on top of the defaults (a real time.Now clock, a crypto/rand hex
-// run id generator, no extra worker env, and slog.Default()).
+// run id generator, an allow-listed worker env per defaultEnvFor, and
+// slog.Default()).
 func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spawner, ws Workspacer, opts ...Option) *Dispatcher {
 	d := &Dispatcher{
 		cfg:      cfg,
@@ -140,6 +169,8 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 		ws:       ws,
 		now:      func() int64 { return time.Now().Unix() },
 		newRunID: newRandomRunID,
+		envFor:   defaultEnvFor(cfg.EnvAllowlist),
+		gitOps:   defaultGitOpsRunner,
 		logger:   slog.Default(),
 		results:  make(chan runResult, defaultResultsBuffer),
 		inflight: make(map[string]inflightRun),
@@ -148,6 +179,61 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 		opt(d)
 	}
 	return d
+}
+
+// defaultEnvFor is New's default envFor, overridable via WithEnvFor: it
+// returns the dispatcher's own environment filtered down to allowlist via
+// spawn.AllowlistedEnv (config.Config.EnvAllowlist — Phase 2 has no
+// per-lane secret differences yet), plus one dispatcher-computed addition:
+// CLIPSE_ISSUE_TEXT, set from issue's own title/description (see issueText).
+// The filtered env is what keeps a spawned worker from ever inheriting
+// LINEAR_API_KEY or anything else the dispatcher process holds that isn't
+// explicitly allow-listed (design doc threat model, B3) — closing the gap
+// where an unset envFor previously left WorkerSpec.Env nil, which
+// exec.Cmd.Env treats as "inherit everything". CLIPSE_ISSUE_TEXT closes a
+// second gap: it's not copied from the dispatcher's own environment at all
+// (an allowlist entry could never produce it), so it's appended unconditionally
+// rather than run through AllowlistedEnv — otherwise the Coder lane's
+// graphs/coder.py load_context has no task text to give the DAC agent and
+// every run fails with "user messages must have non-empty content".
+func defaultEnvFor(allowlist []string) func(store.Issue) []string {
+	return func(issue store.Issue) []string {
+		env := spawn.AllowlistedEnv(os.Environ(), allowlist)
+		return append(env, clipseIssueTextEnvVar+"="+issueText(issue))
+	}
+}
+
+// clipseIssueTextEnvVar is the environment variable the Coder lane's
+// graphs/coder.py load_context falls back to reading
+// (os.environ.get("CLIPSE_ISSUE_TEXT", "")) when the worker invocation
+// didn't pass issue_text directly — which worker.py never does, so this env
+// var is the ONLY production path that gets an issue's task text to the
+// worker.
+const clipseIssueTextEnvVar = "CLIPSE_ISSUE_TEXT"
+
+// clipseReviewFeedbackEnvVar carries the most recent review/rework feedback
+// into a Coder lane re-run claimed out of the rework column: the summary of
+// the run that routed the card there (a Reviewer's changes_requested, or a
+// Git-operator stale-base conflict -- see store.LatestReworkFeedback).
+// graphs/coder.py load_context folds it into the DAC prompt so the Coder
+// actually acts on the feedback instead of re-emitting a byte-identical diff.
+// Like CLIPSE_ISSUE_TEXT it is injected directly by the dispatcher at spawn
+// time (spawnAttempt), never sourced from the host environment, so it bypasses
+// the EnvAllowlist scrubbing entirely; a fresh coder claim from ready never
+// sets it.
+const clipseReviewFeedbackEnvVar = "CLIPSE_REVIEW_FEEDBACK"
+
+// issueText composes the worker-facing task text for issue: its title, plus
+// a blank-line-separated description when non-empty (just the title
+// otherwise). Trailing whitespace is stripped so a Linear issue with a
+// trailing newline in its description doesn't leak one into the env var's
+// value.
+func issueText(issue store.Issue) string {
+	text := issue.Title
+	if issue.Description != "" {
+		text += "\n\n" + issue.Description
+	}
+	return strings.TrimRightFunc(text, unicode.IsSpace)
 }
 
 // newRandomRunID generates a unique run id via crypto/rand: 16 random bytes
@@ -190,24 +276,6 @@ func (d *Dispatcher) Tick(ctx context.Context) error {
 		return fmt.Errorf("tick: drain outbox: %w", err)
 	}
 	return nil
-}
-
-// laneCaps returns the ordered set of lanes the dispatcher schedules, paired
-// with each lane's configured per-lane cap. The bare lane values (e.g.
-// "coder") are what issues.lane_label / runs.lane store, per the store
-// package's documented convention — NOT the "agent:coder" Linear label.
-func (d *Dispatcher) laneCaps() []laneCap {
-	return []laneCap{
-		{lane: string(contract.LaneCoder), cap: d.cfg.Caps.PerLane.Coder},
-		{lane: string(contract.LaneReviewer), cap: d.cfg.Caps.PerLane.Reviewer},
-		{lane: string(contract.LaneGitOperator), cap: d.cfg.Caps.PerLane.GitOperator},
-		{lane: string(contract.LaneScribe), cap: d.cfg.Caps.PerLane.Scribe},
-	}
-}
-
-type laneCap struct {
-	lane string
-	cap  int
 }
 
 // inflightLaneCounts returns the current in-flight run count, both globally

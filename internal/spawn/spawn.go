@@ -36,8 +36,11 @@ var (
 // WorkerSpec describes one worker invocation: the issue/lane/run/thread
 // identifiers the worker binary receives as flags, the worktree it runs in,
 // and its environment. Env is the full, explicit environment the process
-// gets (exec.Cmd.Env semantics) — the dispatcher (or a future lane-scoped
-// allow-list, see Phase 2's env-scrubbing note) decides what's in it.
+// gets (exec.Cmd.Env semantics) — the caller decides what's in it. The
+// dispatcher's default builds Env from an explicit allow-list
+// (config.Config.EnvAllowlist, filtered via AllowlistedEnv) rather than its
+// own os.Environ(), so a worker never inherits secrets like LINEAR_API_KEY
+// that aren't explicitly allow-listed (design doc threat model, B3).
 type WorkerSpec struct {
 	Issue     string
 	Lane      string
@@ -45,6 +48,22 @@ type WorkerSpec struct {
 	ThreadID  string
 	Workspace string
 	Env       []string
+
+	// CheckpointDB is the absolute path to this issue's LangGraph
+	// checkpointer SQLite database (design doc: one file per issue, outside
+	// any git worktree — see dispatcher.checkpointDBPath). The kernel owns
+	// this path, not the worker (Phase 2 plan item: "the kernel owns paths,
+	// not worker-side convention"). Optional: LocalSpawner appends
+	// --checkpoint-db=<value> only when this is non-empty, so callers that
+	// have no checkpoints directory configured (e.g. hand-built test
+	// Configs that bypass config.Load) simply omit the flag.
+	CheckpointDB string
+
+	// MaxTokens is the per-run token ceiling (config.Config.MaxTokensPerRun)
+	// the worker enforces against its own DAC-callback usage tracking.
+	// Optional: LocalSpawner appends --max-tokens=<value> only when this is
+	// > 0.
+	MaxTokens int
 }
 
 // Spawner starts a worker process for spec and returns a handle to observe

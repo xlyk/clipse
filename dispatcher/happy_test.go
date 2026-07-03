@@ -14,9 +14,13 @@ import (
 // trail: the running mirror is enqueued and sent before review, the run
 // closes, board_status ends at review, and the claim is cleared.
 //
-// (In Phase 1 nothing then claims the review card — Reviewer/Git-operator/
-// Scribe workers don't exist until Phase 3 — so a needs_review card simply
-// sits at review, which is correct Phase 1 behavior.)
+// Caps.PerLane.Reviewer is zeroed so nothing claims the freshly-opened
+// review card within this same tick (Phase 3's cross-lane claiming is
+// same-tick responsive, exactly like promote -> claim already is) —
+// isolating that lets this test assert purely on the Coder lane's own
+// needs_review -> review transition, which a same-tick reviewer claim would
+// otherwise race with (this fake Spawner scripts one result per issue
+// identifier, shared by whichever lane spawns it next).
 func TestTick_HappyPath_NeedsReviewMovesToReview(t *testing.T) {
 	s := openTestStore(t)
 	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
@@ -31,7 +35,9 @@ func TestTick_HappyPath_NeedsReviewMovesToReview(t *testing.T) {
 	}
 	ws := newStubWorkspacer(t.TempDir())
 	lc := &linear.MockClient{}
-	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
+	cfg := testConfig()
+	cfg.Caps.PerLane.Reviewer = 0
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
 
 	// Tick 1: poll (no candidates from Linear here; issue seeded directly),
 	// claim + spawn issue-1. The fake worker resolves immediately.
