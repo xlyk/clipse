@@ -53,12 +53,26 @@ Phase 3 lanes (`20c9ac1`) plus a run of fixes, each its own commit:
 - **Gorgeous bubbletea TUI** — liveness dot, activity feed, deps/progress,
   `j`/`k` + `enter` inspector, and a `tab` kanban view; token counts sum across
   all runs, not just the latest (`c36889f`, `f8314ec`, `855510a`, `6a16332`).
+- **Reviewer feedback reaches the Coder on rework.** The dispatcher threads the
+  latest `changes_requested` summary into the coder's rework re-run (env
+  `CLIPSE_REVIEW_FEEDBACK`), so a changes-requested issue converges instead of
+  re-emitting the identical diff and tripping the rework cap (`e8705c8`).
+- **Auto-unblock layer 1.** Transient / crash / timeout / spawn failures
+  auto-retry to their release column, bounded by `recover_cap` (default 5) + a
+  `blocked_until` backoff, then park. Non-transient blocks
+  (`capability`/`needs_input`), rework-cap, illegal transitions, and orphan
+  `max_attempts` still park (`a61ecca`, `9f97944`).
+- **Fullscreen TUI redesign.** Alt-screen (no scrollback bleed, restores on
+  quit), dense header, dashboard/kanban tabs, PIPELINE above a full-width
+  ACTIVITY feed; rendered + iterated via VHS screenshots (`7e89988`).
 
 ## Live smoke
 
 A 10-issue "greet" dependency DAG on the `clipse-development` Linear board (team
-`CLI`) against `xlyk/clipse`. Dependency-ordered promotion is proven end to end;
-about 8 of 10 issues merged to `main`. The smoke config lives at
+`CLI`) against `xlyk/clipse`, run end to end: **all 10 merged to `main` in
+dependency order**, all four lanes exercised. CLI-15 (which had hit the rework
+cap under the old byte-identical dead-loop) converged once the rework-feedback
+fix was live — the exact bug it was built for. The smoke config lives at
 `~/Code/clipse-smoke/clipse.yaml` (local, uncommitted) with a reusable
 `seed.sh`.
 
@@ -74,12 +88,13 @@ about 8 of 10 issues merged to `main`. The smoke config lives at
 
 ## Open follow-ups
 
-- **Rework feedback → Coder retry prompt** (in progress). Without it, a
-  `changes_requested` issue re-runs as a fresh task and can't converge on the
-  reviewer's feedback. This is the next thing to finish.
-- **Auto-unblock, layer 1.** A bounded, deterministic retry of transient /
-  capability / crash blocks. `needs_input` and `rework_cap` exhaustion are
-  **not** auto-retryable — they need a human or new input.
+- **Thread the reviewer's inline findings, not just its rollup summary.**
+  Rework feedback (`CLIPSE_REVIEW_FEEDBACK`) currently carries the reviewer
+  run's terse summary, which can go vague ("diff unchanged, same findings")
+  rather than the actionable per-line findings. CLI-15 still converged (the
+  coder recovered specifics from the PR/context), but threading the reviewer's
+  inline comments (or making the reviewer always restate findings in its
+  summary) would make convergence robust rather than model-luck.
 - **GitHub App bot identity.** Give Clipse its own `clipse[bot]` identity for
   attribution and security, replacing the owner's PAT. Design + how-to in
   [docs/design/2026-07-02-github-app-bot-identity.md](design/2026-07-02-github-app-bot-identity.md).
