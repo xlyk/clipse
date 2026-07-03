@@ -86,8 +86,45 @@ fix was live — the exact bug it was built for. The smoke config lives at
   kanban, `enter` detail, `q` quit. (`--board` defaults to `./.clipse`.)
 - `./bin/clipse status` — one-shot SQLite snapshot table.
 
+## Demo tooling
+
+`scripts/demo/demo.sh` preps a clean-slate run and shows it live: reset → build
+→ seed the DAG → (waits for ENTER) → dispatcher in the background + the live TUI
+in the foreground. You arrange the windows and record the screen yourself; the
+script does only the prep + launch. `--full` runs the 10-ticket DAG, `--keep`
+retains the board. (The old `record-demo.sh` + `arrange-windows.applescript`,
+which drove ffmpeg + window placement, were removed — too brittle across macOS
+TCC/Accessibility grants.)
+
+## Verified: `merging` / `documentation` DO mirror to Linear — Linear coalesces the display
+
+A "cards skip merging/documentation on the board" report was investigated and
+the kernel is **correct**: the `linear_writes` table shows all six hops per
+issue (`ready→running→review→merging→documentation→done`) sent with
+`status=done`, zero retries, zero errors, and all nine workflow states exist on
+the team. The board's *current* state is always right.
+
+The blips are **Linear's own activity/history coalescing**: rapid successive
+state changes by the same actor collapse in Linear's history. Proof from a live
+run — CLI-33 (ran last, waited 38s at Merging for CI) shows all six hops;
+CLI-32 shows only `Documentation→Done`; CLI-31 (ran first, fastest) shows zero —
+yet all three are correctly `Done`. `documentation` always dwells ~1s (the
+Scribe no-ops on a trivial PR), so it coalesces hardest. Decision: **leave the
+kernel as-is** (no artificial per-column dwell in a deterministic
+production kernel). The **TUI is the faithful surface** — it reads SQLite, which
+never coalesces, and now shows every working lane live (below).
+
 ## Open follow-ups
 
+- **TUI live-agent visibility — shipped the cheap half; worker internals are the follow-up.**
+  Liveness is now per-row, keyed off the held claim, so the spinner + the
+  working-lane badge + elapsed light up for the reviewer/scribe/git_operator
+  agents too (not just the coder "running" row), and the header shows a
+  `⚡ N working` tally. What's still missing is *what* each worker is doing
+  mid-run: the captured worker log (`<board>/logs/<issue>.log`) is only DAC
+  skill-load noise, not a step trace. To show live tool-calls/steps, instrument
+  the DAC/LangGraph worker to emit structured progress on a clean channel, have
+  the dispatcher record it, and tail it per-agent in the TUI.
 - **Thread the reviewer's inline findings, not just its rollup summary.**
   Rework feedback (`CLIPSE_REVIEW_FEEDBACK`) currently carries the reviewer
   run's terse summary, which can go vague ("diff unchanged, same findings")
