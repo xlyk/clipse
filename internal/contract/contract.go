@@ -41,7 +41,6 @@ func (j *BlockKind) UnmarshalJSON(value []byte) error {
 type Column string
 
 const ColumnBlocked Column = "blocked"
-const ColumnDocumentation Column = "documentation"
 const ColumnDone Column = "done"
 const ColumnMerging Column = "merging"
 const ColumnReady Column = "ready"
@@ -56,7 +55,6 @@ var enumValues_Column = []interface{}{
 	"running",
 	"review",
 	"merging",
-	"documentation",
 	"done",
 	"rework",
 	"blocked",
@@ -87,13 +85,11 @@ type Lane string
 const LaneCoder Lane = "coder"
 const LaneGitOperator Lane = "git_operator"
 const LaneReviewer Lane = "reviewer"
-const LaneScribe Lane = "scribe"
 
 var enumValues_Lane = []interface{}{
 	"coder",
 	"reviewer",
 	"git_operator",
-	"scribe",
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
