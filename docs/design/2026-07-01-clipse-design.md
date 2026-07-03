@@ -459,7 +459,7 @@ do **not** shell out to `dcode -n`.
 | C2 | Symphony-style auto-continuation + hard per-issue turn cap; resume via LangGraph checkpointer |
 | D1 | Lane = named DAC profile, `agent:<lane>` label-selected |
 | D2 | Reviewer reviews → auto-merge when clean; else Rework → Coder |
-| D3 | Always-on Documentation stage (Scribe no-ops if nothing) |
+| D3 | Always-on Documentation stage (Scribe no-ops if nothing). **Amended (reversed):** documentation is now a best-effort step *inside* the Coder graph (`graphs/coder.py`'s `run_docs` node), not a separate always-on Scribe lane/column. Docs are written into the coder's own worktree before the PR is opened, so they ride the same commit/PR and get reviewed; a merged PR goes `merging → done` directly. This retires the `documentation` column, the `scribe` lane, and the `-docs` branch/worktree (and with them the non-fast-forward push bug that branch existed to dodge, plus its worktree leak). |
 | E | Single machine + pluggable Spawner seam + global/per-lane caps |
 | F | Single configured repo; worktree-per-issue |
 | G | Poll Linear on interval |
