@@ -94,3 +94,73 @@ def get_coder_profile() -> CoderProfile:
         system_prompt=_SYSTEM_PROMPT,
         shell_allow_list=_SHELL_ALLOW_LIST,
     )
+
+
+# ---------------------------------------------------------------------------
+# Documentation sub-step profile
+# ---------------------------------------------------------------------------
+#
+# The Coder lane runs a documentation turn (graphs/coder.py's `run_docs` node)
+# right after the coding turn and before the PR is opened, so docs ride the
+# same commit and same PR as the code. This is a docs-scoped profile for that
+# turn: a docs-only system prompt plus a restricted allow-list. It deliberately
+# omits the source-toolchain commands the coding turn has (no go/uv/python/
+# make/sed/...), so the docs turn can only ever touch documentation. It reuses
+# `CoderProfile` -- a docs turn is a sub-step of the Coder lane, not a separate
+# lane -- so the graph's `AgentFactory` seam accepts it unchanged.
+_DOCS_SYSTEM_PROMPT = """\
+You are the documentation step of Clipse's Coder lane, a headless docs agent. \
+You run right after the Coder lane finished editing THIS worktree for a single \
+Linear issue -- the code change is still UNCOMMITTED in the working tree.
+
+- Stay inside the given worktree; do not touch other worktrees, branches, or \
+repositories.
+- Inspect the change just made here. Because it is not committed yet, use \
+`git status` (new/renamed files) and `git diff` (edits) -- NOT `git log` or \
+`git show`, which won't show uncommitted work -- together with the \
+repository's existing docs.
+- You ONLY write documentation. Never edit application or test source code -- \
+that is the coding step's job, not yours.
+- If the change is user- or contributor-facing and the docs don't already \
+cover it, update or add the relevant documentation, matching the style and \
+structure of the surrounding docs.
+- If nothing needs documenting, make NO file changes at all -- a no-op is a \
+completely valid, expected outcome. Never invent busywork just to have \
+something to commit.
+- Do NOT run git or gh to commit, push, or open a pull request. The platform \
+commits your documentation edits together with the code change, in the SAME \
+commit and the SAME pull request. Use git only to inspect the uncommitted \
+change and context.
+- When you have written the docs (or decided none are needed), stop. Do not \
+loop. Only run commands from your shell allow-list.
+"""
+
+# Docs-only: git/gh to inspect the uncommitted change + mkdir for a new docs
+# subdirectory, but none of the source-toolchain commands in _SHELL_ALLOW_LIST
+# above (no go/uv/python/make/sed) -- the docs turn only ever touches docs.
+_DOCS_SHELL_ALLOW_LIST: tuple[str, ...] = (
+    "git",
+    "gh",
+    "ls",
+    "cat",
+    "grep",
+    "rg",
+    "find",
+    "mkdir",
+)
+
+
+def get_coder_docs_profile() -> CoderProfile:
+    """Return the DAC profile for the Coder lane's documentation sub-step.
+
+    A distinct `assistant_id` ("clipse-coder-docs") keeps the docs turn's
+    telemetry/checkpoints separable from the coding turn's; the model matches
+    the coding turn (docs need no stronger model). Like `get_coder_profile`,
+    `model` is a placeholder spec, never a live credential.
+    """
+    return CoderProfile(
+        assistant_id="clipse-coder-docs",
+        model="anthropic:claude-sonnet-4-6",
+        system_prompt=_DOCS_SYSTEM_PROMPT,
+        shell_allow_list=_DOCS_SHELL_ALLOW_LIST,
+    )

@@ -130,6 +130,27 @@ def _fake_turn_driver(
     return driver
 
 
+def _is_docs_turn(config: Any) -> bool:
+    """True iff `config` targets the documentation DAC turn (its own thread
+    namespace) rather than the coding turn -- see coder._DOCS_DAC_THREAD_NAMESPACE_SUFFIX."""
+    return config["configurable"]["thread_id"].endswith(coder._DOCS_DAC_THREAD_NAMESPACE_SUFFIX)
+
+
+def _fake_turn_driver_by_turn(
+    code_result: DacTurnResult, docs_result: DacTurnResult, calls: list[dict[str, Any]]
+) -> Callable[..., Any]:
+    """A turn driver returning distinct results for the coding turn vs the
+    documentation turn, keyed off the DAC thread namespace, so a test can
+    assert the two turns' tokens/task_text/config independently. Both graph
+    nodes (`run_DAC`, `run_docs`) share one injected driver."""
+
+    async def driver(agent_graph: Any, config: Any, **kwargs: Any) -> DacTurnResult:
+        calls.append({"agent_graph": agent_graph, "config": config, **kwargs})
+        return docs_result if _is_docs_turn(config) else code_result
+
+    return driver
+
+
 async def _drive(
     graph: Any, input_state: dict[str, Any], config: dict[str, Any]
 ) -> tuple[list[str], WorkerResult]:
@@ -185,16 +206,22 @@ def test_happy_path_runs_full_node_order_and_emits_needs_review(tmp_path):
     runner = _base_runner()
     agent_calls: list[dict[str, Any]] = []
     turn_calls: list[dict[str, Any]] = []
-    turn_result = DacTurnResult(
+    code_result = DacTurnResult(
         outcome_hint="completed",
         final_text="Implemented the widget factory.",
         tokens_in=120,
         tokens_out=340,
     )
+    docs_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Documented the widget factory.",
+        tokens_in=5,
+        tokens_out=7,
+    )
 
     graph = coder.build_coder_graph(
         agent_factory=_fake_agent_factory(agent_calls),
-        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        turn_driver=_fake_turn_driver_by_turn(code_result, docs_result, turn_calls),
         run_command=runner,
     )
 
@@ -214,6 +241,7 @@ def test_happy_path_runs_full_node_order_and_emits_needs_review(tmp_path):
         "load_context",
         "ensure_worktree",
         "run_DAC",
+        "run_docs",
         "commit",
         "push",
         "open_PR",
@@ -226,21 +254,149 @@ def test_happy_path_runs_full_node_order_and_emits_needs_review(tmp_path):
     assert result.issue_id == "SPAC-1"
     assert result.thread_id == "thread-1"
     assert result.turn_count == 1
-    assert result.tokens.in_ == 120
-    assert result.tokens.out == 340
+    # Tokens sum the coding turn (120/340) and the documentation turn (5/7).
+    assert result.tokens.in_ == 125
+    assert result.tokens.out == 347
     assert result.pr_url == "https://github.com/acme/widgets/pull/1"
     assert result.artifacts == ["src/thing.py"]
 
-    # run_DAC drove a fresh task_text turn (no resume_payload was given).
-    assert len(turn_calls) == 1
+    # Two DAC turns ran: the coding turn (::dac, issue text) then the docs turn
+    # (::docs-dac, a docs prompt), both fresh task_text (no resume).
+    assert len(turn_calls) == 2
     assert turn_calls[0]["task_text"] == "Build the widget factory."
+    assert turn_calls[0]["config"]["configurable"]["thread_id"].endswith(coder._DAC_THREAD_NAMESPACE_SUFFIX)
     assert "resume" not in turn_calls[0]
+    assert _is_docs_turn(turn_calls[1]["config"])
+    assert turn_calls[1]["config"]["configurable"]["thread_id"] != turn_calls[0]["config"]["configurable"]["thread_id"]
+    assert "resume" not in turn_calls[1]
+    assert "Build the widget factory." in turn_calls[1]["task_text"]  # issue text folded into the docs prompt
+    assert "not committed" in turn_calls[1]["task_text"]
 
-    # The DAC agent was built from this turn's resolved cwd, no checkpointer.
-    assert len(agent_calls) == 1
-    assert agent_calls[0]["checkpointer"] is None
-    assert agent_calls[0]["cwd"] == str(Path(workspace).resolve())
+    # Both DAC agents were built from this turn's resolved cwd, no checkpointer;
+    # the docs turn uses the restricted docs profile.
+    assert len(agent_calls) == 2
+    assert all(c["checkpointer"] is None and c["cwd"] == str(Path(workspace).resolve()) for c in agent_calls)
     assert agent_calls[0]["profile"].assistant_id == "clipse-coder"
+    assert agent_calls[1]["profile"].assistant_id == "clipse-coder-docs"
+
+
+# ---------------------------------------------------------------------------
+# Documentation node: best-effort (never blocks the PR), clean-path only
+# ---------------------------------------------------------------------------
+
+
+def _needs_review_input(tmp_path: Path, thread: str = "thread-docs") -> coder.CoderState:
+    return {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": thread,
+        "workspace": _worktree(tmp_path),
+        "issue_text": "Build the widget factory.",
+    }
+
+
+def test_docs_turn_token_ceiling_is_non_blocking(tmp_path):
+    # A docs-turn token-ceiling must NOT block the run -- the coding turn
+    # already produced a review-ready PR; docs are an enhancement.
+    code_result = DacTurnResult(outcome_hint="completed", final_text="did the code", tokens_in=120, tokens_out=340)
+    docs_result = DacTurnResult(
+        outcome_hint="completed", final_text="", tokens_in=50, tokens_out=0, token_ceiling_exceeded=True
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver_by_turn(code_result, docs_result, []),
+        run_command=_base_runner(),
+    )
+
+    order, result = asyncio.run(_drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}}))
+
+    assert "run_docs" in order and "open_PR" in order
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.needs_review
+    assert result.pr_url == "https://github.com/acme/widgets/pull/1"
+    # Docs tokens still count toward the total even though the turn was cut off.
+    assert result.tokens.in_ == 170
+    assert result.tokens.out == 340
+
+
+def test_docs_turn_interrupt_is_non_blocking(tmp_path):
+    code_result = DacTurnResult(outcome_hint="completed", final_text="did the code", tokens_in=120, tokens_out=340)
+    docs_result = DacTurnResult(
+        outcome_hint="interrupted", final_text="", tokens_in=5, tokens_out=5, interrupt_payload=[{"ask": "which format?"}]
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver_by_turn(code_result, docs_result, []),
+        run_command=_base_runner(),
+    )
+
+    _order, result = asyncio.run(_drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}}))
+
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.needs_review
+    assert result.pr_url == "https://github.com/acme/widgets/pull/1"
+
+
+def test_docs_turn_exception_is_swallowed(tmp_path):
+    code_result = DacTurnResult(outcome_hint="completed", final_text="did the code", tokens_in=120, tokens_out=340)
+
+    async def driver(agent_graph: Any, config: Any, **kwargs: Any) -> DacTurnResult:
+        if _is_docs_turn(config):
+            raise RuntimeError("docs agent blew up")
+        return code_result
+
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=driver,
+        run_command=_base_runner(),
+    )
+
+    order, result = asyncio.run(_drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}}))
+
+    assert "run_docs" in order and "open_PR" in order
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.needs_review
+    # A swallowed docs failure contributes zero tokens: only the coding turn counts.
+    assert result.tokens.in_ == 120
+    assert result.tokens.out == 340
+
+
+def test_code_turn_interrupt_skips_docs_entirely(tmp_path):
+    # When the CODING turn blocks (interrupt), docs never run and the result is blocked.
+    blocked_code = DacTurnResult(
+        outcome_hint="interrupted", final_text="need a decision", tokens_in=10, tokens_out=5,
+        interrupt_payload=[{"ask": "x"}],
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(blocked_code, []),
+        run_command=_base_runner(),
+    )
+
+    order, result = asyncio.run(_drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}}))
+
+    assert order == ["load_context", "ensure_worktree", "run_DAC", "emit_result"]
+    assert "run_docs" not in order
+    _assert_valid_result(result, blocked=True)
+    assert result.block_kind == BlockKind.needs_input
+
+
+def test_docs_no_op_still_needs_review(tmp_path):
+    # Both turns leave no file changes: commit is skipped, but the PR is still
+    # (re)opened and the outcome is needs_review -- a docs no-op is expected.
+    clean = DacTurnResult(outcome_hint="completed", final_text="looked around, nothing to change", tokens_in=1, tokens_out=1)
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(clean, []),
+        run_command=_base_runner(changed_files=""),
+    )
+
+    order, result = asyncio.run(_drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}}))
+
+    assert "run_docs" in order
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.needs_review
+    assert result.artifacts == []
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +583,10 @@ def test_checkpointer_carries_dac_summary_forward_as_next_turns_prior_summary(tm
     captured_task_texts: list[str] = []
 
     async def turn_driver(agent_graph: Any, config: Any, **kwargs: Any) -> DacTurnResult:
+        # The docs turn must not consume the coding-summary sequence (nor be
+        # captured as a coding task_text); it runs each turn but is irrelevant here.
+        if _is_docs_turn(config):
+            return DacTurnResult(outcome_hint="completed", final_text="docs turn", tokens_in=0, tokens_out=0)
         captured_task_texts.append(kwargs.get("task_text", ""))
         return DacTurnResult(outcome_hint="completed", final_text=next(produced_summaries), tokens_in=1, tokens_out=1)
 
@@ -579,10 +739,12 @@ def test_build_coder_graph_default_wiring_uses_real_dac_module(tmp_path, monkeyp
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-10"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "commit", "push", "open_PR", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "run_DAC", "run_docs", "commit", "push", "open_PR", "emit_result"]
     assert result.outcome == Outcome.needs_review
-    assert result.tokens.in_ == 7
-    assert result.tokens.out == 3
+    # The same _FakeAgentGraph (7/3) is streamed for both the coding and docs
+    # turns, so the emitted totals are their sum.
+    assert result.tokens.in_ == 14
+    assert result.tokens.out == 6
     # Safety invariant enforced inside dac.build_coder_agent must never be
     # bypassed just because coder.py is doing the calling.
     assert captured["kwargs"]["auto_approve"] is False
@@ -655,9 +817,9 @@ def test_load_context_folds_both_prior_summary_and_review_feedback():
 # ---------------------------------------------------------------------------
 
 
-def test_route_after_dac_proceeds_to_commit_when_completed_cleanly():
+def test_route_after_dac_proceeds_to_docs_when_completed_cleanly():
     state = {"interrupt_payload": None, "token_ceiling_exceeded": False}
-    assert coder.route_after_dac(state) == "commit"
+    assert coder.route_after_dac(state) == "run_docs"
 
 
 def test_route_after_dac_routes_to_emit_result_on_interrupt():

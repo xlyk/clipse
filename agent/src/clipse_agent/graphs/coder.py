@@ -5,9 +5,13 @@ gives the kernel a typed, testable seam around one DAC turn, per the
 design doc's Coder graph:
 
     load_context -> ensure_worktree -> run_DAC -> {
-        completed (clean)   -> commit -> push -> open_PR -> emit_result
+        completed (clean)   -> run_docs -> commit -> push -> open_PR -> emit_result
         interrupted / over token ceiling -> emit_result
     }
+
+`run_docs` is a best-effort documentation turn on the clean path only: it
+writes docs into the same worktree so they ride the same commit/PR as the
+code, and can never turn a review-ready run into `blocked` (see make_run_docs).
 
 `run_DAC` is the only async node (it awaits `dac.drive_turn`), so the
 compiled graph must always be driven with `.ainvoke`/`.astream`, never the
@@ -49,7 +53,7 @@ from langgraph.graph import END, START, StateGraph
 
 from clipse_agent import dac
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
-from clipse_agent.profiles.coder import CoderProfile, get_coder_profile
+from clipse_agent.profiles.coder import CoderProfile, get_coder_docs_profile, get_coder_profile
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -150,6 +154,13 @@ class CoderState(TypedDict, total=False):
     interrupt_payload: list[Any] | None
     token_ceiling_exceeded: bool
 
+    # --- run_docs (best-effort; kept OUT of the run_DAC channels above so a
+    #     doc-turn ceiling/interrupt/failure can never route the run to blocked
+    #     -- emit_result reads none of these for its blocked branches) ---
+    doc_summary: str
+    doc_tokens_in: int
+    doc_tokens_out: int
+
     # --- commit ---
     artifacts: list[str]
     committed: bool
@@ -175,6 +186,17 @@ _DAC_THREAD_NAMESPACE_SUFFIX = "::dac"
 
 def _dac_config(thread_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": f"{thread_id}{_DAC_THREAD_NAMESPACE_SUFFIX}"}}
+
+
+# The documentation turn (run_docs) drives a SECOND DAC agent -- a different
+# system prompt + allow-list -- against the same per-issue checkpointer. It
+# needs its own thread namespace so it never resumes the coding turn's message
+# history (mirrors reviewer.py's `::review-dac`).
+_DOCS_DAC_THREAD_NAMESPACE_SUFFIX = "::docs-dac"
+
+
+def _docs_dac_config(thread_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": f"{thread_id}{_DOCS_DAC_THREAD_NAMESPACE_SUFFIX}"}}
 
 
 # ---------------------------------------------------------------------------
@@ -299,11 +321,110 @@ def route_after_dac(state: CoderState) -> str:
 
     A token-ceiling abort or a genuine interrupt both skip straight to
     `emit_result` as blocked (see the module docstring on why `blocked`
-    covers both); anything else proceeds to open a PR.
+    covers both); anything else proceeds to the documentation turn (which
+    then flows to commit). Docs therefore never run when the code turn didn't
+    produce a review-ready change.
     """
     if state.get("token_ceiling_exceeded") or state.get("interrupt_payload") is not None:
         return "emit_result"
-    return "commit"
+    return "run_docs"
+
+
+# ---------------------------------------------------------------------------
+# run_docs (documentation sub-step; best-effort, clean path only)
+# ---------------------------------------------------------------------------
+
+
+def _docs_task_text(state: CoderState) -> str:
+    """Compose the documentation turn's prompt.
+
+    Unlike load_context's coding prompt, this points the docs agent at the
+    change the coding turn just made in THIS worktree (still uncommitted) and
+    asks it to update docs if warranted -- a no-op is a valid outcome.
+    """
+    issue_id = state.get("issue_id", "")
+    issue_text = state.get("issue_text") or os.environ.get("CLIPSE_ISSUE_TEXT", "")
+    code_summary = (state.get("dac_summary") or "").strip()
+
+    parts = [
+        f"The Coder lane just edited this worktree to implement {issue_id}; "
+        "the change is not committed yet.",
+    ]
+    if issue_text:
+        parts.append(f"Issue:\n{issue_text}")
+    if code_summary:
+        parts.append(f"What the Coder reported doing:\n{code_summary}")
+    parts.append(
+        "Inspect the uncommitted change with `git status` and `git diff`, then update "
+        "or add documentation if the change is user- or contributor-facing and the docs "
+        "don't already cover it. If nothing needs documenting, make no file changes at "
+        "all -- a no-op is expected. Do not edit source code."
+    )
+    return "\n\n".join(parts)
+
+
+def _docs_max_tokens(state: CoderState) -> int | None:
+    """The docs turn's token budget: whatever the coding turn left of
+    `max_tokens`, so the whole coder run honors a single ceiling. `None` (no
+    ceiling) stays `None`; an already-spent budget yields 0, which trips
+    `drive_turn`'s ceiling immediately and the docs turn best-effort skips.
+    """
+    ceiling = state.get("max_tokens")
+    if ceiling is None:
+        return None
+    spent = state.get("tokens_in", 0) + state.get("tokens_out", 0)
+    return max(0, ceiling - spent)
+
+
+def make_run_docs(
+    profile: CoderProfile,
+    agent_factory: AgentFactory,
+    turn_driver: TurnDriver,
+    checkpointer: BaseCheckpointSaver | None,
+) -> Callable[[CoderState], Awaitable[dict[str, Any]]]:
+    """Drive one best-effort documentation DAC turn in the coder's worktree.
+
+    Runs only on the clean path (see route_after_dac), after the coding turn
+    already produced a review-ready change. Any docs the agent writes sit next
+    to the code edits and are folded into the same commit by `make_commit`'s
+    `git add -A` -- same commit, same PR, no separate branch.
+
+    Best-effort by construction: it returns ONLY the private `doc_*` keys and
+    never `interrupt_payload`/`token_ceiling_exceeded`/`dac_summary`, so a
+    doc-turn ceiling, interrupt, or outright exception can neither turn this
+    run into `blocked` nor rename the PR -- the coding turn's review-ready PR
+    ships regardless. A ceiling/interrupt on the *coding* turn, by contrast,
+    still blocks (route_after_dac skips this node entirely), because there the
+    change itself may be incomplete or need a human. Uses its own `::docs-dac`
+    thread namespace so it never resumes the coding turn's message history.
+    """
+
+    async def _node(state: CoderState) -> dict[str, Any]:
+        try:
+            agent_graph, _backend = agent_factory(profile, checkpointer, state["cwd"])
+            turn_result = await turn_driver(
+                agent_graph,
+                _docs_dac_config(state["thread_id"]),
+                task_text=_docs_task_text(state),
+                max_tokens=_docs_max_tokens(state),
+            )
+        except Exception as exc:  # noqa: BLE001 -- docs are non-critical; degrade, never block the PR
+            return {"doc_summary": f"Documentation step skipped (error): {exc}", "doc_tokens_in": 0, "doc_tokens_out": 0}
+
+        if turn_result.token_ceiling_exceeded:
+            summary = "Documentation step skipped: token budget reached before it finished."
+        elif turn_result.interrupt_payload is not None:
+            summary = "Documentation step skipped: it needed input it could not resolve on its own."
+        else:
+            summary = turn_result.final_text
+
+        return {
+            "doc_summary": summary,
+            "doc_tokens_in": turn_result.tokens_in,
+            "doc_tokens_out": turn_result.tokens_out,
+        }
+
+    return _node
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +517,9 @@ def _pr_body(state: CoderState) -> str:
     body = f"Implements {issue_id}."
     if summary:
         body += f"\n\n{summary}"
+    doc_summary = (state.get("doc_summary") or "").strip()
+    if doc_summary:
+        body += f"\n\nDocumentation: {doc_summary}"
     return body
 
 
@@ -472,6 +596,9 @@ def _needs_review_summary(state: CoderState) -> str:
     if dac_summary:
         parts.append(dac_summary)
     parts.append("Committed and pushed changes." if state.get("committed") else "No new changes to commit this turn.")
+    doc_summary = (state.get("doc_summary") or "").strip()
+    if doc_summary:
+        parts.append(f"Docs: {doc_summary}")
     pr_url = state.get("pr_url")
     if pr_url:
         parts.append(f"PR: {pr_url}")
@@ -495,8 +622,13 @@ def emit_result(state: CoderState) -> dict[str, Any]:
     forward so a later turn on the same checkpointed thread sees it via
     `load_context` without the caller having to resupply it explicitly.
     """
-    tokens_in = state.get("tokens_in", 0)
-    tokens_out = state.get("tokens_out", 0)
+    # Sum the coding turn and the (best-effort) docs turn. The docs turn wrote
+    # separate doc_* keys precisely so it couldn't clobber the coding turn's
+    # counts here (CoderState channels are last-write-wins). On the blocked
+    # paths docs never ran, so the doc_* keys are absent and .get(..., 0)
+    # leaves the coding-turn totals untouched.
+    tokens_in = state.get("tokens_in", 0) + state.get("doc_tokens_in", 0)
+    tokens_out = state.get("tokens_out", 0) + state.get("doc_tokens_out", 0)
     tokens = Tokens(**{"in": tokens_in, "out": tokens_out})
     turn_count = state.get("turn_count", 0) + 1
     common: dict[str, Any] = {
@@ -553,6 +685,7 @@ def build_coder_graph(
     *,
     checkpointer: BaseCheckpointSaver | None = None,
     profile: CoderProfile | None = None,
+    docs_profile: CoderProfile | None = None,
     agent_factory: AgentFactory = dac.build_coder_agent,
     turn_driver: TurnDriver = dac.drive_turn,
     run_command: CommandRunner | None = None,
@@ -575,16 +708,21 @@ def build_coder_graph(
     (LangGraph loads the thread's checkpointed state before merging in the
     new input), with no need for the caller to resupply it.
 
-    The returned graph's only async node is `run_DAC`, so it must be
-    driven with `.ainvoke`/`.astream` -- never the sync `.invoke`.
+    `run_DAC` and `run_docs` are the async nodes (both await a DAC turn), so
+    the returned graph must be driven with `.ainvoke`/`.astream` -- never the
+    sync `.invoke`. Both turns share `agent_factory`/`turn_driver`; only the
+    profile differs (`profile` for the coding turn, `docs_profile` for the
+    documentation turn).
     """
     resolved_profile = profile if profile is not None else get_coder_profile()
+    resolved_docs_profile = docs_profile if docs_profile is not None else get_coder_docs_profile()
     resolved_run_command = run_command if run_command is not None else _default_run_command
 
     graph: StateGraph[CoderState, Any, Any, Any] = StateGraph(CoderState)
     graph.add_node("load_context", load_context)
     graph.add_node("ensure_worktree", make_ensure_worktree(resolved_run_command))
     graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer))
+    graph.add_node("run_docs", make_run_docs(resolved_docs_profile, agent_factory, turn_driver, checkpointer))
     graph.add_node("commit", make_commit(resolved_run_command))
     graph.add_node("push", make_push(resolved_run_command))
     graph.add_node("open_PR", make_open_pr(resolved_run_command))
@@ -594,6 +732,7 @@ def build_coder_graph(
     graph.add_edge("load_context", "ensure_worktree")
     graph.add_edge("ensure_worktree", "run_DAC")
     graph.add_conditional_edges("run_DAC", route_after_dac)
+    graph.add_edge("run_docs", "commit")
     graph.add_edge("commit", "push")
     graph.add_edge("push", "open_PR")
     graph.add_edge("open_PR", "emit_result")
