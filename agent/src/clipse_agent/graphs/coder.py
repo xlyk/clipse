@@ -26,7 +26,7 @@ running)` as an *illegal* transition -- only `needs_review`, `blocked`, and
 `TestNext_ErrorNamesOutcomeAndCurrent` in `internal/board/board_test.go`).
 So a clean DAC turn that opens/updates a PR always emits `needs_review`
 (the PR is ready for the Reviewer lane), never `done` -- `done` belongs to
-the Reviewer/Git-operator/Scribe lanes' own terminal columns. This module
+the Reviewer/Git-operator lanes' own terminal columns. This module
 never emits `continue`: driving a single DAC turn to either "completed" or
 "interrupted" (dac.py's only two outcome hints) fully determines the
 result, with nothing left over that would need a same-thread respawn
@@ -612,7 +612,7 @@ def emit_result(state: CoderState) -> dict[str, Any]:
     `internal/board.Next` treats `(done, running)`/`(done, rework)` as
     illegal transitions (the Coder lane's card lives in `running`/`rework`
     while this graph runs), so `done` is reserved for the
-    Reviewer/Git-operator/Scribe lanes' own terminal columns. A
+    Reviewer/Git-operator lanes' own terminal columns. A
     token-ceiling abort takes priority over an interrupt (dac.py's own
     documented precedence), and both map to `blocked` with a distinct
     `block_kind` -- present here in every branch, consistent with
