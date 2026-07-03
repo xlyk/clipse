@@ -563,9 +563,9 @@ func TestClaimColumn_IgnoresAlreadyClaimedCard(t *testing.T) {
 func TestClaimColumn_AppendsClaimedEvent(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
-	seedColumnIssue(t, s, "issue-1", "documentation", 1, 100)
+	seedColumnIssue(t, s, "issue-1", "review", 1, 100)
 
-	if _, err := s.ClaimColumn(ctx, "documentation", "scribe", "run-1", 1000, 60); err != nil {
+	if _, err := s.ClaimColumn(ctx, "review", "reviewer", "run-1", 1000, 60); err != nil {
 		t.Fatalf("ClaimColumn: unexpected error: %v", err)
 	}
 
@@ -658,7 +658,6 @@ func TestReleaseTargetColumn(t *testing.T) {
 		{current: "running", want: "ready"},
 		{current: "review", want: "review"},
 		{current: "rework", want: "rework"},
-		{current: "documentation", want: "documentation"},
 		{current: "merging", want: "merging"},
 		{current: "ready", want: "ready"},
 	}

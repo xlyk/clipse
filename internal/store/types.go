@@ -111,14 +111,14 @@ type IssueSnapshot struct {
 	LatestRun *Run
 
 	// Runs is every run for this issue in chronological order (oldest first:
-	// coder, then reviewer, then git_operator, then scribe as the card
+	// coder, then reviewer, then git_operator as the card
 	// advances). LatestRun is retained as the convenience "current lane"
 	// pointer; Runs is what the TUI's per-issue detail view walks to show the
 	// full lane history. A card with no runs yet has an empty (nil) slice.
 	Runs []Run
 
 	// TokensInTotal / TokensOutTotal sum tokens across ALL of this issue's
-	// runs (every lane it has passed through — coder, reviewer, scribe, ...),
+	// runs (every lane it has passed through — coder, reviewer, git_operator, ...),
 	// not just LatestRun. Displaying LatestRun's tokens alone dropped every
 	// earlier lane's usage the moment a card advanced, which read as the
 	// counters "not updating".

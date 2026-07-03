@@ -76,7 +76,7 @@ func selectClaimCandidate(ctx context.Context, q queryRowContexter, now int64, w
 // nextAttempt computes the next runs.attempt for issueID inside tx: the
 // prior max (0 if none) plus one. attempt is global per issue, not per-lane
 // (R5): a coder rework re-run continues the same attempt sequence as its
-// original ready-claim run, and a later reviewer/scribe claim on the same
+// original ready-claim run, and a later reviewer claim on the same
 // issue shares it too, so cfg.MaxAttempts counts real dispatch attempts
 // across every lane, restart, and retry -- shared by ClaimReady and
 // ClaimColumn.
@@ -206,7 +206,7 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 }
 
 // ClaimColumn atomically claims the single best UNCLAIMED card currently
-// sitting in column (e.g. "review", "rework", "documentation", "merging")
+// sitting in column (e.g. "review", "rework", "merging")
 // for runID, and records the run as dispatched to lane.
 //
 // This is cross-lane claiming (design doc decision O amendment, Phase 3):
@@ -229,7 +229,7 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 // and left by a later Transition once the claimed lane's worker resolves.
 //
 // attempt is computed the same issue-global way as ClaimReady (R5): a
-// reviewer/scribe/git-operator claim on an issue continues the same attempt
+// reviewer/git-operator claim on an issue continues the same attempt
 // sequence as its coder run(s), not a separate per-lane counter.
 func (s *Store) ClaimColumn(ctx context.Context, column, lane, runID string, now, ttl int64) (*Claim, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -350,7 +350,7 @@ func (s *Store) PeekColumnCandidate(ctx context.Context, column string, now int6
 // claim_expires to now+ttl and records the run's heartbeat_at. It errors if
 // runID has no active claim (i.e. no issue currently locked by it). This
 // works identically for a ClaimReady claim (running) or a ClaimColumn claim
-// (review/rework/documentation/merging): both key off claim_lock, not
+// (review/rework/merging): both key off claim_lock, not
 // board_status.
 func (s *Store) Heartbeat(ctx context.Context, runID string, now, ttl int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -398,7 +398,7 @@ func (s *Store) Heartbeat(ctx context.Context, runID string, now, ttl int64) err
 // dispatcher restart (dispatcher.requeueOrphan). A card claimed while
 // running -- the Coder lane's sole working column, entered only via
 // ClaimReady -- returns to ready to be re-claimed. A card claimed in any
-// downstream lane-entry column (review, rework, documentation, merging, all
+// downstream lane-entry column (review, rework, merging, all
 // claimed via ClaimColumn) never left that column to begin with; only
 // claim_lock changed, so releasing the claim leaves board_status unchanged.
 // Both release paths call this one function so they cannot drift apart
@@ -412,8 +412,8 @@ func ReleaseTargetColumn(current string) string {
 
 // ReleaseStaleClaims requeues every claimed issue whose claim_expires has
 // passed now, regardless of which column it's claimed in (a ClaimReady
-// 'running' claim, or a ClaimColumn claim on review/rework/documentation/
-// merging): it resets the issue's board_status per ReleaseTargetColumn
+// 'running' claim, or a ClaimColumn claim on review/rework/merging): it
+// resets the issue's board_status per ReleaseTargetColumn
 // (running -> ready; every downstream column stays put) with claim_lock and
 // claim_expires cleared, marks its still-'running' run 'stale', and appends
 // a "stale_release" event per released issue. It returns the number of

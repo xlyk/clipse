@@ -11,14 +11,14 @@ import (
 
 // TestReadSnapshot_CumulativeTokensAcrossRuns asserts token totals sum EVERY
 // run of an issue, not just its latest. An issue accrues one run per lane
-// (coder, then reviewer, then scribe), so counting only LatestRun (as the TUI
-// header used to) silently dropped every earlier lane's tokens — which read
-// as "token counts not updating" once a card moved past its coder run.
+// (coder, then reviewer, then git-operator), so counting only LatestRun (as
+// the TUI header used to) silently dropped every earlier lane's tokens —
+// which read as "token counts not updating" once a card moved past its coder run.
 func TestReadSnapshot_CumulativeTokensAcrossRuns(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "documentation"}); err != nil {
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "done"}); err != nil {
 		t.Fatalf("UpsertIssue issue-1: %v", err)
 	}
 	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-2", Identifier: "CLP-2", BoardStatus: "running"}); err != nil {
@@ -28,7 +28,7 @@ func TestReadSnapshot_CumulativeTokensAcrossRuns(t *testing.T) {
 	for _, r := range []store.Run{
 		{RunID: "r1", IssueID: "issue-1", Lane: "coder", Status: "needs_review", StartedAt: 10, Attempt: 1, TokensIn: 100, TokensOut: 200},
 		{RunID: "r2", IssueID: "issue-1", Lane: "reviewer", Status: "done", StartedAt: 20, Attempt: 1, TokensIn: 50, TokensOut: 60},
-		{RunID: "r3", IssueID: "issue-1", Lane: "scribe", Status: "done", StartedAt: 30, Attempt: 1, TokensIn: 30, TokensOut: 40},
+		{RunID: "r3", IssueID: "issue-1", Lane: "git_operator", Status: "done", StartedAt: 30, Attempt: 1, TokensIn: 30, TokensOut: 40},
 	} {
 		if err := s.InsertRun(ctx, r); err != nil {
 			t.Fatalf("InsertRun %s: %v", r.RunID, err)
@@ -138,7 +138,7 @@ func TestReadSnapshot_IssueRuns(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "documentation"}); err != nil {
+	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-1", Identifier: "CLP-1", BoardStatus: "done"}); err != nil {
 		t.Fatalf("UpsertIssue issue-1: %v", err)
 	}
 	if err := s.UpsertIssue(ctx, store.Issue{ID: "issue-2", Identifier: "CLP-2", BoardStatus: "ready"}); err != nil {
@@ -148,7 +148,7 @@ func TestReadSnapshot_IssueRuns(t *testing.T) {
 	// issue-1: three lane runs, inserted out of chronological order to prove
 	// the query sorts by started_at rather than insertion order.
 	for _, r := range []store.Run{
-		{RunID: "r3", IssueID: "issue-1", Lane: "scribe", Status: "done", StartedAt: 30, Attempt: 1},
+		{RunID: "r3", IssueID: "issue-1", Lane: "git_operator", Status: "done", StartedAt: 30, Attempt: 1},
 		{RunID: "r1", IssueID: "issue-1", Lane: "coder", Status: "needs_review", StartedAt: 10, Attempt: 1},
 		{RunID: "r2", IssueID: "issue-1", Lane: "reviewer", Status: "done", StartedAt: 20, Attempt: 1},
 	} {
@@ -171,7 +171,7 @@ func TestReadSnapshot_IssueRuns(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("issue-1 Runs len = %d, want 3", len(got))
 	}
-	wantOrder := []string{"coder", "reviewer", "scribe"}
+	wantOrder := []string{"coder", "reviewer", "git_operator"}
 	for i, lane := range wantOrder {
 		if got[i].Lane != lane {
 			t.Errorf("issue-1 Runs[%d].Lane = %q, want %q (chronological)", i, got[i].Lane, lane)

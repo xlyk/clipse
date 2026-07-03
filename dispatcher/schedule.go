@@ -15,12 +15,12 @@ import (
 //   - the coder pool (ready -> running, plus rework -> running re-runs)
 //     shares Caps.PerLane.Coder between both columns (R4 — see
 //     claimCoderPool);
-//   - review -> reviewer and documentation -> scribe are simple per-column
-//     claims (decision O's cross-lane claiming — see claimSimpleColumn);
+//   - review -> reviewer is a simple per-column claim (decision O's
+//     cross-lane claiming — see claimSimpleColumn);
 //   - merging runs internal/gitops INLINE rather than spawning a worker
 //     (decision J amendment / O — see claimAndRunGitops).
 //
-// The global cap is re-checked before every single claim across all four
+// The global cap is re-checked before every single claim across all
 // pools, so a claim made for one pool immediately counts against the
 // global cap for every pool checked afterward in the same pass.
 func (d *Dispatcher) selectAndClaim(ctx context.Context) error {
@@ -30,9 +30,6 @@ func (d *Dispatcher) selectAndClaim(ctx context.Context) error {
 		return err
 	}
 	if err := d.claimSimpleColumn(ctx, now, string(contract.ColumnReview), string(contract.LaneReviewer), d.cfg.Caps.PerLane.Reviewer); err != nil {
-		return err
-	}
-	if err := d.claimSimpleColumn(ctx, now, string(contract.ColumnDocumentation), string(contract.LaneScribe), d.cfg.Caps.PerLane.Scribe); err != nil {
 		return err
 	}
 	if err := d.claimAndRunGitops(ctx, now); err != nil {
@@ -179,8 +176,8 @@ func priorityRank(p int) int {
 
 // claimSimpleColumn claims up to capN (and the global cap) UNCLAIMED cards
 // currently sitting in column, spawning lane's worker for each. Unlike the
-// coder pool, review and documentation each feed exactly one lane from
-// exactly one column, so no cross-column fairness is needed —
+// coder pool, review feeds exactly one lane from exactly one column, so no
+// cross-column fairness is needed —
 // store.ClaimColumn's own (priority, created_at, identifier) ordering
 // already picks the single best candidate each time.
 //
@@ -203,7 +200,7 @@ func (d *Dispatcher) claimSimpleColumn(ctx context.Context, now int64, column, l
 			return fmt.Errorf("claiming column %s: %w", column, err)
 		}
 
-		// Reviewer/scribe claims carry no rework feedback — that is a
+		// Reviewer claims carry no rework feedback — that is a
 		// Coder-lane-only concern (see claimCoderPool).
 		if err := d.spawnClaim(ctx, *claim, ""); err != nil {
 			return fmt.Errorf("spawning claim for issue %s: %w", claim.Issue.ID, err)
@@ -213,7 +210,7 @@ func (d *Dispatcher) claimSimpleColumn(ctx context.Context, now int64, column, l
 
 // spawnClaim starts the worker process for a freshly won claim. claim.Run.
 // Lane already carries the lane the claim dispatched (the bare lane
-// ClaimReady/ClaimColumn recorded — "coder"/"reviewer"/"scribe"), so this
+// ClaimReady/ClaimColumn recorded — "coder"/"reviewer"), so this
 // needs no per-lane branching: spawnAttempt/WorkerSpec build the right
 // `--lane` flag for whichever lane the claim was for (R5). reviewFeedback is
 // the rework feedback for a Coder re-run out of the rework column (empty for

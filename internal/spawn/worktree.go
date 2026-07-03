@@ -22,52 +22,6 @@ import (
 // local branch off baseBranch when branch doesn't already exist locally, or
 // checking out the existing local branch into the new worktree otherwise.
 func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, worktreeRoot string) (string, error) {
-	return ensureWorktreeFrom(ctx, primaryClonePath, branch, baseBranch, worktreeRoot)
-}
-
-// EnsureDocsWorktree is the Scribe lane's worktree primitive: it creates (or
-// reuses) a worktree for a documentation branch cut fresh from the tip of
-// origin/<baseBranch> -- the just-merged state -- fetching origin first so that
-// tip reflects the merge the Scribe is documenting rather than the primary
-// clone's possibly-stale local base.
-//
-// It must NOT reuse or branch from the Coder's own branch: by the time the
-// Scribe runs, gitops has squash-merged (and often update-branch'd) that
-// branch, so its remote tip has advanced past whatever the local worktree
-// holds -- committing docs onto it and pushing fails non-fast-forward (the
-// exact bug this exists to prevent). A brand-new docs branch off origin/<base>
-// instead has no remote counterpart yet, so its first push is always a clean
-// fast-forward, while still carrying the merged change so the Scribe can
-// inspect and document it.
-func EnsureDocsWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, worktreeRoot string) (string, error) {
-	// Reuse short-circuits before the fetch: a re-run's docs worktree already
-	// exists on disk (and its branch already exists on the remote from the
-	// prior turn's push), so re-fetching/re-basing would be both wasteful and
-	// wrong -- ensureWorktreeFrom's own reuse check handles it, but fetching
-	// only matters when we are about to create the branch below.
-	path := worktreePathFor(worktreeRoot, branch)
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
-	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("checking for existing docs worktree at %s: %w", path, err)
-	}
-
-	// Fetch so origin/<base> reflects the merge the Scribe documents. A branch
-	// that already exists locally (a prior turn) is checked out as-is by
-	// ensureWorktreeFrom, so the fetch only feeds the origin/<base> start point
-	// used when the branch is created for the first time.
-	if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", baseBranch); err != nil {
-		return "", fmt.Errorf("fetching origin/%s for docs worktree: %w", baseBranch, err)
-	}
-	return ensureWorktreeFrom(ctx, primaryClonePath, branch, "origin/"+baseBranch, worktreeRoot)
-}
-
-// ensureWorktreeFrom is the shared body behind EnsureWorktree (startPoint =
-// the local base branch) and EnsureDocsWorktree (startPoint = origin/<base>):
-// reuse an existing worktree for branch if present, else create one, branching
-// a new local branch off startPoint when branch doesn't already exist locally,
-// or checking out the existing local branch otherwise.
-func ensureWorktreeFrom(ctx context.Context, primaryClonePath, branch, startPoint, worktreeRoot string) (string, error) {
 	path := worktreePathFor(worktreeRoot, branch)
 
 	if _, err := os.Stat(path); err == nil {
@@ -92,7 +46,7 @@ func ensureWorktreeFrom(ctx context.Context, primaryClonePath, branch, startPoin
 	if branchExistsLocally {
 		args = []string{"worktree", "add", path, branch}
 	} else {
-		args = []string{"worktree", "add", "-b", branch, path, startPoint}
+		args = []string{"worktree", "add", "-b", branch, path, baseBranch}
 	}
 	if err := runGitCmd(ctx, primaryClonePath, args...); err != nil {
 		if !isMissingButRegisteredWorktreeErr(err) {

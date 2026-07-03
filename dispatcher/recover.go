@@ -82,8 +82,8 @@ func (d *Dispatcher) reapRunProcess(run store.Run) (spawn.Reaped, error) {
 // The target column is column-aware (R2), via the exact same
 // store.ReleaseTargetColumn rule ReleaseStaleClaims uses, so the two release
 // paths cannot drift apart: an orphaned 'running' (Coder) claim returns to
-// 'ready', while an orphaned downstream claim (review/rework/documentation/
-// merging, entered via ClaimColumn) keeps its own column — it never left
+// 'ready', while an orphaned downstream claim (review/rework/merging,
+// entered via ClaimColumn) keeps its own column — it never left
 // that column in the first place, only claim_lock did.
 func (d *Dispatcher) requeueOrphan(ctx context.Context, issue store.Issue, run store.Run) error {
 	now := d.now()

@@ -107,7 +107,7 @@ func (d *Dispatcher) runGitopsClaim(ctx context.Context, claim store.Claim) erro
 // path a spawned worker's result uses (applyTerminalWorkerOutcome), by
 // building the equivalent contract.WorkerResult:
 //
-//   - OutcomeMerged            -> outcome "done"               (merging -> documentation)
+//   - OutcomeMerged            -> outcome "done"               (merging -> done)
 //   - OutcomeStaleBaseConflict -> outcome "changes_requested"   (merging -> rework, R1)
 //   - OutcomeNotMergeable      -> outcome "blocked"              (merging -> blocked)
 //   - OutcomeCIPending         -> NO transition at all (R3): the merging

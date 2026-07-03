@@ -21,22 +21,15 @@ import (
 // for a Coder re-run claimed out of the rework column; it is injected into
 // the worker's environment as CLIPSE_REVIEW_FEEDBACK (see that constant) so
 // the Coder lane can address it. Every other spawn (a fresh coder claim from
-// ready, reviewer, scribe, a continuation) passes "" and injects nothing.
+// ready, reviewer, a continuation) passes "" and injects nothing.
 //
 // On a Spawn failure (workspace or exec-level, not a worker-process
 // failure), the issue is transitioned straight to blocked: there is no
 // process to Wait on, so this can't flow through the normal
 // applyResult/runResult path.
 func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID, lane, threadID string, turn int, reviewFeedback string) error {
-	// The Scribe lane needs its own docs worktree cut from origin/<base>, not
-	// the issue's already-merged Coder branch (which fails non-fast-forward on
-	// push once gitops has advanced its remote tip). Every other spawned lane
-	// (coder/reviewer) operates on the issue's own branch via Ensure.
-	ensure := d.ws.Ensure
-	if lane == string(contract.LaneScribe) {
-		ensure = d.ws.EnsureDocs
-	}
-	workspace, err := ensure(issue)
+	// Every spawned lane (coder/reviewer) operates on the issue's own branch.
+	workspace, err := d.ws.Ensure(issue)
 	if err != nil {
 		// A workspace/spawn failure is transient by nature, so it is eligible
 		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
