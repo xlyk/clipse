@@ -131,7 +131,7 @@ func TestTick_CoderPool_SharesCapAcrossReadyAndRework(t *testing.T) {
 	cfg := testConfig()
 	cfg.Caps = config.Caps{
 		Global:  1,
-		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0, Scribe: 0},
+		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0},
 	}
 	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
 
@@ -200,7 +200,7 @@ func TestTick_CoderPool_PrefersHigherPriorityAcrossColumns(t *testing.T) {
 	cfg.MaxRuntimeS = 3600
 	cfg.Caps = config.Caps{
 		Global:  1,
-		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0, Scribe: 0},
+		PerLane: config.PerLaneCaps{Coder: 1, Reviewer: 0, GitOperator: 0},
 	}
 	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
 

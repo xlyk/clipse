@@ -62,7 +62,6 @@ func testConfig() config.Config {
 				Coder:       4,
 				Reviewer:    2,
 				GitOperator: 1,
-				Scribe:      1,
 			},
 		},
 	}

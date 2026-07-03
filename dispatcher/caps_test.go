@@ -35,7 +35,7 @@ func TestTick_RespectsCapsAcrossManyReadyIssues(t *testing.T) {
 	cfg.MaxRuntimeS = 3600 // hung workers below never resolve within this test's lifetime
 	cfg.Caps = config.Caps{
 		Global:  3,
-		PerLane: config.PerLaneCaps{Coder: 2, Reviewer: 2, GitOperator: 2, Scribe: 2},
+		PerLane: config.PerLaneCaps{Coder: 2, Reviewer: 2, GitOperator: 2},
 	}
 	lc := &linear.MockClient{}
 	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
@@ -86,7 +86,7 @@ func TestTick_GlobalCapLimitsAcrossLanes(t *testing.T) {
 	cfg := testConfig()
 	cfg.Caps = config.Caps{
 		Global:  2,
-		PerLane: config.PerLaneCaps{Coder: 4, Reviewer: 4, GitOperator: 4, Scribe: 4},
+		PerLane: config.PerLaneCaps{Coder: 4, Reviewer: 4, GitOperator: 4},
 	}
 	lc := &linear.MockClient{}
 	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
