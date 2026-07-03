@@ -19,18 +19,17 @@ const laneLabelPrefix = "agent:"
 // so an unrecognized/renamed Linear state doesn't crash normalization; it
 // just won't be picked up as ready/running/etc until the mapping is fixed.
 var statusByWorkflowName = map[string]string{
-	"todo":          "todo",
-	"backlog":       "todo",
-	"ready":         "ready",
-	"running":       "running",
-	"in progress":   "running",
-	"review":        "review",
-	"in review":     "review",
-	"merging":       "merging",
-	"documentation": "documentation",
-	"done":          "done",
-	"rework":        "rework",
-	"blocked":       "blocked",
+	"todo":        "todo",
+	"backlog":     "todo",
+	"ready":       "ready",
+	"running":     "running",
+	"in progress": "running",
+	"review":      "review",
+	"in review":   "review",
+	"merging":     "merging",
+	"done":        "done",
+	"rework":      "rework",
+	"blocked":     "blocked",
 }
 
 // statusFromWorkflowName maps a Linear workflow-state name to our Column
@@ -53,15 +52,14 @@ func statusFromWorkflowName(name string) string {
 // and the workflow states actually configured on the Linear team driving
 // Clipse.
 var canonicalWorkflowNameByColumn = map[string]string{
-	"todo":          "Todo",
-	"ready":         "Ready",
-	"running":       "Running",
-	"review":        "Review",
-	"merging":       "Merging",
-	"documentation": "Documentation",
-	"done":          "Done",
-	"rework":        "Rework",
-	"blocked":       "Blocked",
+	"todo":    "Todo",
+	"ready":   "Ready",
+	"running": "Running",
+	"review":  "Review",
+	"merging": "Merging",
+	"done":    "Done",
+	"rework":  "Rework",
+	"blocked": "Blocked",
 }
 
 // canonicalWorkflowName returns the canonical Linear workflow-state name for

@@ -22,7 +22,6 @@ const teamStatesFixture = `{
           { "id": "state-running-id", "name": "Running", "type": "started" },
           { "id": "state-review-id", "name": "Review", "type": "started" },
           { "id": "state-merging-id", "name": "Merging", "type": "started" },
-          { "id": "state-documentation-id", "name": "Documentation", "type": "started" },
           { "id": "state-done-id", "name": "Done", "type": "completed" },
           { "id": "state-rework-id", "name": "Rework", "type": "started" },
           { "id": "state-blocked-id", "name": "Blocked", "type": "canceled" }
@@ -106,15 +105,14 @@ func TestHTTPClient_SetState_ResolvesColumnAndSendsExactBodies(t *testing.T) {
 // of statusFromWorkflowName.
 func TestHTTPClient_SetState_ResolvesAllCanonicalColumns(t *testing.T) {
 	wantStateIDByColumn := map[string]string{
-		"todo":          "state-todo-id",
-		"ready":         "state-ready-id",
-		"running":       "state-running-id",
-		"review":        "state-review-id",
-		"merging":       "state-merging-id",
-		"documentation": "state-documentation-id",
-		"done":          "state-done-id",
-		"rework":        "state-rework-id",
-		"blocked":       "state-blocked-id",
+		"todo":    "state-todo-id",
+		"ready":   "state-ready-id",
+		"running": "state-running-id",
+		"review":  "state-review-id",
+		"merging": "state-merging-id",
+		"done":    "state-done-id",
+		"rework":  "state-rework-id",
+		"blocked": "state-blocked-id",
 	}
 
 	var gotStateID string
