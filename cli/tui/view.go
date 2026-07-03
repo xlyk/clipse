@@ -336,8 +336,8 @@ func (m Model) livenessBadge(now int64) string {
 	}
 	segs := []string{dot, "  ", age}
 	// A prominent tally of how many agents are actively working right now
-	// (claims held, across every lane) so concurrent coder/reviewer/scribe
-	// work is legible without scanning the sections for spinners.
+	// (claims held, across every lane) so concurrent coder/reviewer work is
+	// legible without scanning the sections for spinners.
 	if n := m.workingCount(); n > 0 {
 		segs = append(segs, "  ", lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render(fmt.Sprintf("⚡ %d working", n)))
 	}
@@ -412,7 +412,7 @@ func (m Model) count(status string) int { return m.counts[status] }
 
 // inFlightCount sums the downstream active columns for the header chip.
 func (m Model) inFlightCount() int {
-	return m.count("review") + m.count("rework") + m.count("merging") + m.count("documentation")
+	return m.count("review") + m.count("rework") + m.count("merging")
 }
 
 // countChip renders a "glyph N label" stat chip in the given accent color.
@@ -430,8 +430,6 @@ func laneColor(lane string) lipgloss.Color {
 		return cPurple
 	case "git_operator":
 		return cOrange
-	case "scribe":
-		return cTeal
 	default:
 		return cDim
 	}
@@ -467,8 +465,6 @@ func statusColor(status string) lipgloss.Color {
 		return cAmber
 	case "merging":
 		return cPurple
-	case "documentation":
-		return cTeal
 	case "ready":
 		return cCyan
 	case "blocked":

@@ -10,14 +10,10 @@ import (
 // kanbanColumns is the left-to-right board order rendered by the kanban view.
 // "blocked" is included (beyond the core pipeline columns) so parked issues
 // are never invisible on the board.
-var kanbanColumns = []string{"todo", "ready", "running", "review", "rework", "merging", "documentation", "blocked", "done"}
+var kanbanColumns = []string{"todo", "ready", "running", "review", "rework", "merging", "blocked", "done"}
 
-// kanbanLabel is the short column heading — "documentation" is abbreviated so
-// the heading fits a narrow column without wrapping.
+// kanbanLabel is the short column heading.
 func kanbanLabel(status string) string {
-	if status == "documentation" {
-		return "docs"
-	}
 	return status
 }
 

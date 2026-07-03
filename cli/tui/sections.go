@@ -75,7 +75,7 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 	}
 
 	// Liveness is per-row (an active claim = a worker on it now), so the
-	// spinner lights up for a working agent in ANY lane — reviewer, scribe, or
+	// spinner lights up for a working agent in ANY lane — reviewer or
 	// git_operator — not only the coder-lane "running" section.
 	lead := lipgloss.NewStyle().Foreground(s.accent).Render(s.glyph)
 	if row.Live {
@@ -89,7 +89,7 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 	}
 
 	// Badge the lane actually working the card when it's live (reviewer while
-	// a review card is being reviewed, scribe while docs are written), falling
+	// a review card is being reviewed, git_operator while it merges), falling
 	// back to the issue's home label when nothing is actively on it.
 	badgeLane := row.LaneLabel
 	if row.Live && row.ActiveLane != "" {

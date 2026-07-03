@@ -77,7 +77,7 @@ type Row struct {
 	// Live is true iff the dispatcher currently holds a claim on this issue —
 	// i.e. a worker is actively working it RIGHT NOW, in whatever lane. It is
 	// keyed off the claim, not board_status, so it lights up for the
-	// reviewer/scribe/git_operator agents (review/documentation/merging) just
+	// reviewer/git_operator agents (review/merging) just
 	// as it does for the coder ("running"), and it goes dark for a card merely
 	// parked in a downstream column waiting to be claimed. Live rows render
 	// with the spinner + elapsed, whatever section they fall in.
@@ -100,7 +100,7 @@ type Model struct {
 	running  []Row
 	blocked  []Row
 	queued   []Row // ready + todo, in that order
-	inFlight []Row // review + rework + merging + documentation, in that order
+	inFlight []Row // review + rework + merging, in that order
 
 	// ordered is every visible row flattened in section order
 	// (running→in flight→blocked→queued), the list the selection cursor walks.
@@ -198,7 +198,7 @@ func NewModel(opts ...Option) Model {
 // Running, Blocked, Queued, and InFlight expose the current display-ready
 // rows for each dashboard section. Queued folds "ready" and "todo" issues
 // together; InFlight folds every active downstream lane-entry column
-// (review/rework/merging/documentation) together, labeled per-row by its
+// (review/rework/merging) together, labeled per-row by its
 // own column (Row.Status) since — unlike the other three sections — it
 // spans more than one board_status value.
 func (m Model) Running() []Row  { return m.running }
@@ -526,9 +526,9 @@ func (m *Model) fold(snap store.Snapshot) {
 			m.blocked = append(m.blocked, row)
 		case "ready", "todo":
 			m.queued = append(m.queued, row)
-		case "review", "rework", "merging", "documentation":
+		case "review", "rework", "merging":
 			// Active downstream lane-entry columns: a card here is either
-			// currently claimed (a Reviewer/Git-operator/Scribe run in
+			// currently claimed (a Reviewer/Git-operator run in
 			// flight) or waiting its turn to be claimed — either way it is
 			// still "in play", not invisible the way an unhandled
 			// board_status previously left it. "done" deliberately has no
