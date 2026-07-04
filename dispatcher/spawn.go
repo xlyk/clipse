@@ -55,6 +55,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		env = append(env, clipseReviewFeedbackEnvVar+"="+reviewFeedback)
 	}
 
+	model, docsModel := d.modelsFor(lane)
 	spec := spawn.WorkerSpec{
 		Issue:        issue.Identifier,
 		Lane:         lane,
@@ -64,6 +65,8 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		Env:          env,
 		CheckpointDB: d.checkpointDBPath(issue),
 		MaxTokens:    d.cfg.MaxTokensPerRun,
+		Model:        model,
+		DocsModel:    docsModel,
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -115,6 +118,25 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 // this is non-empty (see internal/spawn.workerArgs). Real production
 // configs always have a non-empty CheckpointsDir, since config.Load
 // defaults it.
+// modelsFor resolves the "provider:model" spec(s) a spawned lane's worker
+// should get from cfg.Models, keyed purely by lane — the same resolution
+// applies whether spawnAttempt was invoked from a fresh claim (spawnClaim) or
+// a turn-cap continuation (applyContinue), since a run's lane never changes
+// across its own turns. Only the Coder lane runs the docs sub-step
+// (graphs/coder.py's run_docs node), so every other lane's docsModel is
+// always "". A lane with no configured model (e.g. git_operator, which never
+// spawns a DAC worker at all) resolves to ("", "").
+func (d *Dispatcher) modelsFor(lane string) (model, docsModel string) {
+	switch lane {
+	case string(contract.LaneCoder):
+		return d.cfg.Models.Coder, d.cfg.Models.CoderDocs
+	case string(contract.LaneReviewer):
+		return d.cfg.Models.Reviewer, ""
+	default:
+		return "", ""
+	}
+}
+
 func (d *Dispatcher) checkpointDBPath(issue store.Issue) string {
 	if d.cfg.CheckpointsDir == "" {
 		return ""
