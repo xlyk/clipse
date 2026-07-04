@@ -34,6 +34,8 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs.coder import build_coder_graph
 from clipse_agent.graphs.reviewer import build_reviewer_graph
+from clipse_agent.profiles.coder import get_coder_docs_profile, get_coder_profile
+from clipse_agent.profiles.reviewer import get_reviewer_profile
 
 _ZERO_TOKENS = Tokens(**{"in": 0, "out": 0})
 
@@ -52,6 +54,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", default="")
     parser.add_argument("--checkpoint-db", default="")
     parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--model", default="")
+    parser.add_argument("--docs-model", default="")
     return parser
 
 
@@ -102,7 +106,9 @@ def _blocked_transient(args: argparse.Namespace, *, lane: Lane, summary: str) ->
     )
 
 
-async def _run_lane_graph(args: argparse.Namespace, build_graph: Any, *, lane: Lane) -> WorkerResult:
+async def _run_lane_graph(
+    args: argparse.Namespace, build_graph: Any, *, lane: Lane, extra_kwargs: dict[str, Any] | None = None
+) -> WorkerResult:
     """Drive one turn of `build_graph`'s graph and return its result.
 
     Shared by every lane `_dispatch` knows how to route to (coder/
@@ -118,6 +124,13 @@ async def _run_lane_graph(args: argparse.Namespace, build_graph: Any, *, lane: L
     owned by the kernel, shared by every lane that runs against that
     issue); otherwise the graph runs with no checkpointer at all -- still
     correct for a single turn, just without cross-process resume.
+
+    `extra_kwargs` carries lane-specific keyword arguments `_dispatch`
+    already resolved (e.g. the coder lane's `profile`/`docs_profile`) that
+    get forwarded verbatim into `build_graph` alongside `checkpointer`. The
+    `or {}` guard matters: `build_graph(**None)` raises `TypeError`, and a
+    lane that has no extra kwargs (or a caller that omits the argument
+    entirely) must still build cleanly.
 
     `lane` is `_dispatch`'s own already-matched Lane for this call, used
     ONLY to namespace the OUTER wrapping-graph's checkpoint thread_id below
@@ -144,12 +157,12 @@ async def _run_lane_graph(args: argparse.Namespace, build_graph: Any, *, lane: L
     config: dict[str, Any] = {"configurable": {"thread_id": f"{args.thread}::{lane.value}"}}
 
     if not args.checkpoint_db:
-        graph = build_graph(checkpointer=None)
+        graph = build_graph(checkpointer=None, **(extra_kwargs or {}))
         final_state = await graph.ainvoke(input_state, config)
         return final_state["result"]
 
     async with AsyncSqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer:
-        graph = build_graph(checkpointer=checkpointer)
+        graph = build_graph(checkpointer=checkpointer, **(extra_kwargs or {}))
         final_state = await graph.ainvoke(input_state, config)
         return final_state["result"]
 
@@ -172,9 +185,22 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
     """
     lane = _coerce_lane(args.lane)
     if lane == Lane.coder:
-        return await _run_lane_graph(args, build_coder_graph, lane=Lane.coder)
+        return await _run_lane_graph(
+            args,
+            build_coder_graph,
+            lane=Lane.coder,
+            extra_kwargs={
+                "profile": get_coder_profile(args.model or None),
+                "docs_profile": get_coder_docs_profile(args.docs_model or None),
+            },
+        )
     if lane == Lane.reviewer:
-        return await _run_lane_graph(args, build_reviewer_graph, lane=Lane.reviewer)
+        return await _run_lane_graph(
+            args,
+            build_reviewer_graph,
+            lane=Lane.reviewer,
+            extra_kwargs={"profile": get_reviewer_profile(args.model or None)},
+        )
     return _blocked_transient(
         args,
         lane=lane if lane is not None else Lane.coder,

@@ -50,6 +50,14 @@ def test_model_is_a_provider_qualified_placeholder_not_a_key():
     assert "key" not in profile.model.lower()
 
 
+def test_get_reviewer_profile_model_override():
+    assert get_reviewer_profile("openai_codex:gpt-5.5").model == "openai_codex:gpt-5.5"
+
+
+def test_get_reviewer_profile_default_preserved():
+    assert get_reviewer_profile().model == "anthropic:claude-opus-4-6"
+
+
 def test_reviewer_model_is_distinct_from_coder_model():
     # Design doc: "Optionally run the Reviewer lane on a stronger or
     # distinct model to reduce correlated blind spots" -- Coder and

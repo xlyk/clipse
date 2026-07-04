@@ -43,6 +43,10 @@ not guess, and do not loop.
 - Only run commands from your shell allow-list.
 """
 
+# Single-sourced so get_coder_profile and get_coder_docs_profile -- which
+# share the same default model -- can't drift apart.
+_DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
+
 _SHELL_ALLOW_LIST: tuple[str, ...] = (
     "git",
     "gh",
@@ -81,16 +85,18 @@ class CoderProfile:
     shell_allow_list: tuple[str, ...]
 
 
-def get_coder_profile() -> CoderProfile:
+def get_coder_profile(model: str | None = None) -> CoderProfile:
     """Return the Coder lane's DAC profile.
 
     `model` is a placeholder `provider:model` spec, never a live credential
     — secrets (e.g. `ANTHROPIC_API_KEY`) reach the DAC agent via the
-    worker's scrubbed environment, not this profile.
+    worker's scrubbed environment, not this profile. When omitted (`None`),
+    falls back to `_DEFAULT_MODEL`; `worker.py` passes an explicit override
+    resolved from the kernel's `--model` flag.
     """
     return CoderProfile(
         assistant_id="clipse-coder",
-        model="anthropic:claude-sonnet-4-6",
+        model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_SYSTEM_PROMPT,
         shell_allow_list=_SHELL_ALLOW_LIST,
     )
@@ -150,17 +156,18 @@ _DOCS_SHELL_ALLOW_LIST: tuple[str, ...] = (
 )
 
 
-def get_coder_docs_profile() -> CoderProfile:
+def get_coder_docs_profile(model: str | None = None) -> CoderProfile:
     """Return the DAC profile for the Coder lane's documentation sub-step.
 
     A distinct `assistant_id` ("clipse-coder-docs") keeps the docs turn's
     telemetry/checkpoints separable from the coding turn's; the model matches
-    the coding turn (docs need no stronger model). Like `get_coder_profile`,
-    `model` is a placeholder spec, never a live credential.
+    the coding turn by default (docs need no stronger model). Like
+    `get_coder_profile`, `model` is a placeholder spec, never a live
+    credential, and falls back to `_DEFAULT_MODEL` when omitted (`None`).
     """
     return CoderProfile(
         assistant_id="clipse-coder-docs",
-        model="anthropic:claude-sonnet-4-6",
+        model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_DOCS_SYSTEM_PROMPT,
         shell_allow_list=_DOCS_SHELL_ALLOW_LIST,
     )

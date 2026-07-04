@@ -42,6 +42,14 @@ def test_model_is_a_provider_qualified_placeholder_not_a_key():
     assert "key" not in profile.model.lower()
 
 
+def test_get_coder_docs_profile_model_override():
+    assert get_coder_docs_profile("openai_codex:gpt-5.5").model == "openai_codex:gpt-5.5"
+
+
+def test_get_coder_docs_profile_default_preserved():
+    assert get_coder_docs_profile().model == "anthropic:claude-sonnet-4-6"
+
+
 def test_prompt_targets_the_uncommitted_pre_review_change_not_a_merge():
     prompt = get_coder_docs_profile().system_prompt
     assert prompt.strip()

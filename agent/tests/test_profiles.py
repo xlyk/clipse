@@ -30,6 +30,14 @@ def test_get_coder_profile_is_deterministic():
     assert get_coder_profile() == get_coder_profile()
 
 
+def test_get_coder_profile_model_override():
+    assert get_coder_profile("openai_codex:gpt-5.5").model == "openai_codex:gpt-5.5"
+
+
+def test_get_coder_profile_default_preserved():
+    assert get_coder_profile().model == "anthropic:claude-sonnet-4-6"
+
+
 def test_assistant_id_is_clipse_coder():
     profile = get_coder_profile()
 

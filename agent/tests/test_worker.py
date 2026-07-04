@@ -57,17 +57,27 @@ class _FakeGraph:
         return self._final_state
 
 
-def _fake_build_coder_graph(graph: _FakeGraph, build_calls: list[Any]) -> Any:
+def _fake_build_coder_graph(
+    graph: _FakeGraph, build_calls: list[Any], kwarg_calls: list[dict[str, Any]] | None = None
+) -> Any:
     """Named after its original (Coder-lane) use, but genuinely lane-generic:
     every `build_*_graph` function worker.py calls takes the same
     `checkpointer=...` keyword and returns a compiled graph, so this one
     fake factory is reused below for `build_reviewer_graph` too -- mirrors
     `dac.build_coder_agent` being reused across lanes for the same reason
     (see graphs/reviewer.py's docstring).
+
+    Accepts `**kwargs` -- not just `checkpointer` -- because `_dispatch` now
+    forwards lane-specific `extra_kwargs` (e.g. `profile`/`docs_profile`)
+    into `build_graph` alongside `checkpointer`; every call's kwargs are
+    recorded into `kwarg_calls` (when given) so a test can assert on exactly
+    what `_dispatch` passed through.
     """
 
-    def factory(*, checkpointer: Any = None) -> _FakeGraph:
+    def factory(*, checkpointer: Any = None, **kwargs: Any) -> _FakeGraph:
         build_calls.append(checkpointer)
+        if kwarg_calls is not None:
+            kwarg_calls.append(kwargs)
         return graph
 
     return factory
@@ -98,8 +108,9 @@ def _run_main_capture(
     graph: _FakeGraph,
     build_calls: list[Any],
     attr: str = "build_coder_graph",
+    kwarg_calls: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], WorkerResult]:
-    monkeypatch.setattr(worker, attr, _fake_build_coder_graph(graph, build_calls))
+    monkeypatch.setattr(worker, attr, _fake_build_coder_graph(graph, build_calls, kwarg_calls))
     exit_code = worker.main(argv)
     assert exit_code == 0
 
@@ -361,6 +372,85 @@ def test_main_dispatches_reviewer_lane_and_prints_graph_result(monkeypatch, caps
     assert input_state["workspace"] == "/ws"
     assert input_state["max_tokens"] is None
     assert graph.calls[0]["config"] == {"configurable": {"thread_id": "thread-20::reviewer"}}
+
+
+# ---------------------------------------------------------------------------
+# --model/--docs-model threading: _dispatch resolves these into the lane's
+# profile(s) and forwards them to build_graph as extra kwargs.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_threads_model_into_coder_profile(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            "--issue=SPAC-1",
+            "--lane=coder",
+            "--run=run-1",
+            "--thread=thread-1",
+            "--workspace=/ws",
+            "--model=openai_codex:gpt-5.5",
+            "--docs-model=anthropic:claude-sonnet-4-6",
+        ],
+        graph=graph,
+        build_calls=build_calls,
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["profile"].model == "openai_codex:gpt-5.5"
+    assert kwarg_calls[-1]["docs_profile"].model == "anthropic:claude-sonnet-4-6"
+
+
+def test_dispatch_coder_falls_back_to_default_models_when_flags_omitted(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        ["--issue=SPAC-1", "--lane=coder", "--run=run-1", "--thread=thread-1", "--workspace=/ws"],
+        graph=graph,
+        build_calls=build_calls,
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["profile"].model == "anthropic:claude-sonnet-4-6"
+    assert kwarg_calls[-1]["docs_profile"].model == "anthropic:claude-sonnet-4-6"
+
+
+def test_dispatch_reviewer_has_no_docs_profile(monkeypatch, capsys):
+    canned = _canned_result(lane=Lane.reviewer, outcome=Outcome.done, summary="reviewed the diff: no issues found")
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            "--issue=SPAC-20",
+            "--lane=reviewer",
+            "--run=run-1",
+            "--thread=thread-20",
+            "--workspace=/ws",
+            "--model=anthropic:claude-opus-4-6",
+        ],
+        graph=graph,
+        build_calls=build_calls,
+        attr="build_reviewer_graph",
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["profile"].model == "anthropic:claude-opus-4-6"
+    assert "docs_profile" not in kwarg_calls[-1]
 
 
 # ---------------------------------------------------------------------------

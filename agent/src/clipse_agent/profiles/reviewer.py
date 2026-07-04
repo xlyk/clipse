@@ -62,6 +62,8 @@ than assuming either verdict, and prefer CHANGES_REQUESTED over an unearned \
 PASS.
 """
 
+_DEFAULT_MODEL = "anthropic:claude-opus-4-6"
+
 # Read-mostly: no write/execute-capable commands (no sed/mkdir/go/uv/python/
 # make/echo/etc, unlike the Coder lane's list in profiles/coder.py) -- a
 # reviewer inspects the code, it never edits it.
@@ -92,20 +94,21 @@ class ReviewerProfile:
     shell_allow_list: tuple[str, ...]
 
 
-def get_reviewer_profile() -> ReviewerProfile:
+def get_reviewer_profile(model: str | None = None) -> ReviewerProfile:
     """Return the Reviewer lane's DAC profile.
 
     `model` names a placeholder `provider:model` spec, never a live
     credential -- secrets (e.g. `ANTHROPIC_API_KEY`) reach the DAC agent via
-    the worker's scrubbed environment, not this profile. It is deliberately
-    a *different* model than `profiles.coder.get_coder_profile`'s: the
+    the worker's scrubbed environment, not this profile. When omitted
+    (`None`), falls back to `_DEFAULT_MODEL`, which is deliberately a
+    *different* model than `profiles.coder.get_coder_profile`'s default: the
     design doc calls for "a stronger or distinct model to reduce correlated
     blind spots" precisely because a reviewer sharing the coder's model
     family is advisory signal, not a safety guarantee.
     """
     return ReviewerProfile(
         assistant_id="clipse-reviewer",
-        model="anthropic:claude-opus-4-6",
+        model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_SYSTEM_PROMPT,
         shell_allow_list=_SHELL_ALLOW_LIST,
     )
