@@ -38,6 +38,16 @@ def test_get_coder_profile_default_preserved():
     assert get_coder_profile().model == "anthropic:claude-sonnet-4-6"
 
 
+def test_get_coder_profile_model_params_override():
+    profile = get_coder_profile(model_params={"reasoning_effort": "high"})
+
+    assert profile.model_params == {"reasoning_effort": "high"}
+
+
+def test_get_coder_profile_model_params_default_is_none():
+    assert get_coder_profile().model_params is None
+
+
 def test_assistant_id_is_clipse_coder():
     profile = get_coder_profile()
 

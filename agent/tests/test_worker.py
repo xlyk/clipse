@@ -454,6 +454,104 @@ def test_dispatch_reviewer_has_no_docs_profile(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# --model-params/--docs-model-params threading: same shape as --model/
+# --docs-model above, but each carries a JSON-encoded dict of extra
+# model-construction kwargs instead of a provider:model spec string.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_threads_model_params_into_coder_and_docs_profile(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            "--issue=SPAC-1",
+            "--lane=coder",
+            "--run=run-1",
+            "--thread=thread-1",
+            "--workspace=/ws",
+            '--model-params={"reasoning_effort": "high"}',
+            '--docs-model-params={"reasoning_effort": "low"}',
+        ],
+        graph=graph,
+        build_calls=build_calls,
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["profile"].model_params == {"reasoning_effort": "high"}
+    assert kwarg_calls[-1]["docs_profile"].model_params == {"reasoning_effort": "low"}
+
+
+def test_dispatch_coder_model_params_default_to_none_when_flags_omitted(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        ["--issue=SPAC-1", "--lane=coder", "--run=run-1", "--thread=thread-1", "--workspace=/ws"],
+        graph=graph,
+        build_calls=build_calls,
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["profile"].model_params is None
+    assert kwarg_calls[-1]["docs_profile"].model_params is None
+
+
+def test_dispatch_threads_model_params_into_reviewer_profile(monkeypatch, capsys):
+    canned = _canned_result(lane=Lane.reviewer, outcome=Outcome.done, summary="reviewed the diff: no issues found")
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            "--issue=SPAC-20",
+            "--lane=reviewer",
+            "--run=run-1",
+            "--thread=thread-20",
+            "--workspace=/ws",
+            '--model-params={"reasoning_effort": "high"}',
+        ],
+        graph=graph,
+        build_calls=build_calls,
+        attr="build_reviewer_graph",
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["profile"].model_params == {"reasoning_effort": "high"}
+
+
+def test_dispatch_reviewer_model_params_default_to_none_when_flag_omitted(monkeypatch, capsys):
+    canned = _canned_result(lane=Lane.reviewer, outcome=Outcome.done, summary="reviewed the diff: no issues found")
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        ["--issue=SPAC-20", "--lane=reviewer", "--run=run-1", "--thread=thread-20", "--workspace=/ws"],
+        graph=graph,
+        build_calls=build_calls,
+        attr="build_reviewer_graph",
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["profile"].model_params is None
+
+
+# ---------------------------------------------------------------------------
 # Outer wrapping-graph checkpoint thread_id: namespaced per lane so
 # coder/reviewer never collide on the same physical checkpoint (the inner DAC
 # thread is already namespaced this way one level down -- see graphs/coder.py's

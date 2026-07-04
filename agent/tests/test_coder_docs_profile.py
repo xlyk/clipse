@@ -50,6 +50,16 @@ def test_get_coder_docs_profile_default_preserved():
     assert get_coder_docs_profile().model == "anthropic:claude-sonnet-4-6"
 
 
+def test_get_coder_docs_profile_model_params_override():
+    profile = get_coder_docs_profile(model_params={"reasoning_effort": "high"})
+
+    assert profile.model_params == {"reasoning_effort": "high"}
+
+
+def test_get_coder_docs_profile_model_params_default_is_none():
+    assert get_coder_docs_profile().model_params is None
+
+
 def test_prompt_targets_the_uncommitted_pre_review_change_not_a_merge():
     prompt = get_coder_docs_profile().system_prompt
     assert prompt.strip()

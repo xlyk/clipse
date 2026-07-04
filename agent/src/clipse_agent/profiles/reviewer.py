@@ -29,6 +29,7 @@ name a distinct or stronger model than the Coder lane's -- see
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 _SYSTEM_PROMPT = """\
 You are the Reviewer lane of Clipse, a headless code-review agent. You \
@@ -85,16 +86,20 @@ class ReviewerProfile:
     Fields line up with `profiles.coder.CoderProfile`: an assistant
     identity, a `provider:model` spec, a system prompt, and a shell
     allow-list. `shell_allow_list` is a tuple (not a list) so the frozen
-    dataclass is actually immutable end to end.
+    dataclass is actually immutable end to end. `model_params` is a plain
+    `dict`, mirroring `CoderProfile.model_params` -- frozen blocks
+    *reassigning* the field, not mutating the dict it points to, and this
+    value is only ever read after being built once.
     """
 
     assistant_id: str
     model: str
     system_prompt: str
     shell_allow_list: tuple[str, ...]
+    model_params: dict[str, Any] | None = None
 
 
-def get_reviewer_profile(model: str | None = None) -> ReviewerProfile:
+def get_reviewer_profile(model: str | None = None, model_params: dict[str, Any] | None = None) -> ReviewerProfile:
     """Return the Reviewer lane's DAC profile.
 
     `model` names a placeholder `provider:model` spec, never a live
@@ -105,10 +110,16 @@ def get_reviewer_profile(model: str | None = None) -> ReviewerProfile:
     design doc calls for "a stronger or distinct model to reduce correlated
     blind spots" precisely because a reviewer sharing the coder's model
     family is advisory signal, not a safety guarantee.
+
+    `model_params` is an opaque bag of extra model-construction kwargs
+    (config.ModelParams's `Reviewer` map, threaded through as JSON via
+    `worker.py`'s `--model-params` flag). Unlike `model`, it has no default
+    to fall back to -- omitted (`None`) means exactly that: no overrides.
     """
     return ReviewerProfile(
         assistant_id="clipse-reviewer",
         model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_SYSTEM_PROMPT,
         shell_allow_list=_SHELL_ALLOW_LIST,
+        model_params=model_params,
     )

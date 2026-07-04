@@ -17,6 +17,7 @@ this profile only carries the allow-list itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 _SYSTEM_PROMPT = """\
 You are the Coder lane of Clipse, a headless coding agent. You implement a \
@@ -76,16 +77,22 @@ class CoderProfile:
     (`deepagents_code.agent`) needs to build the lane's DAC agent: an
     assistant identity, a `provider:model` spec, a system prompt, and a
     shell allow-list. `shell_allow_list` is a tuple (not a list) so the
-    frozen dataclass is actually immutable end to end.
+    frozen dataclass is actually immutable end to end. `model_params` is a
+    plain `dict` rather than a tuple: frozen blocks *reassigning* the field,
+    not mutating the dict it points to, and unlike `shell_allow_list` this
+    value is never mutated in place — it is built once (config.ModelParams,
+    threaded through the kernel and `worker.py`'s `--model-params` JSON) and
+    only ever read.
     """
 
     assistant_id: str
     model: str
     system_prompt: str
     shell_allow_list: tuple[str, ...]
+    model_params: dict[str, Any] | None = None
 
 
-def get_coder_profile(model: str | None = None) -> CoderProfile:
+def get_coder_profile(model: str | None = None, model_params: dict[str, Any] | None = None) -> CoderProfile:
     """Return the Coder lane's DAC profile.
 
     `model` is a placeholder `provider:model` spec, never a live credential
@@ -93,12 +100,18 @@ def get_coder_profile(model: str | None = None) -> CoderProfile:
     worker's scrubbed environment, not this profile. When omitted (`None`),
     falls back to `_DEFAULT_MODEL`; `worker.py` passes an explicit override
     resolved from the kernel's `--model` flag.
+
+    `model_params` is an opaque bag of extra model-construction kwargs
+    (config.ModelParams's `Coder` map, threaded through as JSON via
+    `worker.py`'s `--model-params` flag). Unlike `model`, it has no default
+    to fall back to — omitted (`None`) means exactly that: no overrides.
     """
     return CoderProfile(
         assistant_id="clipse-coder",
         model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_SYSTEM_PROMPT,
         shell_allow_list=_SHELL_ALLOW_LIST,
+        model_params=model_params,
     )
 
 
@@ -156,7 +169,7 @@ _DOCS_SHELL_ALLOW_LIST: tuple[str, ...] = (
 )
 
 
-def get_coder_docs_profile(model: str | None = None) -> CoderProfile:
+def get_coder_docs_profile(model: str | None = None, model_params: dict[str, Any] | None = None) -> CoderProfile:
     """Return the DAC profile for the Coder lane's documentation sub-step.
 
     A distinct `assistant_id` ("clipse-coder-docs") keeps the docs turn's
@@ -164,10 +177,15 @@ def get_coder_docs_profile(model: str | None = None) -> CoderProfile:
     the coding turn by default (docs need no stronger model). Like
     `get_coder_profile`, `model` is a placeholder spec, never a live
     credential, and falls back to `_DEFAULT_MODEL` when omitted (`None`).
+
+    `model_params` mirrors `get_coder_profile`'s: an opaque, no-default kwargs
+    bag (config.ModelParams's `CoderDocs` map, threaded through as JSON via
+    `worker.py`'s `--docs-model-params` flag) that stays `None` when omitted.
     """
     return CoderProfile(
         assistant_id="clipse-coder-docs",
         model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_DOCS_SYSTEM_PROMPT,
         shell_allow_list=_DOCS_SHELL_ALLOW_LIST,
+        model_params=model_params,
     )

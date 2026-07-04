@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 import traceback
@@ -56,6 +57,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--model", default="")
     parser.add_argument("--docs-model", default="")
+    parser.add_argument("--model-params", default="")
+    parser.add_argument("--docs-model-params", default="")
     return parser
 
 
@@ -76,6 +79,18 @@ def _resolve_max_tokens(args: argparse.Namespace) -> int | None:
         return int(raw)
     except ValueError:
         return None
+
+
+def _parse_params(raw: str) -> dict[str, Any] | None:
+    """Decode a `--model-params`/`--docs-model-params` flag value.
+
+    The kernel hands these over as compact JSON only when the corresponding
+    lane has a `model_params` block configured (`internal/spawn.LocalSpawner`
+    omits the flag entirely otherwise, so `raw` defaults to `""` here) --
+    mirroring `CoderProfile.model_params`/`ReviewerProfile.model_params`'s own
+    "no config means None, not some empty-dict default" contract.
+    """
+    return json.loads(raw) if raw else None
 
 
 def _coerce_lane(raw: str) -> Lane | None:
@@ -190,8 +205,10 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
             build_coder_graph,
             lane=Lane.coder,
             extra_kwargs={
-                "profile": get_coder_profile(args.model or None),
-                "docs_profile": get_coder_docs_profile(args.docs_model or None),
+                "profile": get_coder_profile(args.model or None, model_params=_parse_params(args.model_params)),
+                "docs_profile": get_coder_docs_profile(
+                    args.docs_model or None, model_params=_parse_params(args.docs_model_params)
+                ),
             },
         )
     if lane == Lane.reviewer:
@@ -199,7 +216,9 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
             args,
             build_reviewer_graph,
             lane=Lane.reviewer,
-            extra_kwargs={"profile": get_reviewer_profile(args.model or None)},
+            extra_kwargs={
+                "profile": get_reviewer_profile(args.model or None, model_params=_parse_params(args.model_params))
+            },
         )
     return _blocked_transient(
         args,
