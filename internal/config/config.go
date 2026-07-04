@@ -37,18 +37,27 @@ const (
 	// and orphan max_attempts are NOT covered: those park immediately. A cap
 	// of 0 disables auto-recovery entirely (every failure parks).
 	defaultRecoverCap = 5
-	// defaultMaxTokensPerRun is the per-run token ceiling passed to the
-	// worker (as --max-tokens) when max_tokens_per_run is absent from the
-	// YAML document. The worker aborts over budget with
+	// defaultMaxTokensPerRun is the per-round context (input-token) ceiling
+	// passed to the worker (as --max-tokens) when max_tokens_per_run is
+	// absent from the YAML document: the largest single DAC round's input
+	// the worker will allow before blocking, with
 	// outcome=blocked/block_kind=capability (Phase 2 plan item B2).
 	//
-	// This is a cumulative sum over every model call in a DAC turn, and each
-	// call re-sends the growing message history, so a real coding turn with a
-	// few dozen tool calls easily accumulates hundreds of thousands of INPUT
-	// tokens (against a tiny output count). 200k blocked even trivial tasks
-	// live, so the default is 1M — a safety backstop against a runaway loop,
-	// not a working budget. Override per-repo via max_tokens_per_run.
-	defaultMaxTokensPerRun = 1_000_000
+	// This is NOT a cumulative-spend cap. drive_turn (agent/) compares each
+	// round's input tokens individually, not their running sum, so a long
+	// but healthy turn can run indefinitely without ever tripping it — it's
+	// a post-compaction runaway guard. DAC's built-in auto-summarizer
+	// already keeps each round under a fraction of the model's advertised
+	// context window, which clipse tunes down via the coder/reviewer
+	// profile's context_window_tokens field (default 200k, so compaction
+	// triggers around 170k/round — see AGENTS.md). 400k sits comfortably
+	// above that trigger, giving compaction room to do its job, while
+	// staying well under any real model's context window, so this guard
+	// only fires on a genuine runaway. max_runtime_s and turn_cap remain
+	// the backstops against total work across a run (wall-clock,
+	// continuation count) — this bounds one round, not the whole run.
+	// Override per-repo via max_tokens_per_run.
+	defaultMaxTokensPerRun = 400_000
 	// defaultCheckpointsDir mirrors defaultBoardDir's default board
 	// directory ("./.clipse"): the design doc's checkpointer-path
 	// convention is "<board>/checkpoints/<issue_id>.db". This is a plain
@@ -192,10 +201,13 @@ type Config struct {
 	// corresponding YAML key is present — no defaulting (see ModelParams's
 	// doc comment).
 	ModelParams ModelParams `yaml:"model_params"`
-	// MaxTokensPerRun is the per-run token ceiling passed to the worker
-	// (--max-tokens); it tracks usage from its own DAC callbacks and aborts
-	// over budget (Phase 2 plan item B2). Defaults to defaultMaxTokensPerRun
-	// when absent from the YAML document.
+	// MaxTokensPerRun is the per-round context (input-token) ceiling passed
+	// to the worker (--max-tokens): the largest single DAC round's input
+	// the worker will allow before blocking capability — not a
+	// cumulative-spend cap. See defaultMaxTokensPerRun's doc comment for
+	// the full semantics and its relationship to DAC's auto-compaction and
+	// the max_runtime_s/turn_cap backstops. Defaults to
+	// defaultMaxTokensPerRun when absent from the YAML document.
 	MaxTokensPerRun int `yaml:"max_tokens_per_run"`
 	// CheckpointsDir holds one LangGraph checkpointer SQLite database per
 	// issue (<CheckpointsDir>/<issue-identifier>.db), outside any git
