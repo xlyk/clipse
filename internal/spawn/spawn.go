@@ -64,6 +64,16 @@ type WorkerSpec struct {
 	// Optional: LocalSpawner appends --max-tokens=<value> only when this is
 	// > 0.
 	MaxTokens int
+
+	// Model is "provider:model" for this lane's DAC agent (empty = worker
+	// default). Optional: LocalSpawner appends --model=<value> only when
+	// this is non-empty.
+	Model string
+
+	// DocsModel is "provider:model" for the coder graph's docs sub-step
+	// (empty = worker default). Optional: LocalSpawner appends
+	// --docs-model=<value> only when this is non-empty.
+	DocsModel string
 }
 
 // Spawner starts a worker process for spec and returns a handle to observe

@@ -126,6 +126,49 @@ func TestWorkerArgs(t *testing.T) {
 				"--max-tokens=50000",
 			},
 		},
+		{
+			name: "model only",
+			spec: WorkerSpec{
+				Lane:  "coder",
+				Model: "openai_codex:gpt-5.5",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				"--model=openai_codex:gpt-5.5",
+			},
+		},
+		{
+			name: "docs-model only",
+			spec: WorkerSpec{
+				Lane:      "coder",
+				DocsModel: "anthropic:claude-sonnet-4-6",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				"--docs-model=anthropic:claude-sonnet-4-6",
+			},
+		},
+		{
+			name: "both empty omits both flags",
+			spec: WorkerSpec{
+				Lane: "reviewer",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=reviewer",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+			},
+		},
 	}
 
 	for _, tt := range tests {
