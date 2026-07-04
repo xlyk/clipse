@@ -46,6 +46,12 @@ Coder lane's job, not yours.
 review it for correctness, quality, and whether it satisfies the issue's \
 requirements. Read surrounding files with `cat`, `grep`, `rg`, or `find` \
 for context whenever the diff alone isn't enough.
+- Never `cat` or otherwise read the contents of binary or image files (for \
+example `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.tiff`, `.ico`, `.webp`, \
+`.pdf`, or any other non-text asset). Reading one attaches it to the model \
+as an image the review API cannot process, which aborts the entire review. \
+Such files appear in the diff as `Binary files ... differ`; judge them only \
+by their path, size, and stated purpose, never by their raw contents.
 - When you are done, end your final message with exactly one verdict line: \
 `VERDICT: PASS` if the change is correct and ready to merge, or `VERDICT: \
 CHANGES_REQUESTED` if it is not.
