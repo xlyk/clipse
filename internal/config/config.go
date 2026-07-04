@@ -129,6 +129,19 @@ type Models struct {
 	Reviewer  string `yaml:"reviewer"`
 }
 
+// ModelParams holds opaque per-lane model-construction kwargs (DAC
+// create_model extra_kwargs — e.g. a codex reasoning effort or an anthropic
+// extended-thinking budget), threaded down to the worker. Unlike Models, the
+// kernel never validates the *semantics* of these values — they are carried
+// through as-is, keeping the kernel LLM-free. A nil map means the lane has no
+// overrides (inherit ~/.deepagents/config.toml / provider default); there is
+// no defaulting.
+type ModelParams struct {
+	Coder     map[string]any `yaml:"coder"`
+	CoderDocs map[string]any `yaml:"coder_docs"`
+	Reviewer  map[string]any `yaml:"reviewer"`
+}
+
 // Config is the fully parsed and validated clipse configuration.
 type Config struct {
 	Repo Repo `yaml:"repo"`
@@ -174,6 +187,11 @@ type Config struct {
 	// (defaultModelCoder/defaultModelCoderDocs/defaultModelReviewer) when
 	// absent from the YAML document.
 	Models Models `yaml:"models"`
+	// ModelParams holds opaque per-lane model-construction kwargs threaded
+	// down to the worker alongside Models. Each field is nil unless the
+	// corresponding YAML key is present — no defaulting (see ModelParams's
+	// doc comment).
+	ModelParams ModelParams `yaml:"model_params"`
 	// MaxTokensPerRun is the per-run token ceiling passed to the worker
 	// (--max-tokens); it tracks usage from its own DAC callbacks and aborts
 	// over budget (Phase 2 plan item B2). Defaults to defaultMaxTokensPerRun
@@ -229,6 +247,21 @@ type rawModels struct {
 	Reviewer  *string `yaml:"reviewer"`
 }
 
+// rawModelParams mirrors ModelParams. Unlike rawModels, its fields need no
+// pointer indirection to tell "absent from YAML" apart from "explicitly
+// set": a map's own zero value (nil) already means absent (yaml.v3 leaves it
+// nil unless the document sets the key), and there is no default value to
+// distinguish it from (model_params never defaults — see ModelParams's doc
+// comment). rawConfig embeds this behind a pointer (unlike rawModels, which
+// is a plain value) so Load can tell "model_params: omitted entirely" apart
+// from "model_params: present"; see Load's nil-guard when copying it into
+// Config.
+type rawModelParams struct {
+	Coder     map[string]any `yaml:"coder"`
+	CoderDocs map[string]any `yaml:"coder_docs"`
+	Reviewer  map[string]any `yaml:"reviewer"`
+}
+
 // rawConfig mirrors Config but uses pointers for every field that has a
 // default, so Load can distinguish "missing from YAML" from "explicitly
 // set to the zero value" before defaulting and validating. EnvAllowlist is a
@@ -246,20 +279,23 @@ type rawConfig struct {
 	Worker Worker `yaml:"worker"`
 	// Models is plain (not pointer-wrapped), like Caps: its own fields
 	// (rawModels) carry the pointers needed to detect "absent from YAML".
-	Models          rawModels `yaml:"models"`
-	PollIntervalS   *int      `yaml:"poll_interval_s"`
-	Caps            rawCaps   `yaml:"caps"`
-	TurnCap         *int      `yaml:"turn_cap"`
-	MaxRuntimeS     *int      `yaml:"max_runtime_s"`
-	LaneLabelPrefix *string   `yaml:"lane_label_prefix"`
-	MaxAttempts     *int      `yaml:"max_attempts"`
-	ReworkCap       *int      `yaml:"rework_cap"`
-	RecoverCap      *int      `yaml:"recover_cap"`
-	RecoverBackoffS *int      `yaml:"recover_backoff_s"`
-	MaxTokensPerRun *int      `yaml:"max_tokens_per_run"`
-	CheckpointsDir  *string   `yaml:"checkpoints_dir"`
-	BoardDir        *string   `yaml:"board_dir"`
-	EnvAllowlist    []string  `yaml:"env_allowlist"`
+	Models rawModels `yaml:"models"`
+	// ModelParams is pointer-wrapped, unlike Models: see rawModelParams's
+	// doc comment for why.
+	ModelParams     *rawModelParams `yaml:"model_params"`
+	PollIntervalS   *int            `yaml:"poll_interval_s"`
+	Caps            rawCaps         `yaml:"caps"`
+	TurnCap         *int            `yaml:"turn_cap"`
+	MaxRuntimeS     *int            `yaml:"max_runtime_s"`
+	LaneLabelPrefix *string         `yaml:"lane_label_prefix"`
+	MaxAttempts     *int            `yaml:"max_attempts"`
+	ReworkCap       *int            `yaml:"rework_cap"`
+	RecoverCap      *int            `yaml:"recover_cap"`
+	RecoverBackoffS *int            `yaml:"recover_backoff_s"`
+	MaxTokensPerRun *int            `yaml:"max_tokens_per_run"`
+	CheckpointsDir  *string         `yaml:"checkpoints_dir"`
+	BoardDir        *string         `yaml:"board_dir"`
+	EnvAllowlist    []string        `yaml:"env_allowlist"`
 }
 
 // Load reads the clipse config file at path, applies defaults for fields
@@ -280,6 +316,19 @@ func Load(path string) (*Config, error) {
 	// lands roughly one poll later), so it must be known before defaulting.
 	pollIntervalS := intOrDefault(raw.PollIntervalS, defaultPollIntervalS)
 
+	// model_params is an opaque passthrough (kernel LLM-free, no validated
+	// vocabulary) with no defaulting: every lane stays nil unless the YAML
+	// document sets it, including all three when model_params itself is
+	// absent entirely (raw.ModelParams == nil).
+	var modelParams ModelParams
+	if raw.ModelParams != nil {
+		modelParams = ModelParams{
+			Coder:     raw.ModelParams.Coder,
+			CoderDocs: raw.ModelParams.CoderDocs,
+			Reviewer:  raw.ModelParams.Reviewer,
+		}
+	}
+
 	cfg := &Config{
 		Repo:    raw.Repo,
 		TeamKey: raw.TeamKey,
@@ -290,6 +339,7 @@ func Load(path string) (*Config, error) {
 			CoderDocs: stringOrDefault(raw.Models.CoderDocs, defaultModelCoderDocs),
 			Reviewer:  stringOrDefault(raw.Models.Reviewer, defaultModelReviewer),
 		},
+		ModelParams:     modelParams,
 		PollIntervalS:   pollIntervalS,
 		TurnCap:         intOrDefault(raw.TurnCap, defaultTurnCap),
 		MaxRuntimeS:     intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),

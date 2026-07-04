@@ -327,6 +327,45 @@ models:
 	}
 }
 
+// TestLoad_ModelParams asserts a model_params: block parses into opaque
+// per-lane maps (including nested values), that an omitted model_params
+// yields nil maps for all three lanes, and that keys default independently
+// (only coder set -> coder_docs/reviewer stay nil).
+func TestLoad_ModelParams(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML+`
+model_params:
+  coder: { reasoning_effort: high }
+  reviewer: { thinking: { type: enabled, budget_tokens: 10000 } }
+`)
+	if cfg.ModelParams.Coder["reasoning_effort"] != "high" {
+		t.Errorf("coder reasoning_effort = %v", cfg.ModelParams.Coder["reasoning_effort"])
+	}
+	if cfg.ModelParams.CoderDocs != nil {
+		t.Errorf("coder_docs should be nil, got %v", cfg.ModelParams.CoderDocs)
+	}
+	th, _ := cfg.ModelParams.Reviewer["thinking"].(map[string]any)
+	if th == nil || th["type"] != "enabled" {
+		t.Errorf("reviewer thinking = %v", cfg.ModelParams.Reviewer["thinking"])
+	}
+}
+
+// TestLoad_ModelParamsOmittedIsNil asserts that omitting model_params
+// entirely yields nil maps for every lane — no defaulting, since
+// model_params is an opaque passthrough with no built-in values.
+func TestLoad_ModelParamsOmittedIsNil(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML)
+
+	if cfg.ModelParams.Coder != nil {
+		t.Errorf("Coder = %v, want nil", cfg.ModelParams.Coder)
+	}
+	if cfg.ModelParams.CoderDocs != nil {
+		t.Errorf("CoderDocs = %v, want nil", cfg.ModelParams.CoderDocs)
+	}
+	if cfg.ModelParams.Reviewer != nil {
+		t.Errorf("Reviewer = %v, want nil", cfg.ModelParams.Reviewer)
+	}
+}
+
 func TestLoad_InvalidConfigs(t *testing.T) {
 	tests := []struct {
 		name          string

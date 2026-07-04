@@ -98,6 +98,15 @@ models:
   coder_docs: "anthropic:claude-sonnet-4-6"
   reviewer: "anthropic:claude-opus-4-6"
 
+# model_params: optional per-lane kwargs passed to the model constructor
+# (DAC create_model extra_kwargs). Overrides ~/.deepagents/config.toml provider
+# params. Opaque to the kernel. Examples: codex reasoning effort, anthropic
+# extended-thinking budget. Omit a lane to inherit config.toml / provider default.
+# model_params:
+#   coder: { reasoning_effort: high }
+#   coder_docs: { reasoning_effort: low }
+#   reviewer: { thinking: { type: enabled, budget_tokens: 10000 } }
+
 # checkpoints_dir: directory holding one LangGraph checkpointer SQLite
 # database per issue (<checkpoints_dir>/<issue-identifier>.db), outside any
 # git worktree — passed to the worker per-issue as --checkpoint-db. Defaults
