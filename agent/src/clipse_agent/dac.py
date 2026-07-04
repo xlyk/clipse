@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from deepagents_code.agent import create_cli_agent
+from deepagents_code.config import create_model
+from deepagents_code.model_config import CODEX_PROVIDER
 from langchain_core.messages import AIMessage
 from langgraph.types import Command
 
@@ -99,11 +101,18 @@ def build_coder_agent(
     and an ambiguous issue can never block for input.
 
     Raises:
-        DacError: wrapping anything `create_cli_agent` raises.
+        DacError: wrapping anything `create_model` or `create_cli_agent` raises
+            (including a `MissingCredentialsError` from either).
     """
     try:
+        model: str | Any = profile.model
+        if profile.model.split(":", 1)[0] == CODEX_PROVIDER:
+            # init_chat_model can't resolve the DAC-only "openai_codex" provider
+            # (raises ValueError); DAC's create_model wires the on-disk OAuth
+            # token store and returns a ready BaseChatModel to hand over instead.
+            model = create_model(profile.model).model
         return create_cli_agent(
-            profile.model,
+            model,
             profile.assistant_id,
             system_prompt=profile.system_prompt,
             interactive=False,

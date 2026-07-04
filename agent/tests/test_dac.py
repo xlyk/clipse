@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -132,6 +133,56 @@ def test_build_coder_agent_wraps_create_cli_agent_errors(monkeypatch):
         dac.build_coder_agent(profile, checkpointer=None, cwd="/tmp/work")
 
     assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_build_coder_agent_codex_prebuilds_model_object(monkeypatch):
+    # init_chat_model can't resolve the DAC-only "openai_codex" provider, so
+    # build_coder_agent must hand create_cli_agent the pre-built BaseChatModel
+    # object from create_model, never the raw "openai_codex:..." string.
+    sentinel = object()
+    monkeypatch.setattr(dac, "create_model", lambda spec: SimpleNamespace(model=sentinel))
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        dac,
+        "create_cli_agent",
+        lambda model, aid, **kw: captured.update(model=model) or (object(), object()),
+    )
+
+    dac.build_coder_agent(get_coder_profile(model="openai_codex:gpt-5.5"), None, "/tmp")
+
+    assert captured["model"] is sentinel  # object, never the string
+
+
+def test_build_coder_agent_anthropic_passes_string(monkeypatch):
+    # Every other provider keeps the plain-string path untouched -- create_model
+    # must not even be called.
+    called = {"create_model": False}
+    monkeypatch.setattr(
+        dac, "create_model", lambda spec: called.__setitem__("create_model", True)
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        dac,
+        "create_cli_agent",
+        lambda model, aid, **kw: captured.update(model=model) or (object(), object()),
+    )
+
+    dac.build_coder_agent(get_coder_profile(model="anthropic:claude-sonnet-4-6"), None, "/tmp")
+
+    assert captured["model"] == "anthropic:claude-sonnet-4-6"
+    assert called["create_model"] is False
+
+
+def test_build_coder_agent_wraps_create_model_failure(monkeypatch):
+    def boom(spec):
+        raise RuntimeError("no creds")
+
+    monkeypatch.setattr(dac, "create_model", boom)
+
+    with pytest.raises(dac.DacError) as exc_info:
+        dac.build_coder_agent(get_coder_profile(model="openai_codex:gpt-5.5"), None, "/tmp")
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 # ---------------------------------------------------------------------------
