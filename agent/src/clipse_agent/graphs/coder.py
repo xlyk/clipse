@@ -364,16 +364,20 @@ def _docs_task_text(state: CoderState) -> str:
 
 
 def _docs_max_tokens(state: CoderState) -> int | None:
-    """The docs turn's token budget: whatever the coding turn left of
-    `max_tokens`, so the whole coder run honors a single ceiling. `None` (no
-    ceiling) stays `None`; an already-spent budget yields 0, which trips
-    `drive_turn`'s ceiling immediately and the docs turn best-effort skips.
+    """The docs turn's token budget: the SAME per-round ceiling the coding
+    turn used, not `ceiling - cumulative_spent`.
+
+    `drive_turn`'s ceiling is per-round, not cumulative (it caps the largest
+    single round's input tokens -- see its docstring); the docs turn is a
+    SEPARATE DAC turn with its own per-round guard, so it must receive that
+    same ceiling unchanged. Deducting the coding turn's cumulative spend here
+    was a leftover from the old cumulative-pool model: after a big coding
+    turn, `ceiling - spent` could land at (or near) zero and trip the docs
+    turn's ceiling on its very first round -- best-effort-skipping docs
+    whenever the coding turn ran long, regardless of how large `max_tokens`
+    actually is. `None` (no ceiling configured) still stays `None`.
     """
-    ceiling = state.get("max_tokens")
-    if ceiling is None:
-        return None
-    spent = state.get("tokens_in", 0) + state.get("tokens_out", 0)
-    return max(0, ceiling - spent)
+    return state.get("max_tokens")
 
 
 def make_run_docs(

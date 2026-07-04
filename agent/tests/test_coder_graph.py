@@ -820,6 +820,55 @@ def test_load_context_folds_both_prior_summary_and_review_feedback():
 
 
 # ---------------------------------------------------------------------------
+# _docs_max_tokens (pure) -- per-round ceiling, not cumulative-spend-adjusted
+# ---------------------------------------------------------------------------
+
+
+def test_docs_max_tokens_passes_the_full_ceiling_regardless_of_coding_turn_spend():
+    # Task 1 changed drive_turn's ceiling semantics to per-round (the largest
+    # single round's input tokens), not a cumulative turn sum. The docs turn
+    # is a SEPARATE DAC turn with its own per-round guard, so it must get the
+    # same full ceiling the coding turn got -- not `ceiling - cumulative_spent`,
+    # which could go to (near) zero after a big coding turn and trip the docs
+    # turn's ceiling on its very first round, regardless of how large
+    # max_tokens actually is.
+    state = {"max_tokens": 100_000, "tokens_in": 95_000, "tokens_out": 4_999}
+
+    assert coder._docs_max_tokens(state) == 100_000
+
+
+def test_docs_max_tokens_is_none_when_no_ceiling_configured():
+    assert coder._docs_max_tokens({"tokens_in": 10, "tokens_out": 5}) is None
+
+
+def test_docs_max_tokens_ignores_absent_token_fields():
+    assert coder._docs_max_tokens({"max_tokens": 50_000}) == 50_000
+
+
+def test_docs_turn_receives_full_ceiling_after_large_coding_spend(tmp_path):
+    # End-to-end: even though the coding turn spent almost the entire
+    # ceiling, the docs turn's DAC call still gets the FULL max_tokens, not
+    # the remainder.
+    code_result = DacTurnResult(
+        outcome_hint="completed", final_text="did the code", tokens_in=90_000, tokens_out=9_000
+    )
+    docs_result = DacTurnResult(outcome_hint="completed", final_text="did the docs", tokens_in=10, tokens_out=10)
+    turn_calls: list[dict[str, Any]] = []
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver_by_turn(code_result, docs_result, turn_calls),
+        run_command=_base_runner(),
+    )
+    input_state = {**_needs_review_input(tmp_path), "max_tokens": 100_000}
+
+    _order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-docs"}}))
+
+    _assert_valid_result(result, blocked=False)
+    docs_call = next(c for c in turn_calls if _is_docs_turn(c["config"]))
+    assert docs_call["max_tokens"] == 100_000
+
+
+# ---------------------------------------------------------------------------
 # route_after_dac (pure)
 # ---------------------------------------------------------------------------
 
