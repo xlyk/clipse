@@ -639,6 +639,31 @@ def _commit_message(state: CoderState) -> str:
     return f"{issue_id}: {headline}"[:72]
 
 
+_CONFLICT_MARKER_PATTERN = r"^(<<<<<<<|=======|>>>>>>>)"
+
+
+def _unresolved_conflict_markers(run_command: CommandRunner, cwd: str, files: Sequence[str]) -> list[str]:
+    """Which of `files` (the merge's own conflicted paths, relative to `cwd`)
+    still contain an unresolved conflict marker line (`<<<<<<<`, `=======`, or
+    `>>>>>>>`) -- i.e. the conflict-resolution DAC turn
+    (`_conflict_resolution_task_text`) claimed to be done but actually left
+    the file incompletely resolved.
+
+    `grep -l` prints the name of each matching file and exits 0 when at least
+    one matches, 1 when none do -- an empty `stdout` either way means clean,
+    so (like `_unmerged_paths`) this reads `stdout` alone and ignores
+    `returncode` entirely, always with `check=False` since "no matches" is a
+    normal, expected outcome here, never a command failure.
+    """
+    result = _run(
+        run_command,
+        ["grep", "-lE", _CONFLICT_MARKER_PATTERN, *files],
+        cwd,
+        check=False,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
 def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
     """Stage and commit whatever this turn changed.
 
@@ -651,13 +676,25 @@ def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, 
     prior interrupted turn via `make_sync_base`'s MERGE_HEAD guard; either
     way a real merge is sitting in progress in the worktree:
 
-    - Merge in progress: the conflict-resolution DAC turn just edited the
-      conflicted files (see `_coding_task_text`); `git commit --no-edit`
-      concludes the merge with git's own two-parent message. A commit always
-      happens on this path -- even if `git status --porcelain` looks clean
-      (e.g. a prior turn already staged the resolution before being
-      interrupted) -- because concluding an in-progress merge is mandatory,
-      not conditional on there being a fresh diff.
+    - Merge in progress: BEFORE staging or committing anything, every file in
+      `merge_conflict_files` is scanned for a remaining `<<<<<<<`/`=======`/
+      `>>>>>>>` marker (`_unresolved_conflict_markers`). Nothing here proves
+      the conflict-resolution DAC turn (`_coding_task_text`) actually removed
+      every marker -- it only edited files and said it was done -- so if any
+      listed file still has one, this raises `CoderGraphError` instead of
+      committing: landing literal conflict markers on the shared branch would
+      be syntactically broken code reaching CI/the reviewer before anyone
+      catches it, defeating the point of resolving the conflict at all. The
+      error propagates out of the graph so the worker's top-level handler
+      emits a `blocked` result (never a partial stage/commit/push) -- a
+      bounded retry re-runs this issue, and `sync_base`'s MERGE_HEAD guard
+      lets the coder resume resolving exactly where it left off. Only once
+      every file is clean does `git commit --no-edit` conclude the merge with
+      git's own two-parent message; that commit always happens on this path
+      -- even if `git status --porcelain` looks clean (e.g. a prior turn
+      already staged the resolution before being interrupted) -- because
+      concluding an in-progress merge is mandatory, not conditional on there
+      being a fresh diff.
     - No merge in progress: the existing single-parent commit, skipped
       entirely when `git status --porcelain` reports no changes at all, so a
       turn that only left commentary (no file edits) doesn't fail on
@@ -666,7 +703,13 @@ def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, 
 
     def _node(state: CoderState) -> dict[str, Any]:
         cwd = state["cwd"]
-        merging = bool(state.get("merge_conflict_files"))
+        conflict_files = state.get("merge_conflict_files") or []
+        merging = bool(conflict_files)
+
+        if merging:
+            unresolved = _unresolved_conflict_markers(run_command, cwd, conflict_files)
+            if unresolved:
+                raise CoderGraphError(f"unresolved conflict markers remain in: {', '.join(unresolved)}")
 
         _run(run_command, ["git", "add", "-A"], cwd)
         status = _run(run_command, ["git", "status", "--porcelain"], cwd)

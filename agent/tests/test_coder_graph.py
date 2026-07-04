@@ -1460,3 +1460,94 @@ def test_commit_completes_merge_even_when_status_looks_clean(tmp_path):
     commit_calls = [c for c in runner.calls if c.argv[:2] == ["git", "commit"]]
     assert len(commit_calls) == 1
     assert commit_calls[0].argv == ["git", "commit", "--no-edit"]
+
+
+# ---------------------------------------------------------------------------
+# commit's unresolved-marker guard (Task 3 review gap): a merge-completion
+# commit must never land literal `<<<<<<<`/`=======`/`>>>>>>>` conflict
+# markers on the shared branch just because the conflict-resolution DAC turn
+# claimed to be done without actually finishing.
+# ---------------------------------------------------------------------------
+
+
+def test_commit_raises_when_unresolved_conflict_markers_remain(tmp_path):
+    # grep -l exit 0 with a filename on stdout means that file still has a
+    # marker -- the conflict-resolution turn did not actually finish.
+    runner = FakeRunner(
+        rules=[(_starts_with("grep", "-lE"), coder.CommandResult(0, "src/a.py\n", ""))]
+    )
+    node = coder.make_commit(runner)
+
+    with pytest.raises(coder.CoderGraphError, match="src/a.py"):
+        node(
+            {
+                "cwd": str(tmp_path),
+                "issue_id": "SPAC-1",
+                "turn_count": 0,
+                "merge_conflict_files": ["src/a.py", "src/b.py"],
+            }
+        )
+
+    # Must never stage or commit a file that still has conflict markers in it.
+    add_calls = [c for c in runner.calls if c.argv[:2] == ["git", "add"]]
+    commit_calls = [c for c in runner.calls if c.argv[:2] == ["git", "commit"]]
+    push_calls = [c for c in runner.calls if c.argv[:2] == ["git", "push"]]
+    assert add_calls == []
+    assert commit_calls == []
+    assert push_calls == []
+
+    grep_calls = [c for c in runner.calls if c.argv[:1] == ["grep"]]
+    assert len(grep_calls) == 1
+    # Scoped to the coder's OWN worktree -- never the clipse repo this test
+    # process itself runs from.
+    assert grep_calls[0].cwd == str(tmp_path)
+    assert grep_calls[0].argv == ["grep", "-lE", r"^(<<<<<<<|=======|>>>>>>>)", "src/a.py", "src/b.py"]
+
+
+def test_commit_proceeds_when_conflict_markers_are_fully_resolved(tmp_path):
+    # grep -l exit 1 with no output means clean -- every conflicted file was
+    # actually resolved, so the merge-completing commit proceeds as before.
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("grep", "-lE"), coder.CommandResult(1, "", "")),
+            (
+                _starts_with("git", "status", "--porcelain"),
+                coder.CommandResult(0, "M  src/a.py\nM  src/b.py\n", ""),
+            ),
+        ]
+    )
+    node = coder.make_commit(runner)
+
+    out = node(
+        {
+            "cwd": str(tmp_path),
+            "issue_id": "SPAC-1",
+            "turn_count": 0,
+            "merge_conflict_files": ["src/a.py", "src/b.py"],
+        }
+    )
+
+    assert set(out["artifacts"]) == {"src/a.py", "src/b.py"}
+    assert out["committed"] is True
+    commit_calls = [c for c in runner.calls if c.argv[:2] == ["git", "commit"]]
+    assert len(commit_calls) == 1
+    assert commit_calls[0].argv == ["git", "commit", "--no-edit"]
+
+
+def test_commit_never_greps_for_markers_when_no_merge_in_progress(tmp_path):
+    # The guard is specific to the merge-completion path -- a normal
+    # (non-merge) commit has no `merge_conflict_files` to check and must
+    # never shell out to grep at all.
+    runner = FakeRunner(
+        rules=[
+            (
+                _starts_with("git", "status", "--porcelain"),
+                coder.CommandResult(0, " M src/a.py\n", ""),
+            )
+        ]
+    )
+    node = coder.make_commit(runner)
+
+    node({"cwd": str(tmp_path), "issue_id": "SPAC-1", "turn_count": 0})
+
+    assert [c for c in runner.calls if c.argv[:1] == ["grep"]] == []
