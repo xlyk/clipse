@@ -118,6 +118,13 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 // this is non-empty (see internal/spawn.workerArgs). Real production
 // configs always have a non-empty CheckpointsDir, since config.Load
 // defaults it.
+func (d *Dispatcher) checkpointDBPath(issue store.Issue) string {
+	if d.cfg.CheckpointsDir == "" {
+		return ""
+	}
+	return filepath.Join(d.cfg.CheckpointsDir, issue.Identifier+".db")
+}
+
 // modelsFor resolves the "provider:model" spec(s) a spawned lane's worker
 // should get from cfg.Models, keyed purely by lane — the same resolution
 // applies whether spawnAttempt was invoked from a fresh claim (spawnClaim) or
@@ -135,13 +142,6 @@ func (d *Dispatcher) modelsFor(lane string) (model, docsModel string) {
 	default:
 		return "", ""
 	}
-}
-
-func (d *Dispatcher) checkpointDBPath(issue store.Issue) string {
-	if d.cfg.CheckpointsDir == "" {
-		return ""
-	}
-	return filepath.Join(d.cfg.CheckpointsDir, issue.Identifier+".db")
 }
 
 // blockOnSpawnFailure transitions issue straight to blocked when the
