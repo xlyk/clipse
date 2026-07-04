@@ -21,6 +21,33 @@ func writeYAML(t *testing.T, contents string) string {
 	return path
 }
 
+// baseValidYAML is a minimal valid config (mirrors
+// TestLoad_MinimalConfigGetsDefaults's fixture) that tests needing a
+// loadable base append field-specific overrides to.
+const baseValidYAML = `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+worker:
+  command:
+    - clipse-worker
+`
+
+// loadYAML writes contents to a temp clipse.yaml and loads it, failing the
+// test immediately on any unexpected Load error.
+func loadYAML(t *testing.T, contents string) *config.Config {
+	t.Helper()
+	path := writeYAML(t, contents)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	return cfg
+}
+
 func TestLoad_ValidFullConfig(t *testing.T) {
 	path := writeYAML(t, `
 repo:
@@ -56,6 +83,10 @@ worker:
     - /abs/path/agent
     - run
     - clipse-worker
+models:
+  coder: "openai_codex:gpt-5.5"
+  coder_docs: "openai_codex:gpt-5.5-mini"
+  reviewer: "anthropic:claude-opus-4-7"
 checkpoints_dir: "/abs/path/board/checkpoints"
 board_dir: "/abs/path/board"
 `)
@@ -133,6 +164,15 @@ board_dir: "/abs/path/board"
 	if cfg.BoardDir != "/abs/path/board" {
 		t.Errorf("BoardDir = %q, want %q", cfg.BoardDir, "/abs/path/board")
 	}
+	if cfg.Models.Coder != "openai_codex:gpt-5.5" {
+		t.Errorf("Models.Coder = %q, want %q", cfg.Models.Coder, "openai_codex:gpt-5.5")
+	}
+	if cfg.Models.CoderDocs != "openai_codex:gpt-5.5-mini" {
+		t.Errorf("Models.CoderDocs = %q, want %q", cfg.Models.CoderDocs, "openai_codex:gpt-5.5-mini")
+	}
+	if cfg.Models.Reviewer != "anthropic:claude-opus-4-7" {
+		t.Errorf("Models.Reviewer = %q, want %q", cfg.Models.Reviewer, "anthropic:claude-opus-4-7")
+	}
 }
 
 func TestLoad_MinimalConfigGetsDefaults(t *testing.T) {
@@ -204,6 +244,15 @@ worker:
 	if cfg.BoardDir != "./.clipse" {
 		t.Errorf("BoardDir = %q, want default %q", cfg.BoardDir, "./.clipse")
 	}
+	if cfg.Models.Coder != "anthropic:claude-sonnet-4-6" {
+		t.Errorf("Models.Coder = %q, want default %q", cfg.Models.Coder, "anthropic:claude-sonnet-4-6")
+	}
+	if cfg.Models.CoderDocs != "anthropic:claude-sonnet-4-6" {
+		t.Errorf("Models.CoderDocs = %q, want default %q", cfg.Models.CoderDocs, "anthropic:claude-sonnet-4-6")
+	}
+	if cfg.Models.Reviewer != "anthropic:claude-opus-4-6" {
+		t.Errorf("Models.Reviewer = %q, want default %q", cfg.Models.Reviewer, "anthropic:claude-opus-4-6")
+	}
 }
 
 // TestLoad_RecoverBackoffDefaultsToPollInterval asserts recover_backoff_s
@@ -255,6 +304,26 @@ worker:
 	}
 	if cfg.RecoverCap != 0 {
 		t.Errorf("RecoverCap = %d, want 0 (kill switch)", cfg.RecoverCap)
+	}
+}
+
+// TestLoad_PartialModelsOverride asserts models.* fields default
+// independently: overriding only models.coder must not disturb
+// coder_docs/reviewer's own defaults.
+func TestLoad_PartialModelsOverride(t *testing.T) {
+	// only models.coder set -> coder_docs & reviewer keep their independent defaults
+	cfg := loadYAML(t, baseValidYAML+`
+models:
+  coder: "openai_codex:gpt-5.5"
+`)
+	if cfg.Models.Coder != "openai_codex:gpt-5.5" {
+		t.Errorf("Coder = %q, want openai_codex:gpt-5.5", cfg.Models.Coder)
+	}
+	if cfg.Models.CoderDocs != "anthropic:claude-sonnet-4-6" {
+		t.Errorf("CoderDocs = %q, want default", cfg.Models.CoderDocs)
+	}
+	if cfg.Models.Reviewer != "anthropic:claude-opus-4-6" {
+		t.Errorf("Reviewer = %q, want default", cfg.Models.Reviewer)
 	}
 }
 
@@ -520,6 +589,30 @@ worker:
 max_tokens_per_run: 0
 `,
 			wantErrSubstr: "max_tokens_per_run",
+		},
+		{
+			name: "model missing colon",
+			yaml: baseValidYAML + `
+models:
+  coder: "gpt-5.5"
+`,
+			wantErrSubstr: "models.coder",
+		},
+		{
+			name: "model empty provider",
+			yaml: baseValidYAML + `
+models:
+  coder: ":gpt-5.5"
+`,
+			wantErrSubstr: "models.coder",
+		},
+		{
+			name: "model empty name",
+			yaml: baseValidYAML + `
+models:
+  coder: "openai_codex:"
+`,
+			wantErrSubstr: "models.coder",
 		},
 	}
 

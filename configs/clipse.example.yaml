@@ -89,6 +89,15 @@ worker:
     - run
     - clipse-worker
 
+# models: the "provider:model" spec per DAC profile. Omit any key to keep the
+# built-in default. Keep coder and reviewer on different model families so the
+# reviewer isn't rubber-stamping its own sibling's code. openai_codex:* uses a
+# one-time ChatGPT sign-in on the dispatcher host (see AGENTS.md), no API key.
+models:
+  coder: "anthropic:claude-sonnet-4-6"
+  coder_docs: "anthropic:claude-sonnet-4-6"
+  reviewer: "anthropic:claude-opus-4-6"
+
 # checkpoints_dir: directory holding one LangGraph checkpointer SQLite
 # database per issue (<checkpoints_dir>/<issue-identifier>.db), outside any
 # git worktree — passed to the worker per-issue as --checkpoint-db. Defaults

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -59,6 +60,12 @@ const (
 	// default, now promoted into config so it can be set once instead of
 	// passed on every invocation.
 	defaultBoardDir = "./.clipse"
+	// Keep in sync with the Python profile defaults in
+	// agent/src/clipse_agent/profiles/{coder,reviewer}.py — a divergence
+	// silently changes an unconfigured deploy's model.
+	defaultModelCoder     = "anthropic:claude-sonnet-4-6"
+	defaultModelCoderDocs = "anthropic:claude-sonnet-4-6"
+	defaultModelReviewer  = "anthropic:claude-opus-4-6"
 )
 
 // defaultEnvAllowlist is the env var allow-list applied when env_allowlist
@@ -111,6 +118,17 @@ type Worker struct {
 	Command []string `yaml:"command"`
 }
 
+// Models specifies the "provider:model" spec used per DAC profile
+// (validateModelSpec enforces the "provider:model", both-halves-non-empty
+// shape only — the kernel stays LLM-free and never validates a model
+// vocabulary). CoderDocs is the Coder lane's documentation sub-step
+// (graphs/coder.py's run_docs node), not a separate lane.
+type Models struct {
+	Coder     string `yaml:"coder"`
+	CoderDocs string `yaml:"coder_docs"`
+	Reviewer  string `yaml:"reviewer"`
+}
+
 // Config is the fully parsed and validated clipse configuration.
 type Config struct {
 	Repo Repo `yaml:"repo"`
@@ -151,6 +169,11 @@ type Config struct {
 	// Worker configures the clipse-worker subprocess invocation. Required —
 	// see Worker.Command's doc comment.
 	Worker Worker `yaml:"worker"`
+	// Models holds the per-lane "provider:model" spec threaded down to the
+	// worker (--model/--docs-model). Each field defaults independently
+	// (defaultModelCoder/defaultModelCoderDocs/defaultModelReviewer) when
+	// absent from the YAML document.
+	Models Models `yaml:"models"`
 	// MaxTokensPerRun is the per-run token ceiling passed to the worker
 	// (--max-tokens); it tracks usage from its own DAC callbacks and aborts
 	// over budget (Phase 2 plan item B2). Defaults to defaultMaxTokensPerRun
@@ -194,6 +217,18 @@ type rawCaps struct {
 	PerLane rawPerLaneCaps `yaml:"per_lane"`
 }
 
+// rawModels mirrors Models with pointer fields so Load can distinguish
+// "absent from YAML" (nil, gets a default) from "explicitly set" — the same
+// reasoning as rawPerLaneCaps. Like rawCaps.PerLane, this is embedded as a
+// plain value (not a pointer) in rawConfig: a YAML document that omits
+// `models:` entirely still yields a zero-value rawModels with all-nil
+// fields, so no nil-sub-struct guard is needed before reading them.
+type rawModels struct {
+	Coder     *string `yaml:"coder"`
+	CoderDocs *string `yaml:"coder_docs"`
+	Reviewer  *string `yaml:"reviewer"`
+}
+
 // rawConfig mirrors Config but uses pointers for every field that has a
 // default, so Load can distinguish "missing from YAML" from "explicitly
 // set to the zero value" before defaulting and validating. EnvAllowlist is a
@@ -208,20 +243,23 @@ type rawConfig struct {
 	// Worker is plain (not pointer-wrapped) like Repo: it's required, with
 	// no default to apply, so Load copies it straight through and validate
 	// checks it.
-	Worker          Worker   `yaml:"worker"`
-	PollIntervalS   *int     `yaml:"poll_interval_s"`
-	Caps            rawCaps  `yaml:"caps"`
-	TurnCap         *int     `yaml:"turn_cap"`
-	MaxRuntimeS     *int     `yaml:"max_runtime_s"`
-	LaneLabelPrefix *string  `yaml:"lane_label_prefix"`
-	MaxAttempts     *int     `yaml:"max_attempts"`
-	ReworkCap       *int     `yaml:"rework_cap"`
-	RecoverCap      *int     `yaml:"recover_cap"`
-	RecoverBackoffS *int     `yaml:"recover_backoff_s"`
-	MaxTokensPerRun *int     `yaml:"max_tokens_per_run"`
-	CheckpointsDir  *string  `yaml:"checkpoints_dir"`
-	BoardDir        *string  `yaml:"board_dir"`
-	EnvAllowlist    []string `yaml:"env_allowlist"`
+	Worker Worker `yaml:"worker"`
+	// Models is plain (not pointer-wrapped), like Caps: its own fields
+	// (rawModels) carry the pointers needed to detect "absent from YAML".
+	Models          rawModels `yaml:"models"`
+	PollIntervalS   *int      `yaml:"poll_interval_s"`
+	Caps            rawCaps   `yaml:"caps"`
+	TurnCap         *int      `yaml:"turn_cap"`
+	MaxRuntimeS     *int      `yaml:"max_runtime_s"`
+	LaneLabelPrefix *string   `yaml:"lane_label_prefix"`
+	MaxAttempts     *int      `yaml:"max_attempts"`
+	ReworkCap       *int      `yaml:"rework_cap"`
+	RecoverCap      *int      `yaml:"recover_cap"`
+	RecoverBackoffS *int      `yaml:"recover_backoff_s"`
+	MaxTokensPerRun *int      `yaml:"max_tokens_per_run"`
+	CheckpointsDir  *string   `yaml:"checkpoints_dir"`
+	BoardDir        *string   `yaml:"board_dir"`
+	EnvAllowlist    []string  `yaml:"env_allowlist"`
 }
 
 // Load reads the clipse config file at path, applies defaults for fields
@@ -243,10 +281,15 @@ func Load(path string) (*Config, error) {
 	pollIntervalS := intOrDefault(raw.PollIntervalS, defaultPollIntervalS)
 
 	cfg := &Config{
-		Repo:            raw.Repo,
-		TeamKey:         raw.TeamKey,
-		TeamID:          raw.TeamID,
-		Worker:          raw.Worker,
+		Repo:    raw.Repo,
+		TeamKey: raw.TeamKey,
+		TeamID:  raw.TeamID,
+		Worker:  raw.Worker,
+		Models: Models{
+			Coder:     stringOrDefault(raw.Models.Coder, defaultModelCoder),
+			CoderDocs: stringOrDefault(raw.Models.CoderDocs, defaultModelCoderDocs),
+			Reviewer:  stringOrDefault(raw.Models.Reviewer, defaultModelReviewer),
+		},
 		PollIntervalS:   pollIntervalS,
 		TurnCap:         intOrDefault(raw.TurnCap, defaultTurnCap),
 		MaxRuntimeS:     intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),
@@ -391,6 +434,30 @@ func validate(cfg *Config) error {
 		if arg == "" {
 			return fmt.Errorf("worker.command must not contain empty entries")
 		}
+	}
+	// models.* are checked last, alongside worker.command, for the same
+	// isolation reason: a fixture targeting a single models.* error carries
+	// a full valid repo/team_key/team_id/worker.command, so nothing earlier
+	// in this function fires first.
+	if err := validateModelSpec("models.coder", cfg.Models.Coder); err != nil {
+		return err
+	}
+	if err := validateModelSpec("models.coder_docs", cfg.Models.CoderDocs); err != nil {
+		return err
+	}
+	if err := validateModelSpec("models.reviewer", cfg.Models.Reviewer); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateModelSpec checks only the "provider:model" shape (both halves
+// non-empty) — never a model vocabulary, keeping the kernel LLM-free by
+// design.
+func validateModelSpec(field, spec string) error {
+	provider, name, ok := strings.Cut(spec, ":")
+	if !ok || provider == "" || name == "" {
+		return fmt.Errorf("%s must be \"provider:model\" with both halves non-empty, got %q", field, spec)
 	}
 	return nil
 }
