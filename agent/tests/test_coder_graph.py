@@ -60,6 +60,19 @@ def _starts_with(*prefix: str) -> Callable[[list[str]], bool]:
     return lambda argv: argv[: len(prefix)] == list(prefix)
 
 
+# `sync_base` (Task 3) and `make_commit` (Task 3) both probe MERGE_HEAD via
+# `git rev-parse -q --verify MERGE_HEAD`. Every fixture/test below that
+# doesn't care about an in-progress merge needs this to report "no merge in
+# progress" (non-zero exit) -- otherwise `FakeRunner`'s default (a clean
+# zero-exit, empty-stdout success for anything unscripted) would make every
+# such probe look like a merge IS in progress, silently rerouting sync_base
+# away from its fetch/merge path.
+_NO_MERGE_IN_PROGRESS = (
+    _starts_with("git", "rev-parse", "-q", "--verify", "MERGE_HEAD"),
+    coder.CommandResult(1, "", "fatal: Needed a single revision"),
+)
+
+
 class FakeRunner:
     """Injectable stand-in for `coder.CommandRunner`.
 
@@ -106,6 +119,7 @@ def _base_runner(
                 _starts_with("git", "rev-parse", "--abbrev-ref", "HEAD"),
                 coder.CommandResult(0, f"{branch}\n", ""),
             ),
+            _NO_MERGE_IN_PROGRESS,
             (_starts_with("git", "status", "--porcelain"), coder.CommandResult(0, changed_files, "")),
             (_starts_with("gh", "pr", "view"), view_result),
             (_starts_with("gh", "pr", "create"), coder.CommandResult(0, f"{pr_url}\n", "")),
@@ -729,6 +743,7 @@ def test_sync_base_is_a_no_op_when_base_branch_is_absent(tmp_path):
 def test_sync_base_clean_merge_returns_no_conflicts(tmp_path):
     runner = FakeRunner(
         rules=[
+            _NO_MERGE_IN_PROGRESS,
             (_starts_with("git", "fetch", "origin", "main"), coder.CommandResult(0, "", "")),
             (
                 _starts_with("git", "merge", "--no-edit", "origin/main"),
@@ -752,6 +767,7 @@ def test_sync_base_clean_merge_returns_no_conflicts(tmp_path):
 def test_sync_base_conflict_parses_unmerged_files_and_leaves_merge_in_progress(tmp_path):
     runner = FakeRunner(
         rules=[
+            _NO_MERGE_IN_PROGRESS,
             (_starts_with("git", "fetch", "origin", "main"), coder.CommandResult(0, "", "")),
             (
                 _starts_with("git", "merge", "--no-edit", "origin/main"),
@@ -776,10 +792,11 @@ def test_sync_base_conflict_parses_unmerged_files_and_leaves_merge_in_progress(t
 def test_sync_base_fetch_failure_warns_and_skips_without_attempting_merge(tmp_path, caplog):
     runner = FakeRunner(
         rules=[
+            _NO_MERGE_IN_PROGRESS,
             (
                 _starts_with("git", "fetch", "origin", "main"),
                 coder.CommandResult(128, "", "unable to access 'https://example/repo': Could not resolve host"),
-            )
+            ),
         ]
     )
     node = coder.make_sync_base(runner)
@@ -797,6 +814,7 @@ def test_sync_base_fetch_failure_warns_and_skips_without_attempting_merge(tmp_pa
 def test_sync_base_unexpected_merge_error_without_conflicts_aborts_and_proceeds(tmp_path, caplog):
     runner = FakeRunner(
         rules=[
+            _NO_MERGE_IN_PROGRESS,
             (_starts_with("git", "fetch", "origin", "main"), coder.CommandResult(0, "", "")),
             (
                 _starts_with("git", "merge", "--no-edit", "origin/main"),
@@ -814,6 +832,54 @@ def test_sync_base_unexpected_merge_error_without_conflicts_aborts_and_proceeds(
     verbs = [tuple(c.argv) for c in runner.calls]
     assert ("git", "merge", "--abort") in verbs
     assert "merge" in caplog.text
+
+
+def test_sync_base_merge_head_guard_resumes_without_starting_new_merge(tmp_path):
+    # A prior turn's conflict-resolution DAC call was interrupted (or hit its
+    # token ceiling) before `make_commit` could complete the merge, leaving
+    # MERGE_HEAD set. This turn must NOT attempt a second merge (git refuses
+    # that outright) and must NOT abort the merge it didn't start -- it just
+    # resumes by re-deriving the still-unresolved files from the index.
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("git", "rev-parse", "-q", "--verify", "MERGE_HEAD"), coder.CommandResult(0, "", "")),
+            (
+                _starts_with("git", "diff", "--name-only", "--diff-filter=U"),
+                coder.CommandResult(0, "src/a.py\nsrc/b.py\n", ""),
+            ),
+        ]
+    )
+    node = coder.make_sync_base(runner)
+
+    out = node({"cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"merge_conflict_files": ["src/a.py", "src/b.py"]}
+    verbs = [tuple(c.argv[:2]) for c in runner.calls]
+    assert ("git", "fetch") not in verbs
+    assert ("git", "merge") not in verbs
+
+
+def test_sync_base_merge_head_guard_can_resume_to_no_remaining_conflicts(tmp_path):
+    # A prior turn resolved AND staged the files (git add) but crashed before
+    # `git commit --no-edit` concluded the merge: the index has no more
+    # unmerged entries, so re-deriving yields an empty list. This is a valid
+    # outcome -- `_coding_task_text` falls back to the normal issue task, and
+    # `make_commit`'s own `git status --porcelain` still picks up the staged
+    # change on this turn.
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("git", "rev-parse", "-q", "--verify", "MERGE_HEAD"), coder.CommandResult(0, "", "")),
+            (_starts_with("git", "diff", "--name-only", "--diff-filter=U"), coder.CommandResult(0, "", "")),
+        ]
+    )
+    node = coder.make_sync_base(runner)
+
+    out = node({"cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"merge_conflict_files": []}
+    verbs = [tuple(c.argv[:2]) for c in runner.calls]
+    assert ("git", "fetch") not in verbs
+    assert ("git", "merge") not in verbs
 
 
 def test_sync_base_wired_between_ensure_worktree_and_run_dac(tmp_path):
@@ -854,6 +920,166 @@ def test_sync_base_wired_between_ensure_worktree_and_run_dac(tmp_path):
     merge_calls = [c for c in runner.calls if c.argv[:2] == ["git", "merge"]]
     assert fetch_calls and fetch_calls[0].argv == ["git", "fetch", "origin", "main"]
     assert merge_calls and merge_calls[0].argv == ["git", "merge", "--no-edit", "origin/main"]
+
+
+# ---------------------------------------------------------------------------
+# run_DAC's task text: conflict-resolution turn vs the normal issue/rework
+# task, branching on `merge_conflict_files` (`_coding_task_text`, pure) --
+# mirrors `_docs_task_text`'s own pure-function + wired-node coverage.
+# ---------------------------------------------------------------------------
+
+
+def test_coding_task_text_uses_normal_task_when_no_conflict_files_key():
+    state = {"task_text": "Build the widget factory."}
+    assert coder._coding_task_text(state) == "Build the widget factory."
+
+
+def test_coding_task_text_uses_normal_task_when_conflict_files_is_empty_list():
+    state = {"task_text": "Build the widget factory.", "merge_conflict_files": []}
+    assert coder._coding_task_text(state) == "Build the widget factory."
+
+
+def test_coding_task_text_names_files_and_markers_when_conflicts_present():
+    state = {
+        "task_text": "Build the widget factory.",
+        "merge_conflict_files": ["src/a.py", "src/b.py"],
+    }
+
+    task = coder._coding_task_text(state)
+
+    assert "src/a.py" in task
+    assert "src/b.py" in task
+    assert "<<<<<<<" in task
+    assert "=======" in task
+    assert ">>>>>>>" in task
+    assert "both" in task.lower()  # preserve BOTH sides' intent
+    # This turn REPLACES the normal issue task -- it never rides along.
+    assert "Build the widget factory." not in task
+
+
+def test_run_dac_sends_conflict_resolution_task_to_turn_driver(tmp_path):
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="resolved", tokens_in=1, tokens_out=1)
+    node = coder.make_run_dac(
+        "unused-profile",
+        _fake_agent_factory([]),
+        _fake_turn_driver(turn_result, turn_calls),
+        None,
+    )
+    state: coder.CoderState = {
+        "cwd": str(tmp_path),
+        "thread_id": "thread-conflict",
+        "task_text": "Build the widget factory.",
+        "merge_conflict_files": ["src/a.py", "src/b.py"],
+    }
+
+    asyncio.run(node(state))
+
+    sent = turn_calls[0]["task_text"]
+    assert "src/a.py" in sent
+    assert "src/b.py" in sent
+    assert "<<<<<<<" in sent
+    assert "Build the widget factory." not in sent
+
+
+def test_run_dac_sends_normal_task_text_when_no_merge_conflict_files(tmp_path):
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="done", tokens_in=1, tokens_out=1)
+    node = coder.make_run_dac(
+        "unused-profile",
+        _fake_agent_factory([]),
+        _fake_turn_driver(turn_result, turn_calls),
+        None,
+    )
+    state: coder.CoderState = {
+        "cwd": str(tmp_path),
+        "thread_id": "thread-normal",
+        "task_text": "Build the widget factory.",
+    }
+
+    asyncio.run(node(state))
+
+    assert turn_calls[0]["task_text"] == "Build the widget factory."
+
+
+def test_conflict_resolution_turn_completes_merge_and_reaches_needs_review(tmp_path):
+    # Full graph, end to end: sync_base hits a real conflict; run_DAC gets a
+    # conflict-resolution task (never the normal issue task); the turn
+    # completes cleanly; commit concludes the merge with `--no-edit`; push
+    # and open_PR run unchanged, landing on needs_review.
+    runner = FakeRunner(
+        rules=[
+            _NO_MERGE_IN_PROGRESS,
+            (
+                _starts_with("git", "rev-parse", "--abbrev-ref", "HEAD"),
+                coder.CommandResult(0, "clipse/spac-12\n", ""),
+            ),
+            (_starts_with("git", "fetch", "origin", "main"), coder.CommandResult(0, "", "")),
+            (
+                _starts_with("git", "merge", "--no-edit", "origin/main"),
+                coder.CommandResult(1, "", "CONFLICT (content): Merge conflict in src/a.py"),
+            ),
+            (
+                _starts_with("git", "diff", "--name-only", "--diff-filter=U"),
+                coder.CommandResult(0, "src/a.py\n", ""),
+            ),
+            (_starts_with("git", "status", "--porcelain"), coder.CommandResult(0, "M  src/a.py\n", "")),
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(1, "", "no pull requests found for branch")),
+            (
+                _starts_with("gh", "pr", "create"),
+                coder.CommandResult(0, "https://github.com/acme/widgets/pull/12\n", ""),
+            ),
+        ]
+    )
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(
+        outcome_hint="completed", final_text="Resolved the conflict.", tokens_in=8, tokens_out=4
+    )
+
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: coder.CoderState = {
+        "issue_id": "SPAC-12",
+        "run_id": "run-1",
+        "thread_id": "thread-12",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "Build the widget factory.",
+        "base_branch": "main",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-12"}}))
+
+    assert order == [
+        "load_context",
+        "ensure_worktree",
+        "sync_base",
+        "run_DAC",
+        "run_docs",
+        "commit",
+        "push",
+        "open_PR",
+        "emit_result",
+    ]
+    _assert_valid_result(result, blocked=False)
+    assert result.outcome == Outcome.needs_review
+    assert result.pr_url == "https://github.com/acme/widgets/pull/12"
+
+    # The coding turn's task was conflict resolution, never the issue text.
+    code_call = next(c for c in turn_calls if not _is_docs_turn(c["config"]))
+    assert "src/a.py" in code_call["task_text"]
+    assert "<<<<<<<" in code_call["task_text"]
+    assert "Build the widget factory." not in code_call["task_text"]
+
+    commit_calls = [c for c in runner.calls if c.argv[:2] == ["git", "commit"]]
+    assert len(commit_calls) == 1
+    assert commit_calls[0].argv == ["git", "commit", "--no-edit"]
+
+    push_calls = [c for c in runner.calls if c.argv[:2] == ["git", "push"]]
+    assert len(push_calls) == 1
+    assert push_calls[0].argv == ["git", "push", "--set-upstream", "origin", "clipse/spac-12"]
 
 
 # ---------------------------------------------------------------------------
@@ -1164,3 +1390,73 @@ def test_commit_extracts_artifact_paths_and_commits_when_changed(tmp_path):
     assert out["committed"] is True
     commit_calls = [c for c in runner.calls if c.argv[:2] == ["git", "commit"]]
     assert len(commit_calls) == 1
+    # No merge in progress -- the normal single-parent message form, never
+    # the merge-completing `--no-edit`.
+    assert commit_calls[0].argv[:3] == ["git", "commit", "-m"]
+
+
+# ---------------------------------------------------------------------------
+# commit completing an in-progress merge (Task 3): `merge_conflict_files`
+# non-empty signals `sync_base` left a real merge in progress this turn
+# (freshly conflicted, or resumed via its MERGE_HEAD guard) -- the resolved
+# files are staged and the merge is concluded with `git commit --no-edit`
+# instead of the normal single-parent commit.
+# ---------------------------------------------------------------------------
+
+
+def test_commit_completes_merge_with_no_edit_when_merge_conflict_files_set(tmp_path):
+    runner = FakeRunner(
+        rules=[
+            (
+                _starts_with("git", "status", "--porcelain"),
+                coder.CommandResult(0, "M  src/a.py\nM  src/b.py\n", ""),
+            )
+        ]
+    )
+    node = coder.make_commit(runner)
+
+    out = node(
+        {
+            "cwd": str(tmp_path),
+            "issue_id": "SPAC-1",
+            "turn_count": 0,
+            "merge_conflict_files": ["src/a.py", "src/b.py"],
+        }
+    )
+
+    assert set(out["artifacts"]) == {"src/a.py", "src/b.py"}
+    assert out["committed"] is True
+
+    add_calls = [c for c in runner.calls if c.argv[:2] == ["git", "add"]]
+    assert len(add_calls) == 1
+    assert add_calls[0].argv == ["git", "add", "-A"]
+    # `git add` must be scoped to the coder's OWN worktree -- never the
+    # clipse repo this test process itself runs from.
+    assert add_calls[0].cwd == str(tmp_path)
+
+    commit_calls = [c for c in runner.calls if c.argv[:2] == ["git", "commit"]]
+    assert len(commit_calls) == 1
+    assert commit_calls[0].argv == ["git", "commit", "--no-edit"]
+    assert commit_calls[0].cwd == str(tmp_path)
+
+
+def test_commit_completes_merge_even_when_status_looks_clean(tmp_path):
+    # Edge case: a prior (interrupted) turn already staged the resolution,
+    # so `git status --porcelain` reports nothing new this turn -- but the
+    # merge is still unconcluded and must still be committed.
+    runner = FakeRunner(rules=[(_starts_with("git", "status", "--porcelain"), coder.CommandResult(0, "", ""))])
+    node = coder.make_commit(runner)
+
+    out = node(
+        {
+            "cwd": str(tmp_path),
+            "issue_id": "SPAC-1",
+            "turn_count": 0,
+            "merge_conflict_files": ["src/a.py"],
+        }
+    )
+
+    assert out["committed"] is True
+    commit_calls = [c for c in runner.calls if c.argv[:2] == ["git", "commit"]]
+    assert len(commit_calls) == 1
+    assert commit_calls[0].argv == ["git", "commit", "--no-edit"]

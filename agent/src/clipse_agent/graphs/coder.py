@@ -11,11 +11,23 @@ design doc's Coder graph:
 
 `sync_base` merges the worktree up to date with `origin/<base_branch>` (a
 merge, never a rebase, so the branch stays fast-forward-pushable) before DAC
-starts its turn each turn. It is best-effort: no `base_branch`, a failed
-`fetch`, or a merge conflict all fall through to `run_DAC` rather than
-failing the turn -- a real conflict is left mid-merge (never aborted) and
-reported via `merge_conflict_files` so the coder can resolve it (see
-make_sync_base).
+starts its turn each turn. It is best-effort: no `base_branch` or a failed
+`fetch` fall through to `run_DAC` rather than failing the turn. A real
+conflict is left mid-merge (never aborted) and reported via
+`merge_conflict_files` so the coder resolves it THIS turn (see
+make_sync_base); if a merge is already in progress when this node runs (a
+prior conflict-resolution turn was interrupted or hit its token ceiling
+before `commit` could conclude it), it never starts a second merge or aborts
+the first -- it re-derives `merge_conflict_files` from the still-unresolved
+index so the coder resumes exactly where it left off.
+
+When `merge_conflict_files` is non-empty, `run_DAC` drives an entirely
+separate conflict-resolution turn instead of the normal issue/rework task
+(see `_coding_task_text`) -- DAC only edits files to remove the conflict
+markers; it never runs git for this (the lane's "don't commit/push/open a
+PR yourself" system prompt is unaffected). `commit` then concludes the merge
+itself (`git commit --no-edit`) before the unchanged, still-fast-forward
+`push`.
 
 `run_docs` is a best-effort documentation turn on the clean path only: it
 writes docs into the same worktree so they ride the same commit/PR as the
@@ -300,6 +312,19 @@ def make_ensure_worktree(run_command: CommandRunner) -> Callable[[CoderState], d
 # ---------------------------------------------------------------------------
 
 
+def _unmerged_paths(run_command: CommandRunner, cwd: str) -> list[str]:
+    """Paths the INDEX still has as unmerged (conflicted).
+
+    `git diff --name-only --diff-filter=U` reflects the index's unresolved
+    merge entries regardless of whether the working tree's conflict markers
+    have already been edited away -- accurate whether called right after a
+    fresh conflicting `git merge` or against an already-in-progress one
+    (see `make_sync_base`'s MERGE_HEAD guard).
+    """
+    result = _run(run_command, ["git", "diff", "--name-only", "--diff-filter=U"], cwd, check=False)
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
 def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
     """Bring the worktree up to date with `origin/<base_branch>` before DAC's
     turn starts, so a long-running branch doesn't drift so far from base that
@@ -314,12 +339,27 @@ def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[st
 
     - No `base_branch` (git-operator/reviewer never reach this node; a coder
       turn with the flag simply unset) is a no-op.
+    - A merge ALREADY in progress (`git rev-parse -q --verify MERGE_HEAD`
+      succeeds), checked BEFORE anything else: a prior turn's
+      conflict-resolution DAC call was interrupted or hit its token ceiling
+      before `commit` could conclude the merge (`route_after_dac` skips
+      straight to `emit_result` on either, never reaching `commit`). This
+      node must not start a SECOND merge on top of one already in progress
+      -- git itself refuses that outright -- and must not abort a merge it
+      did not itself start, which would silently discard the prior turn's
+      resolution. It re-derives `merge_conflict_files` from the
+      still-unresolved index instead, so the coder resumes exactly where it
+      left off. (Empirically confirmed: attempting a fresh `git merge` while
+      `MERGE_HEAD` already exists exits 128 without touching the index, so
+      skipping straight to `_unmerged_paths` here is equivalent to -- but
+      safer than -- letting that attempt fail first.)
     - `git fetch` failing (transient network/GitHub issue) skips the sync for
       this turn; DAC still runs against whatever the worktree already has.
     - `git merge` failing WITH unresolved paths is a real conflict: left
       exactly as git leaves it (mid-merge, conflict markers in the tree, NOT
       aborted) and reported via `merge_conflict_files` so the coder's own
-      turn (or a later resolution task) can see and resolve it.
+      turn (`run_DAC`'s conflict-resolution branch -- see `_coding_task_text`)
+      can see and resolve it.
     - `git merge` failing with NO unresolved paths is unexpected (e.g. a
       dirty worktree) rather than a real conflict: the attempt is aborted so
       nothing downstream inherits a half-merged worktree it doesn't expect,
@@ -332,6 +372,10 @@ def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[st
             return {"merge_conflict_files": []}
 
         cwd = state["cwd"]
+
+        merge_head = _run(run_command, ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd, check=False)
+        if merge_head.returncode == 0:
+            return {"merge_conflict_files": _unmerged_paths(run_command, cwd)}
 
         fetch = _run(run_command, ["git", "fetch", "origin", base_branch], cwd, check=False)
         if fetch.returncode != 0:
@@ -347,11 +391,10 @@ def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[st
         if merge.returncode == 0:
             return {"merge_conflict_files": []}
 
-        unmerged = _run(run_command, ["git", "diff", "--name-only", "--diff-filter=U"], cwd, check=False)
-        conflict_files = [line.strip() for line in unmerged.stdout.splitlines() if line.strip()]
+        conflict_files = _unmerged_paths(run_command, cwd)
         if conflict_files:
             # Left mid-merge on purpose -- do NOT abort. The coder resolves
-            # this (Task 3 handles the resolution + commit); aborting here
+            # this (run_DAC's conflict-resolution branch); aborting here
             # would erase the exact conflict state it needs to see.
             return {"merge_conflict_files": conflict_files}
 
@@ -372,14 +415,57 @@ def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[st
 # ---------------------------------------------------------------------------
 
 
+def _conflict_resolution_task_text(conflict_files: Sequence[str]) -> str:
+    """Compose the DAC turn's task when `sync_base` left a real base-branch
+    merge conflict in progress this turn: an entirely separate
+    conflict-resolution turn, never mixed in with the normal issue/rework
+    task (see `_coding_task_text`, which chooses between the two).
+
+    DAC only ever EDITS files here -- `sync_base` already started the merge
+    and left it in progress (or resumed one via its MERGE_HEAD guard), and
+    `make_commit` concludes it (`git commit --no-edit`) once this turn's
+    edits land. That keeps this lane's "don't run git to commit/push/open a
+    PR yourself" system prompt exactly as-is -- resolving a conflict is still
+    just editing files, the same as any other turn.
+    """
+    files = "\n".join(f"- {path}" for path in conflict_files)
+    return (
+        "This turn is ONLY about resolving a merge conflict -- it is NOT "
+        "the usual issue task, and there is no issue task to do this turn. "
+        "Merging the base branch into this branch left unresolved conflicts "
+        f"in the following file(s):\n{files}\n\n"
+        "Open each file listed above and resolve every conflict in it: "
+        "remove the `<<<<<<<`, `=======`, and `>>>>>>>` conflict markers, "
+        "and edit the surrounding code so the result correctly preserves "
+        "the intent of BOTH sides -- the incoming base-branch change AND "
+        "this branch's own change -- rather than simply discarding one "
+        "side. Do not run git yourself; once every listed file is free of "
+        "conflict markers and correctly merged, stop."
+    )
+
+
+def _coding_task_text(state: CoderState) -> str:
+    """The coding turn's task: a conflict-resolution instruction when
+    `sync_base` (this same turn) left `merge_conflict_files` non-empty,
+    otherwise the normal issue/rework task `load_context` already built into
+    `state["task_text"]`, unchanged.
+    """
+    conflict_files = state.get("merge_conflict_files") or []
+    if conflict_files:
+        return _conflict_resolution_task_text(conflict_files)
+    return state.get("task_text", "")
+
+
 def make_run_dac(
     profile: CoderProfile,
     agent_factory: AgentFactory,
     turn_driver: TurnDriver,
     checkpointer: BaseCheckpointSaver | None,
 ) -> Callable[[CoderState], Awaitable[dict[str, Any]]]:
-    """Drive exactly one DAC turn: a fresh `task_text` turn normally, or a
-    `resume` of a previously-interrupted turn when `resume_payload` is set.
+    """Drive exactly one DAC turn: a fresh task turn normally (the normal
+    issue/rework task, or a conflict-resolution task when `sync_base` left a
+    merge in progress -- see `_coding_task_text`), or a `resume` of a
+    previously-interrupted turn when `resume_payload` is set.
     """
 
     async def _node(state: CoderState) -> dict[str, Any]:
@@ -392,7 +478,7 @@ def make_run_dac(
             turn_result = await turn_driver(agent_graph, config, resume=resume_payload, max_tokens=max_tokens)
         else:
             turn_result = await turn_driver(
-                agent_graph, config, task_text=state.get("task_text", ""), max_tokens=max_tokens
+                agent_graph, config, task_text=_coding_task_text(state), max_tokens=max_tokens
             )
 
         return {
@@ -556,21 +642,42 @@ def _commit_message(state: CoderState) -> str:
 def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
     """Stage and commit whatever this turn changed.
 
-    `git add -A` always runs (harmless when there's nothing to add); the
-    actual `git commit` is skipped when `git status --porcelain` reports
-    no changes at all, so a turn that only left commentary (no file
-    edits) doesn't fail on "nothing to commit".
+    `git add -A` always runs (harmless when there's nothing to add) and is
+    always scoped to `state["cwd"]` -- the coder's OWN worktree, never the
+    clipse repo this process itself runs from.
+
+    Two paths, chosen by whether `sync_base` (this same turn) left
+    `merge_conflict_files` non-empty -- freshly conflicted, or resumed from a
+    prior interrupted turn via `make_sync_base`'s MERGE_HEAD guard; either
+    way a real merge is sitting in progress in the worktree:
+
+    - Merge in progress: the conflict-resolution DAC turn just edited the
+      conflicted files (see `_coding_task_text`); `git commit --no-edit`
+      concludes the merge with git's own two-parent message. A commit always
+      happens on this path -- even if `git status --porcelain` looks clean
+      (e.g. a prior turn already staged the resolution before being
+      interrupted) -- because concluding an in-progress merge is mandatory,
+      not conditional on there being a fresh diff.
+    - No merge in progress: the existing single-parent commit, skipped
+      entirely when `git status --porcelain` reports no changes at all, so a
+      turn that only left commentary (no file edits) doesn't fail on
+      "nothing to commit".
     """
 
     def _node(state: CoderState) -> dict[str, Any]:
         cwd = state["cwd"]
+        merging = bool(state.get("merge_conflict_files"))
+
         _run(run_command, ["git", "add", "-A"], cwd)
         status = _run(run_command, ["git", "status", "--porcelain"], cwd)
         paths = _parse_porcelain_paths(status.stdout)
 
         committed = False
-        if paths:
-            _run(run_command, ["git", "commit", "-m", _commit_message(state)], cwd)
+        if paths or merging:
+            if merging:
+                _run(run_command, ["git", "commit", "--no-edit"], cwd)
+            else:
+                _run(run_command, ["git", "commit", "-m", _commit_message(state)], cwd)
             committed = True
 
         return {"artifacts": paths, "committed": committed}
