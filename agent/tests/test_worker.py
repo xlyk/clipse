@@ -234,6 +234,53 @@ def test_main_accepts_equals_form_flags_like_the_kernel_spawner(monkeypatch, cap
 
 
 # ---------------------------------------------------------------------------
+# --base-branch threading: internal/spawn.workerArgs appends --base-branch=<v>
+# from cfg.Repo.BaseBranch whenever it's non-empty (Task 1); the coder graph's
+# sync_base node reads it from state["base_branch"] (Task 2), so it must flow
+# from the flag into input_state exactly like --workspace does.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_threads_base_branch_into_input_state(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            "--issue=SPAC-1",
+            "--lane=coder",
+            "--run=run-1",
+            "--thread=thread-1",
+            "--workspace=/ws",
+            "--base-branch=main",
+        ],
+        graph=graph,
+        build_calls=build_calls,
+    )
+
+    assert graph.calls[0]["input_state"]["base_branch"] == "main"
+
+
+def test_dispatch_base_branch_defaults_to_empty_string_when_flag_omitted(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        ["--issue=SPAC-1", "--lane=coder", "--run=run-1", "--thread=thread-1", "--workspace=/ws"],
+        graph=graph,
+        build_calls=build_calls,
+    )
+
+    assert graph.calls[0]["input_state"]["base_branch"] == ""
+
+
+# ---------------------------------------------------------------------------
 # --max-tokens / CLIPSE_MAX_TOKENS resolution
 # ---------------------------------------------------------------------------
 

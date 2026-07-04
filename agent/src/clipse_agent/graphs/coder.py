@@ -4,10 +4,18 @@ Wraps `clipse_agent.dac` (the DAC engine wrapper) in a small graph that
 gives the kernel a typed, testable seam around one DAC turn, per the
 design doc's Coder graph:
 
-    load_context -> ensure_worktree -> run_DAC -> {
+    load_context -> ensure_worktree -> sync_base -> run_DAC -> {
         completed (clean)   -> run_docs -> commit -> push -> open_PR -> emit_result
         interrupted / over token ceiling -> emit_result
     }
+
+`sync_base` merges the worktree up to date with `origin/<base_branch>` (a
+merge, never a rebase, so the branch stays fast-forward-pushable) before DAC
+starts its turn each turn. It is best-effort: no `base_branch`, a failed
+`fetch`, or a merge conflict all fall through to `run_DAC` rather than
+failing the turn -- a real conflict is left mid-merge (never aborted) and
+reported via `merge_conflict_files` so the coder can resolve it (see
+make_sync_base).
 
 `run_docs` is a best-effort documentation turn on the clean path only: it
 writes docs into the same worktree so they ride the same commit/PR as the
@@ -42,6 +50,7 @@ findings"). Nothing here re-derives or could bypass that.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from collections.abc import Awaitable, Callable, Sequence
@@ -60,6 +69,13 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
     from clipse_agent.dac import DacTurnResult
+
+# Diagnostics only (e.g. a best-effort sync_base fetch/merge failure) -- must
+# never touch stdout, which worker.py reserves for exactly one WorkerResult
+# JSON line. With no handler configured anywhere in the process, the stdlib's
+# `logging.lastResort` fallback already sends WARNING+ to stderr, matching
+# every other diagnostic this worker emits (see worker.py's module docstring).
+logger = logging.getLogger(__name__)
 
 
 class CoderGraphError(RuntimeError):
@@ -145,6 +161,9 @@ class CoderState(TypedDict, total=False):
 
     # --- ensure_worktree ---
     cwd: str
+
+    # --- sync_base ---
+    merge_conflict_files: list[str]  # unresolved paths from a `git merge` conflict; [] when clean/skipped
 
     # --- run_DAC ---
     dac_outcome_hint: str  # "completed" | "interrupted" (dac.OutcomeHint)
@@ -272,6 +291,78 @@ def make_ensure_worktree(run_command: CommandRunner) -> Callable[[CoderState], d
             updates["branch"] = head.stdout.strip()
 
         return updates
+
+    return _node
+
+
+# ---------------------------------------------------------------------------
+# sync_base
+# ---------------------------------------------------------------------------
+
+
+def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
+    """Bring the worktree up to date with `origin/<base_branch>` before DAC's
+    turn starts, so a long-running branch doesn't drift so far from base that
+    its eventual PR stops being a clean fast-forward merge.
+
+    A MERGE, never a rebase: rebasing would rewrite commits already pushed on
+    a prior turn, forcing a force-push the kernel/DAC never expects between
+    turns. A merge commit keeps history append-only.
+
+    Every failure mode here is best-effort and non-raising -- this node must
+    never turn a sync hiccup into a blocked run:
+
+    - No `base_branch` (git-operator/reviewer never reach this node; a coder
+      turn with the flag simply unset) is a no-op.
+    - `git fetch` failing (transient network/GitHub issue) skips the sync for
+      this turn; DAC still runs against whatever the worktree already has.
+    - `git merge` failing WITH unresolved paths is a real conflict: left
+      exactly as git leaves it (mid-merge, conflict markers in the tree, NOT
+      aborted) and reported via `merge_conflict_files` so the coder's own
+      turn (or a later resolution task) can see and resolve it.
+    - `git merge` failing with NO unresolved paths is unexpected (e.g. a
+      dirty worktree) rather than a real conflict: the attempt is aborted so
+      nothing downstream inherits a half-merged worktree it doesn't expect,
+      and the turn proceeds on the un-synced base.
+    """
+
+    def _node(state: CoderState) -> dict[str, Any]:
+        base_branch = state.get("base_branch")
+        if not base_branch:
+            return {"merge_conflict_files": []}
+
+        cwd = state["cwd"]
+
+        fetch = _run(run_command, ["git", "fetch", "origin", base_branch], cwd, check=False)
+        if fetch.returncode != 0:
+            logger.warning(
+                "sync_base: git fetch origin %s failed (exit %d): %s",
+                base_branch,
+                fetch.returncode,
+                fetch.stderr.strip(),
+            )
+            return {"merge_conflict_files": []}
+
+        merge = _run(run_command, ["git", "merge", "--no-edit", f"origin/{base_branch}"], cwd, check=False)
+        if merge.returncode == 0:
+            return {"merge_conflict_files": []}
+
+        unmerged = _run(run_command, ["git", "diff", "--name-only", "--diff-filter=U"], cwd, check=False)
+        conflict_files = [line.strip() for line in unmerged.stdout.splitlines() if line.strip()]
+        if conflict_files:
+            # Left mid-merge on purpose -- do NOT abort. The coder resolves
+            # this (Task 3 handles the resolution + commit); aborting here
+            # would erase the exact conflict state it needs to see.
+            return {"merge_conflict_files": conflict_files}
+
+        logger.warning(
+            "sync_base: git merge origin/%s failed with no conflicting files (exit %d): %s -- aborting the merge",
+            base_branch,
+            merge.returncode,
+            merge.stderr.strip(),
+        )
+        _run(run_command, ["git", "merge", "--abort"], cwd, check=False)
+        return {"merge_conflict_files": []}
 
     return _node
 
@@ -725,6 +816,7 @@ def build_coder_graph(
     graph: StateGraph[CoderState, Any, Any, Any] = StateGraph(CoderState)
     graph.add_node("load_context", load_context)
     graph.add_node("ensure_worktree", make_ensure_worktree(resolved_run_command))
+    graph.add_node("sync_base", make_sync_base(resolved_run_command))
     graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer))
     graph.add_node("run_docs", make_run_docs(resolved_docs_profile, agent_factory, turn_driver, checkpointer))
     graph.add_node("commit", make_commit(resolved_run_command))
@@ -734,7 +826,8 @@ def build_coder_graph(
 
     graph.add_edge(START, "load_context")
     graph.add_edge("load_context", "ensure_worktree")
-    graph.add_edge("ensure_worktree", "run_DAC")
+    graph.add_edge("ensure_worktree", "sync_base")
+    graph.add_edge("sync_base", "run_DAC")
     graph.add_conditional_edges("run_DAC", route_after_dac)
     graph.add_edge("run_docs", "commit")
     graph.add_edge("commit", "push")

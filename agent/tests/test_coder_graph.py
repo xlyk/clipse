@@ -241,6 +241,7 @@ def test_happy_path_runs_full_node_order_and_emits_needs_review(tmp_path):
     assert order == [
         "load_context",
         "ensure_worktree",
+        "sync_base",
         "run_DAC",
         "run_docs",
         "commit",
@@ -376,7 +377,7 @@ def test_code_turn_interrupt_skips_docs_entirely(tmp_path):
 
     order, result = asyncio.run(_drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "sync_base", "run_DAC", "emit_result"]
     assert "run_docs" not in order
     _assert_valid_result(result, blocked=True)
     assert result.block_kind == BlockKind.needs_input
@@ -492,7 +493,7 @@ def test_interrupt_emits_blocked_needs_input_and_skips_git_and_pr(tmp_path):
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-4"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "sync_base", "run_DAC", "emit_result"]
     _assert_valid_result(result, blocked=True)
     assert result.block_kind == BlockKind.needs_input
     assert result.pr_url is None
@@ -534,7 +535,7 @@ def test_token_ceiling_exceeded_emits_blocked_capability_even_if_interrupted(tmp
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-5"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "emit_result"]
+    assert order == ["load_context", "ensure_worktree", "sync_base", "run_DAC", "emit_result"]
     _assert_valid_result(result, blocked=True)
     assert result.block_kind == BlockKind.capability
     assert "1100" in result.summary
@@ -567,7 +568,7 @@ def test_resume_turn_drives_dac_with_resume_payload_not_task_text(tmp_path):
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-6"}}))
 
-    assert order[:3] == ["load_context", "ensure_worktree", "run_DAC"]
+    assert order[:4] == ["load_context", "ensure_worktree", "sync_base", "run_DAC"]
     assert turn_calls[0]["resume"] == {"int-1": {"decisions": [{"type": "approve"}]}}
     assert "task_text" not in turn_calls[0]
     assert result.turn_count == 2
@@ -699,6 +700,163 @@ def test_ensure_worktree_raises_when_not_a_git_dir(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# sync_base (needs an injected run_command) -- unit-level coverage of every
+# branch, mirroring make_ensure_worktree/make_commit's own direct-node-call
+# test style rather than driving the full graph for each case.
+# ---------------------------------------------------------------------------
+
+
+def test_sync_base_is_a_no_op_when_base_branch_is_empty(tmp_path):
+    runner = FakeRunner()
+    node = coder.make_sync_base(runner)
+
+    out = node({"cwd": str(tmp_path), "base_branch": ""})
+
+    assert out == {"merge_conflict_files": []}
+    assert runner.calls == []
+
+
+def test_sync_base_is_a_no_op_when_base_branch_is_absent(tmp_path):
+    runner = FakeRunner()
+    node = coder.make_sync_base(runner)
+
+    out = node({"cwd": str(tmp_path)})
+
+    assert out == {"merge_conflict_files": []}
+    assert runner.calls == []
+
+
+def test_sync_base_clean_merge_returns_no_conflicts(tmp_path):
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("git", "fetch", "origin", "main"), coder.CommandResult(0, "", "")),
+            (
+                _starts_with("git", "merge", "--no-edit", "origin/main"),
+                coder.CommandResult(0, "Already up to date.\n", ""),
+            ),
+        ]
+    )
+    node = coder.make_sync_base(runner)
+
+    out = node({"cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"merge_conflict_files": []}
+    verbs = [tuple(c.argv) for c in runner.calls]
+    assert ("git", "fetch", "origin", "main") in verbs
+    assert ("git", "merge", "--no-edit", "origin/main") in verbs
+    # A clean merge never probes for conflicts or aborts anything.
+    assert not any(c.argv[:2] == ["git", "diff"] for c in runner.calls)
+    assert ("git", "merge", "--abort") not in verbs
+
+
+def test_sync_base_conflict_parses_unmerged_files_and_leaves_merge_in_progress(tmp_path):
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("git", "fetch", "origin", "main"), coder.CommandResult(0, "", "")),
+            (
+                _starts_with("git", "merge", "--no-edit", "origin/main"),
+                coder.CommandResult(1, "", "CONFLICT (content): Merge conflict in src/a.py"),
+            ),
+            (
+                _starts_with("git", "diff", "--name-only", "--diff-filter=U"),
+                coder.CommandResult(0, "src/a.py\nsrc/b.py\n", ""),
+            ),
+        ]
+    )
+    node = coder.make_sync_base(runner)
+
+    out = node({"cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"merge_conflict_files": ["src/a.py", "src/b.py"]}
+    # Left mid-merge on purpose -- the coder resolves it next turn.
+    verbs = [tuple(c.argv) for c in runner.calls]
+    assert ("git", "merge", "--abort") not in verbs
+
+
+def test_sync_base_fetch_failure_warns_and_skips_without_attempting_merge(tmp_path, caplog):
+    runner = FakeRunner(
+        rules=[
+            (
+                _starts_with("git", "fetch", "origin", "main"),
+                coder.CommandResult(128, "", "unable to access 'https://example/repo': Could not resolve host"),
+            )
+        ]
+    )
+    node = coder.make_sync_base(runner)
+
+    with caplog.at_level("WARNING"):
+        out = node({"cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"merge_conflict_files": []}
+    verbs = [tuple(c.argv[:2]) for c in runner.calls]
+    assert ("git", "merge") not in verbs
+    assert ("git", "diff") not in verbs
+    assert "fetch" in caplog.text
+
+
+def test_sync_base_unexpected_merge_error_without_conflicts_aborts_and_proceeds(tmp_path, caplog):
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("git", "fetch", "origin", "main"), coder.CommandResult(0, "", "")),
+            (
+                _starts_with("git", "merge", "--no-edit", "origin/main"),
+                coder.CommandResult(128, "", "fatal: not something we can merge"),
+            ),
+            (_starts_with("git", "diff", "--name-only", "--diff-filter=U"), coder.CommandResult(0, "", "")),
+        ]
+    )
+    node = coder.make_sync_base(runner)
+
+    with caplog.at_level("WARNING"):
+        out = node({"cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"merge_conflict_files": []}
+    verbs = [tuple(c.argv) for c in runner.calls]
+    assert ("git", "merge", "--abort") in verbs
+    assert "merge" in caplog.text
+
+
+def test_sync_base_wired_between_ensure_worktree_and_run_dac(tmp_path):
+    # Graph-level: proves the node is actually wired into the edge sequence
+    # (ensure_worktree -> sync_base -> run_DAC) and a clean sync doesn't
+    # stop the turn from reaching run_DAC and completing normally.
+    runner = _base_runner()
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="did the work", tokens_in=1, tokens_out=1)
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: coder.CoderState = {
+        "issue_id": "SPAC-11",
+        "run_id": "run-1",
+        "thread_id": "thread-11",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+        "base_branch": "main",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-11"}}))
+
+    assert order == [
+        "load_context",
+        "ensure_worktree",
+        "sync_base",
+        "run_DAC",
+        "run_docs",
+        "commit",
+        "push",
+        "open_PR",
+        "emit_result",
+    ]
+    _assert_valid_result(result, blocked=False)
+    fetch_calls = [c for c in runner.calls if c.argv[:2] == ["git", "fetch"]]
+    merge_calls = [c for c in runner.calls if c.argv[:2] == ["git", "merge"]]
+    assert fetch_calls and fetch_calls[0].argv == ["git", "fetch", "origin", "main"]
+    assert merge_calls and merge_calls[0].argv == ["git", "merge", "--no-edit", "origin/main"]
+
+
+# ---------------------------------------------------------------------------
 # Default wiring really reaches clipse_agent.dac (only DAC's own innermost
 # create_cli_agent/create_model are faked, same seam test_dac.py uses).
 # ---------------------------------------------------------------------------
@@ -746,7 +904,17 @@ def test_build_coder_graph_default_wiring_uses_real_dac_module(tmp_path, monkeyp
 
     order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-10"}}))
 
-    assert order == ["load_context", "ensure_worktree", "run_DAC", "run_docs", "commit", "push", "open_PR", "emit_result"]
+    assert order == [
+        "load_context",
+        "ensure_worktree",
+        "sync_base",
+        "run_DAC",
+        "run_docs",
+        "commit",
+        "push",
+        "open_PR",
+        "emit_result",
+    ]
     assert result.outcome == Outcome.needs_review
     # The same _FakeAgentGraph (7/3) is streamed for both the coding and docs
     # turns, so the emitted totals are their sum.

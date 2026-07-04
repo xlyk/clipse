@@ -59,6 +59,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--docs-model", default="")
     parser.add_argument("--model-params", default="")
     parser.add_argument("--docs-model-params", default="")
+    parser.add_argument("--base-branch", default="")
     return parser
 
 
@@ -128,17 +129,21 @@ async def _run_lane_graph(
 
     Shared by every lane `_dispatch` knows how to route to (coder/
     reviewer): every lane's graph is invoked with the exact same input-state
-    shape (issue_id/run_id/thread_id/workspace/max_tokens -- issue_text is
-    covered separately, by the dispatcher's own $CLIPSE_ISSUE_TEXT env
-    injection that every lane's `load_context` already falls back to) and
-    the exact same checkpointer wiring; only which graph-builder function
-    to call differs, and `_dispatch` passes that in already resolved from
-    this module's own globals (see its docstring on why that matters for
-    monkeypatching). The checkpointer is built from --checkpoint-db when the
-    kernel gave one (design doc: one checkpointer database per issue, path
-    owned by the kernel, shared by every lane that runs against that
-    issue); otherwise the graph runs with no checkpointer at all -- still
-    correct for a single turn, just without cross-process resume.
+    shape (issue_id/run_id/thread_id/workspace/max_tokens/base_branch --
+    issue_text is covered separately, by the dispatcher's own
+    $CLIPSE_ISSUE_TEXT env injection that every lane's `load_context` already
+    falls back to) and the exact same checkpointer wiring; only which
+    graph-builder function to call differs, and `_dispatch` passes that in
+    already resolved from this module's own globals (see its docstring on
+    why that matters for monkeypatching). `base_branch` is meaningful only to
+    the coder lane's own `sync_base` node today; the reviewer lane already
+    reads it too (its PR-diff base), and it is simply unused input for any
+    future lane that ignores it. The checkpointer is built from
+    --checkpoint-db when the kernel gave one (design doc: one checkpointer
+    database per issue, path owned by the kernel, shared by every lane that
+    runs against that issue); otherwise the graph runs with no checkpointer
+    at all -- still correct for a single turn, just without cross-process
+    resume.
 
     `extra_kwargs` carries lane-specific keyword arguments `_dispatch`
     already resolved (e.g. the coder lane's `profile`/`docs_profile`) that
@@ -168,6 +173,7 @@ async def _run_lane_graph(
         "thread_id": args.thread,
         "workspace": args.workspace,
         "max_tokens": _resolve_max_tokens(args),
+        "base_branch": args.base_branch,
     }
     config: dict[str, Any] = {"configurable": {"thread_id": f"{args.thread}::{lane.value}"}}
 
