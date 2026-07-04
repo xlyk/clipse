@@ -2,6 +2,7 @@ package dispatcher_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/xlyk/clipse/internal/config"
@@ -18,6 +19,18 @@ func testModels() config.Models {
 		Coder:     "openai_codex:gpt-5.5",
 		CoderDocs: "anthropic:claude-sonnet-4-6",
 		Reviewer:  "anthropic:claude-opus-4-6",
+	}
+}
+
+// testModelParams returns a fixed, distinguishable-per-lane
+// config.ModelParams used across this file's cases, mirroring testModels's
+// role for the parallel modelParamsFor resolution: a wrong lane's map
+// leaking onto a spec is unmistakable in a test failure message.
+func testModelParams() config.ModelParams {
+	return config.ModelParams{
+		Coder:     map[string]any{"reasoning_effort": "high"},
+		CoderDocs: map[string]any{"reasoning_effort": "medium"},
+		Reviewer:  map[string]any{"thinking_budget_tokens": 4096},
 	}
 }
 
@@ -133,5 +146,126 @@ func TestApplyContinue_PreservesModelResolution(t *testing.T) {
 	}
 	if respawn.DocsModel != cfg.Models.CoderDocs {
 		t.Errorf("continuation DocsModel = %q, want %q", respawn.DocsModel, cfg.Models.CoderDocs)
+	}
+}
+
+// TestSpawnAttempt_ResolvesCoderModelParamsAndDocsModelParams asserts a
+// fresh Coder claim (spawnClaim -> spawnAttempt -> modelParamsFor) carries
+// cfg.ModelParams.Coder / .CoderDocs onto the WorkerSpec as compact JSON —
+// the ModelParams/DocsModelParams parallel of
+// TestSpawnAttempt_ResolvesCoderModelAndDocsModel's Model/DocsModel
+// coverage.
+func TestSpawnAttempt_ResolvesCoderModelParamsAndDocsModelParams(t *testing.T) {
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	cfg := testConfig()
+	cfg.ModelParams = testModelParams()
+
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	specs := spawner.Specs()
+	if len(specs) != 1 {
+		t.Fatalf("SpawnCount = %d, want exactly 1", len(specs))
+	}
+
+	wantParams, err := json.Marshal(cfg.ModelParams.Coder)
+	if err != nil {
+		t.Fatalf("json.Marshal(Coder): unexpected error: %v", err)
+	}
+	wantDocsParams, err := json.Marshal(cfg.ModelParams.CoderDocs)
+	if err != nil {
+		t.Fatalf("json.Marshal(CoderDocs): unexpected error: %v", err)
+	}
+
+	if specs[0].ModelParams != string(wantParams) {
+		t.Errorf("ModelParams = %q, want %q", specs[0].ModelParams, string(wantParams))
+	}
+	if specs[0].DocsModelParams != string(wantDocsParams) {
+		t.Errorf("DocsModelParams = %q, want %q", specs[0].DocsModelParams, string(wantDocsParams))
+	}
+}
+
+// TestSpawnAttempt_ReviewerClaimResolvesModelParamsWithNoDocs asserts a
+// Reviewer-column claim resolves cfg.ModelParams.Reviewer onto ModelParams
+// but leaves DocsModelParams empty — same reasoning as
+// TestSpawnAttempt_ReviewerClaimHasNoDocsModel: the docs sub-step is a
+// coder-graph-only concern (AGENTS.md: "Documentation is a coder-graph step,
+// not a lane"), so a Reviewer worker has no use for it.
+func TestSpawnAttempt_ReviewerClaimResolvesModelParamsWithNoDocs(t *testing.T) {
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", "review", 1, 100)
+
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	cfg := testConfig()
+	cfg.ModelParams = testModelParams()
+
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	specs := spawner.Specs()
+	if len(specs) != 1 {
+		t.Fatalf("SpawnCount = %d, want exactly 1", len(specs))
+	}
+	if specs[0].Lane != string(contract.LaneReviewer) {
+		t.Fatalf("Lane = %q, want %q (bad seed/claim)", specs[0].Lane, contract.LaneReviewer)
+	}
+
+	wantParams, err := json.Marshal(cfg.ModelParams.Reviewer)
+	if err != nil {
+		t.Fatalf("json.Marshal(Reviewer): unexpected error: %v", err)
+	}
+
+	if specs[0].ModelParams != string(wantParams) {
+		t.Errorf("ModelParams = %q, want %q", specs[0].ModelParams, string(wantParams))
+	}
+	if specs[0].DocsModelParams != "" {
+		t.Errorf("DocsModelParams = %q, want empty (Reviewer lane never runs docs)", specs[0].DocsModelParams)
+	}
+}
+
+// TestSpawnAttempt_NilModelParamsOmitFlagValue asserts a lane with no
+// configured model_params (cfg.ModelParams left at its zero value, as most
+// configs do — see config.ModelParams's doc comment: nil means "no
+// overrides, inherit provider default") resolves both ModelParams and
+// DocsModelParams to "", so internal/spawn.LocalSpawner's workerArgs omits
+// --model-params/--docs-model-params entirely rather than handing the
+// worker "{}" or "null" to parse.
+func TestSpawnAttempt_NilModelParamsOmitFlagValue(t *testing.T) {
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	cfg := testConfig() // cfg.ModelParams left zero-value: every lane nil.
+
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	specs := spawner.Specs()
+	if len(specs) != 1 {
+		t.Fatalf("SpawnCount = %d, want exactly 1", len(specs))
+	}
+	if specs[0].ModelParams != "" {
+		t.Errorf("ModelParams = %q, want empty (unconfigured lane)", specs[0].ModelParams)
+	}
+	if specs[0].DocsModelParams != "" {
+		t.Errorf("DocsModelParams = %q, want empty (unconfigured lane)", specs[0].DocsModelParams)
 	}
 }

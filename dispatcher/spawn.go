@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -56,17 +57,20 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	}
 
 	model, docsModel := d.modelsFor(lane)
+	modelParams, docsModelParams := d.modelParamsFor(lane)
 	spec := spawn.WorkerSpec{
-		Issue:        issue.Identifier,
-		Lane:         lane,
-		RunID:        runID,
-		ThreadID:     threadID,
-		Workspace:    workspace,
-		Env:          env,
-		CheckpointDB: d.checkpointDBPath(issue),
-		MaxTokens:    d.cfg.MaxTokensPerRun,
-		Model:        model,
-		DocsModel:    docsModel,
+		Issue:           issue.Identifier,
+		Lane:            lane,
+		RunID:           runID,
+		ThreadID:        threadID,
+		Workspace:       workspace,
+		Env:             env,
+		CheckpointDB:    d.checkpointDBPath(issue),
+		MaxTokens:       d.cfg.MaxTokensPerRun,
+		Model:           model,
+		DocsModel:       docsModel,
+		ModelParams:     modelParams,
+		DocsModelParams: docsModelParams,
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -139,6 +143,45 @@ func (d *Dispatcher) modelsFor(lane string) (model, docsModel string) {
 		return d.cfg.Models.Coder, d.cfg.Models.CoderDocs
 	case string(contract.LaneReviewer):
 		return d.cfg.Models.Reviewer, ""
+	default:
+		return "", ""
+	}
+}
+
+// modelParamsFor resolves the opaque per-lane model-construction kwargs a
+// spawned lane's worker should get from cfg.ModelParams (config.ModelParams's
+// doc comment: DAC create_model extra_kwargs like a codex reasoning effort or
+// an anthropic extended-thinking budget), JSON-encoding each map for
+// WorkerSpec.ModelParams/.DocsModelParams. It mirrors modelsFor's lane
+// mapping exactly — coder gets both Coder and CoderDocs, reviewer gets only
+// Reviewer, everything else gets neither — since the docs sub-step only ever
+// runs inside the Coder graph (AGENTS.md: "Documentation is a coder-graph
+// step, not a lane"). A nil or empty map encodes as "" rather than "{}" or
+// "null", so internal/spawn.LocalSpawner's workerArgs omits
+// --model-params/--docs-model-params entirely for an unconfigured lane
+// instead of handing the worker an empty JSON object to parse.
+func (d *Dispatcher) modelParamsFor(lane string) (params, docsParams string) {
+	enc := func(m map[string]any) string {
+		if len(m) == 0 {
+			return ""
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			// A decoded YAML map failing to round-trip through
+			// encoding/json would be a stdlib-defying surprise, but params
+			// are a best-effort passthrough (config.ModelParams's doc
+			// comment): never fail the spawn over it, just log and fall
+			// back to "no overrides" for this lane.
+			d.logger.Warn("marshal model_params failed", "lane", lane, "error", err)
+			return ""
+		}
+		return string(b)
+	}
+	switch lane {
+	case string(contract.LaneCoder):
+		return enc(d.cfg.ModelParams.Coder), enc(d.cfg.ModelParams.CoderDocs)
+	case string(contract.LaneReviewer):
+		return enc(d.cfg.ModelParams.Reviewer), ""
 	default:
 		return "", ""
 	}
