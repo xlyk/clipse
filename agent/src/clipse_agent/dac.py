@@ -105,12 +105,17 @@ def build_coder_agent(
             (including a `MissingCredentialsError` from either).
     """
     try:
+        provider = profile.model.split(":", 1)[0]
+        # create_cli_agent takes a bare model spec string; create_model is the
+        # only one of the two that accepts extra_kwargs. So any lane carrying
+        # model_params needs create_model even off the codex provider -- not
+        # just openai_codex, whose plain string init_chat_model can't resolve
+        # (raises ValueError) and which create_model's on-disk OAuth token
+        # store handles regardless of model_params.
+        use_create_model = provider == CODEX_PROVIDER or bool(profile.model_params)
         model: str | Any = profile.model
-        if profile.model.split(":", 1)[0] == CODEX_PROVIDER:
-            # init_chat_model can't resolve the DAC-only "openai_codex" provider
-            # (raises ValueError); DAC's create_model wires the on-disk OAuth
-            # token store and returns a ready BaseChatModel to hand over instead.
-            model = create_model(profile.model).model
+        if use_create_model:
+            model = create_model(profile.model, extra_kwargs=profile.model_params or None).model
         return create_cli_agent(
             model,
             profile.assistant_id,

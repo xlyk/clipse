@@ -140,7 +140,14 @@ def test_build_coder_agent_codex_prebuilds_model_object(monkeypatch):
     # build_coder_agent must hand create_cli_agent the pre-built BaseChatModel
     # object from create_model, never the raw "openai_codex:..." string.
     sentinel = object()
-    monkeypatch.setattr(dac, "create_model", lambda spec: SimpleNamespace(model=sentinel))
+    captured_create_model: dict[str, Any] = {}
+
+    def fake_create_model(spec, *, extra_kwargs=None, **kwargs):
+        captured_create_model["spec"] = spec
+        captured_create_model["extra_kwargs"] = extra_kwargs
+        return SimpleNamespace(model=sentinel)
+
+    monkeypatch.setattr(dac, "create_model", fake_create_model)
     captured: dict[str, Any] = {}
     monkeypatch.setattr(
         dac,
@@ -151,6 +158,31 @@ def test_build_coder_agent_codex_prebuilds_model_object(monkeypatch):
     dac.build_coder_agent(get_coder_profile(model="openai_codex:gpt-5.5"), None, "/tmp")
 
     assert captured["model"] is sentinel  # object, never the string
+    # No model_params on the profile -- extra_kwargs must stay falsy, exactly
+    # the pre-model_params behavior.
+    assert not captured_create_model["extra_kwargs"]
+
+
+def test_build_coder_agent_codex_with_model_params_passes_extra_kwargs(monkeypatch):
+    # A codex profile carrying model_params must forward them verbatim as
+    # create_model's extra_kwargs -- this is how per-lane reasoning_effort
+    # etc. reach the constructed model.
+    model_params = {"reasoning_effort": "low"}
+    captured_create_model: dict[str, Any] = {}
+
+    def fake_create_model(spec, *, extra_kwargs=None, **kwargs):
+        captured_create_model["spec"] = spec
+        captured_create_model["extra_kwargs"] = extra_kwargs
+        return SimpleNamespace(model=object())
+
+    monkeypatch.setattr(dac, "create_model", fake_create_model)
+    monkeypatch.setattr(dac, "create_cli_agent", lambda model, aid, **kw: (object(), object()))
+
+    profile = get_coder_profile(model="openai_codex:gpt-5.5", model_params=model_params)
+    dac.build_coder_agent(profile, None, "/tmp")
+
+    assert captured_create_model["spec"] == "openai_codex:gpt-5.5"
+    assert captured_create_model["extra_kwargs"] == model_params
 
 
 def test_build_coder_agent_anthropic_passes_string(monkeypatch):
@@ -173,8 +205,39 @@ def test_build_coder_agent_anthropic_passes_string(monkeypatch):
     assert called["create_model"] is False
 
 
+def test_build_coder_agent_anthropic_with_model_params_routes_through_create_model(monkeypatch):
+    # ANY lane with model_params must route through create_model, not just
+    # codex -- extra_kwargs is create_model's documented param and the only
+    # way per-lane thinking/reasoning params reach the constructed model
+    # object, so a non-codex provider with model_params must also give up
+    # the plain-string path.
+    sentinel = object()
+    model_params = {"thinking": {"type": "enabled", "budget_tokens": 2048}}
+    captured_create_model: dict[str, Any] = {}
+
+    def fake_create_model(spec, *, extra_kwargs=None, **kwargs):
+        captured_create_model["spec"] = spec
+        captured_create_model["extra_kwargs"] = extra_kwargs
+        return SimpleNamespace(model=sentinel)
+
+    monkeypatch.setattr(dac, "create_model", fake_create_model)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        dac,
+        "create_cli_agent",
+        lambda model, aid, **kw: captured.update(model=model) or (object(), object()),
+    )
+
+    profile = get_coder_profile(model="anthropic:claude-sonnet-4-6", model_params=model_params)
+    dac.build_coder_agent(profile, None, "/tmp")
+
+    assert captured_create_model["spec"] == "anthropic:claude-sonnet-4-6"
+    assert captured_create_model["extra_kwargs"] == model_params
+    assert captured["model"] is sentinel  # object, never the string
+
+
 def test_build_coder_agent_wraps_create_model_failure(monkeypatch):
-    def boom(spec):
+    def boom(spec, **kwargs):
         raise RuntimeError("no creds")
 
     monkeypatch.setattr(dac, "create_model", boom)
