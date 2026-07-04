@@ -639,15 +639,23 @@ def _commit_message(state: CoderState) -> str:
     return f"{issue_id}: {headline}"[:72]
 
 
-_CONFLICT_MARKER_PATTERN = r"^(<<<<<<<|=======|>>>>>>>)"
+_CONFLICT_MARKER_PATTERN = r"^(<<<<<<<|>>>>>>>)"
 
 
 def _unresolved_conflict_markers(run_command: CommandRunner, cwd: str, files: Sequence[str]) -> list[str]:
     """Which of `files` (the merge's own conflicted paths, relative to `cwd`)
-    still contain an unresolved conflict marker line (`<<<<<<<`, `=======`, or
+    still contain an unresolved conflict marker line (`<<<<<<<` or
     `>>>>>>>`) -- i.e. the conflict-resolution DAC turn
     (`_conflict_resolution_task_text`) claimed to be done but actually left
     the file incompletely resolved.
+
+    Deliberately does NOT match the bare `=======` separator: a genuine
+    unresolved conflict always ALSO leaves a bracket marker, so dropping
+    `=======` loses no real detection, while matching it false-positives on a
+    correctly resolved file that legitimately contains a line of 7+ `=` (a
+    Markdown setext H1 underline, an RST divider, a `# =======` banner
+    comment, ...) -- which would otherwise wedge the card in `blocked` at
+    `rework_cap` forever, the exact block-loop this guard exists to prevent.
 
     `grep -l` prints the name of each matching file and exits 0 when at least
     one matches, 1 when none do -- an empty `stdout` either way means clean,
@@ -677,8 +685,8 @@ def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, 
     way a real merge is sitting in progress in the worktree:
 
     - Merge in progress: BEFORE staging or committing anything, every file in
-      `merge_conflict_files` is scanned for a remaining `<<<<<<<`/`=======`/
-      `>>>>>>>` marker (`_unresolved_conflict_markers`). Nothing here proves
+      `merge_conflict_files` is scanned for a remaining `<<<<<<<`/`>>>>>>>`
+      marker (`_unresolved_conflict_markers`). Nothing here proves
       the conflict-resolution DAC turn (`_coding_task_text`) actually removed
       every marker -- it only edited files and said it was done -- so if any
       listed file still has one, this raises `CoderGraphError` instead of

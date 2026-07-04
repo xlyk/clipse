@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -1464,10 +1465,93 @@ def test_commit_completes_merge_even_when_status_looks_clean(tmp_path):
 
 # ---------------------------------------------------------------------------
 # commit's unresolved-marker guard (Task 3 review gap): a merge-completion
-# commit must never land literal `<<<<<<<`/`=======`/`>>>>>>>` conflict
-# markers on the shared branch just because the conflict-resolution DAC turn
-# claimed to be done without actually finishing.
+# commit must never land literal `<<<<<<<`/`>>>>>>>` conflict markers on the
+# shared branch just because the conflict-resolution DAC turn claimed to be
+# done without actually finishing. The pattern deliberately does NOT match a
+# bare `=======` line -- that alternative false-positived on a correctly
+# resolved file that legitimately contains a line of 7+ `=` (a Markdown
+# setext H1 underline, an RST divider, a `# =======` banner comment, ...),
+# wedging the card in `blocked` at `rework_cap` forever. A genuine unresolved
+# conflict always leaves a bracket marker too, so dropping `=======` loses no
+# real detection.
 # ---------------------------------------------------------------------------
+
+
+def _grep_lE_against_real_files(
+    default: coder.CommandResult | None = None,
+) -> Callable[[Sequence[str], str], coder.CommandResult]:
+    """A `CommandRunner` that evaluates a `grep -lE <pattern> <files...>` call
+    for real, against files actually written to `cwd` on disk, using
+    whatever pattern the caller (`_unresolved_conflict_markers`) passes.
+
+    Unlike `FakeRunner`'s canned `CommandResult`s, this is the only way to
+    prove that a change to `coder._CONFLICT_MARKER_PATTERN` itself -- not
+    just the plumbing around it -- changes what trips the guard, without
+    shelling out to a real `grep` subprocess (still respecting this file's
+    "never touch a real subprocess" rule: matching is done with `re`, in
+    process). Anything other than `grep -lE` falls through to `default` (a
+    clean success), matching `FakeRunner`'s behavior for unscripted calls.
+    """
+    fallback = default or coder.CommandResult(0, "", "")
+
+    def _runner(argv: Sequence[str], cwd: str) -> coder.CommandResult:
+        argv_list = list(argv)
+        if argv_list[:2] != ["grep", "-lE"]:
+            return fallback
+        pattern, files = argv_list[2], argv_list[3:]
+        hits = [
+            f
+            for f in files
+            if any(re.match(pattern, line) for line in (Path(cwd) / f).read_text().splitlines())
+        ]
+        return coder.CommandResult(0 if hits else 1, "\n".join(hits), "")
+
+    return _runner
+
+
+def test_commit_proceeds_when_resolved_file_has_setext_heading_underline(tmp_path):
+    # Regression: a correctly-resolved file that legitimately contains a
+    # line of 7+ `=` -- e.g. a Markdown setext H1 underline -- must NOT be
+    # mistaken for an unresolved `=======` conflict marker. Reflex is
+    # docs-heavy, so this is reachable in practice.
+    work = tmp_path / "worktree"
+    work.mkdir()
+    (work / "README.md").write_text("Title\n=======\n\nBody text.\n")
+
+    node = coder.make_commit(_grep_lE_against_real_files())
+
+    out = node(
+        {
+            "cwd": str(work),
+            "issue_id": "SPAC-1",
+            "turn_count": 0,
+            "merge_conflict_files": ["README.md"],
+        }
+    )
+
+    assert out["committed"] is True
+
+
+def test_commit_raises_when_real_file_still_has_a_bracket_marker(tmp_path):
+    # Companion to the setext regression above, on real file content rather
+    # than a canned grep result: a file that genuinely still has an
+    # unresolved `<<<<<<<`/`>>>>>>>` marker must still trip the guard now
+    # that the pattern no longer matches a bare `=======` line.
+    work = tmp_path / "worktree"
+    work.mkdir()
+    (work / "src.py").write_text("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n")
+
+    node = coder.make_commit(_grep_lE_against_real_files())
+
+    with pytest.raises(coder.CoderGraphError, match="src.py"):
+        node(
+            {
+                "cwd": str(work),
+                "issue_id": "SPAC-1",
+                "turn_count": 0,
+                "merge_conflict_files": ["src.py"],
+            }
+        )
 
 
 def test_commit_raises_when_unresolved_conflict_markers_remain(tmp_path):
@@ -1501,7 +1585,7 @@ def test_commit_raises_when_unresolved_conflict_markers_remain(tmp_path):
     # Scoped to the coder's OWN worktree -- never the clipse repo this test
     # process itself runs from.
     assert grep_calls[0].cwd == str(tmp_path)
-    assert grep_calls[0].argv == ["grep", "-lE", r"^(<<<<<<<|=======|>>>>>>>)", "src/a.py", "src/b.py"]
+    assert grep_calls[0].argv == ["grep", "-lE", r"^(<<<<<<<|>>>>>>>)", "src/a.py", "src/b.py"]
 
 
 def test_commit_proceeds_when_conflict_markers_are_fully_resolved(tmp_path):
