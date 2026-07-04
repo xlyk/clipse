@@ -169,6 +169,49 @@ func TestWorkerArgs(t *testing.T) {
 				"--workspace=",
 			},
 		},
+		{
+			name: "model-params only",
+			spec: WorkerSpec{
+				Lane:        "coder",
+				ModelParams: `{"reasoning_effort":"high"}`,
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				`--model-params={"reasoning_effort":"high"}`,
+			},
+		},
+		{
+			name: "docs-model-params only",
+			spec: WorkerSpec{
+				Lane:            "coder",
+				DocsModelParams: `{"reasoning_effort":"high"}`,
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				`--docs-model-params={"reasoning_effort":"high"}`,
+			},
+		},
+		{
+			name: "model-params and docs-model-params both empty omits both flags",
+			spec: WorkerSpec{
+				Lane: "reviewer",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=reviewer",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+			},
+		},
 	}
 
 	for _, tt := range tests {

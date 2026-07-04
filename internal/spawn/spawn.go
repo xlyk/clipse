@@ -74,6 +74,17 @@ type WorkerSpec struct {
 	// (empty = worker default). Optional: LocalSpawner appends
 	// --docs-model=<value> only when this is non-empty.
 	DocsModel string
+
+	// ModelParams is a JSON object of extra model-construction kwargs for
+	// this lane's DAC agent (empty = none). Optional: LocalSpawner appends
+	// --model-params=<value> only when this is non-empty.
+	ModelParams string
+
+	// DocsModelParams is a JSON object of extra model-construction kwargs
+	// for the coder graph's docs sub-step (empty = none). Optional:
+	// LocalSpawner appends --docs-model-params=<value> only when this is
+	// non-empty.
+	DocsModelParams string
 }
 
 // Spawner starts a worker process for spec and returns a handle to observe
