@@ -252,10 +252,10 @@ type rawModels struct {
 // set": a map's own zero value (nil) already means absent (yaml.v3 leaves it
 // nil unless the document sets the key), and there is no default value to
 // distinguish it from (model_params never defaults — see ModelParams's doc
-// comment). rawConfig embeds this behind a pointer (unlike rawModels, which
-// is a plain value) so Load can tell "model_params: omitted entirely" apart
-// from "model_params: present"; see Load's nil-guard when copying it into
-// Config.
+// comment). Like rawModels, this is embedded as a plain value (not a
+// pointer) in rawConfig: a YAML document that omits `model_params:` entirely
+// still yields a zero-value rawModelParams with all-nil fields, so no
+// nil-sub-struct guard is needed before reading them.
 type rawModelParams struct {
 	Coder     map[string]any `yaml:"coder"`
 	CoderDocs map[string]any `yaml:"coder_docs"`
@@ -280,22 +280,23 @@ type rawConfig struct {
 	// Models is plain (not pointer-wrapped), like Caps: its own fields
 	// (rawModels) carry the pointers needed to detect "absent from YAML".
 	Models rawModels `yaml:"models"`
-	// ModelParams is pointer-wrapped, unlike Models: see rawModelParams's
-	// doc comment for why.
-	ModelParams     *rawModelParams `yaml:"model_params"`
-	PollIntervalS   *int            `yaml:"poll_interval_s"`
-	Caps            rawCaps         `yaml:"caps"`
-	TurnCap         *int            `yaml:"turn_cap"`
-	MaxRuntimeS     *int            `yaml:"max_runtime_s"`
-	LaneLabelPrefix *string         `yaml:"lane_label_prefix"`
-	MaxAttempts     *int            `yaml:"max_attempts"`
-	ReworkCap       *int            `yaml:"rework_cap"`
-	RecoverCap      *int            `yaml:"recover_cap"`
-	RecoverBackoffS *int            `yaml:"recover_backoff_s"`
-	MaxTokensPerRun *int            `yaml:"max_tokens_per_run"`
-	CheckpointsDir  *string         `yaml:"checkpoints_dir"`
-	BoardDir        *string         `yaml:"board_dir"`
-	EnvAllowlist    []string        `yaml:"env_allowlist"`
+	// ModelParams is plain (not pointer-wrapped), like Models: its own
+	// fields (rawModelParams) are maps whose nil zero-value already means
+	// "absent from YAML" — see rawModelParams's doc comment.
+	ModelParams     rawModelParams `yaml:"model_params"`
+	PollIntervalS   *int           `yaml:"poll_interval_s"`
+	Caps            rawCaps        `yaml:"caps"`
+	TurnCap         *int           `yaml:"turn_cap"`
+	MaxRuntimeS     *int           `yaml:"max_runtime_s"`
+	LaneLabelPrefix *string        `yaml:"lane_label_prefix"`
+	MaxAttempts     *int           `yaml:"max_attempts"`
+	ReworkCap       *int           `yaml:"rework_cap"`
+	RecoverCap      *int           `yaml:"recover_cap"`
+	RecoverBackoffS *int           `yaml:"recover_backoff_s"`
+	MaxTokensPerRun *int           `yaml:"max_tokens_per_run"`
+	CheckpointsDir  *string        `yaml:"checkpoints_dir"`
+	BoardDir        *string        `yaml:"board_dir"`
+	EnvAllowlist    []string       `yaml:"env_allowlist"`
 }
 
 // Load reads the clipse config file at path, applies defaults for fields
@@ -316,19 +317,6 @@ func Load(path string) (*Config, error) {
 	// lands roughly one poll later), so it must be known before defaulting.
 	pollIntervalS := intOrDefault(raw.PollIntervalS, defaultPollIntervalS)
 
-	// model_params is an opaque passthrough (kernel LLM-free, no validated
-	// vocabulary) with no defaulting: every lane stays nil unless the YAML
-	// document sets it, including all three when model_params itself is
-	// absent entirely (raw.ModelParams == nil).
-	var modelParams ModelParams
-	if raw.ModelParams != nil {
-		modelParams = ModelParams{
-			Coder:     raw.ModelParams.Coder,
-			CoderDocs: raw.ModelParams.CoderDocs,
-			Reviewer:  raw.ModelParams.Reviewer,
-		}
-	}
-
 	cfg := &Config{
 		Repo:    raw.Repo,
 		TeamKey: raw.TeamKey,
@@ -339,7 +327,14 @@ func Load(path string) (*Config, error) {
 			CoderDocs: stringOrDefault(raw.Models.CoderDocs, defaultModelCoderDocs),
 			Reviewer:  stringOrDefault(raw.Models.Reviewer, defaultModelReviewer),
 		},
-		ModelParams:     modelParams,
+		// model_params is an opaque passthrough (kernel LLM-free, no
+		// validated vocabulary) with no defaulting: every lane stays nil
+		// unless the YAML document sets it.
+		ModelParams: ModelParams{
+			Coder:     raw.ModelParams.Coder,
+			CoderDocs: raw.ModelParams.CoderDocs,
+			Reviewer:  raw.ModelParams.Reviewer,
+		},
 		PollIntervalS:   pollIntervalS,
 		TurnCap:         intOrDefault(raw.TurnCap, defaultTurnCap),
 		MaxRuntimeS:     intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),
