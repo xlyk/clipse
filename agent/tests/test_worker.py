@@ -396,7 +396,7 @@ def test_dispatch_threads_model_into_coder_profile(monkeypatch, capsys):
             "--thread=thread-1",
             "--workspace=/ws",
             "--model=openai_codex:gpt-5.5",
-            "--docs-model=anthropic:claude-sonnet-4-6",
+            "--docs-model=openai_codex:gpt-5.4",
         ],
         graph=graph,
         build_calls=build_calls,
@@ -404,7 +404,7 @@ def test_dispatch_threads_model_into_coder_profile(monkeypatch, capsys):
     )
 
     assert kwarg_calls[-1]["profile"].model == "openai_codex:gpt-5.5"
-    assert kwarg_calls[-1]["docs_profile"].model == "anthropic:claude-sonnet-4-6"
+    assert kwarg_calls[-1]["docs_profile"].model == "openai_codex:gpt-5.4"
 
 
 def test_dispatch_coder_falls_back_to_default_models_when_flags_omitted(monkeypatch, capsys):
