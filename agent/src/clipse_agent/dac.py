@@ -110,6 +110,15 @@ def build_coder_agent(
     3). This is the SAFETY-neutral lever: only the model's advertised
     profile changes, never the `create_cli_agent` SAFETY args below.
 
+    Since `context_window_tokens` defaults to non-`None`, this routes
+    *every* lane through `create_model` now, not just `openai_codex`/
+    `model_params` ones -- so every lane also picks up what `create_model`
+    does unconditionally: applying any `~/.deepagents/config.toml`
+    provider-profile overrides and an early fail-fast credential check.
+    Dormant in the worker's scrubbed env today (no config.toml overrides in
+    play, and credentials are already required either way), but a
+    deliberate widening of `create_model`'s reach worth knowing about.
+
     Raises:
         DacError: wrapping anything `create_model` or `create_cli_agent` raises
             (including a `MissingCredentialsError` from either).
