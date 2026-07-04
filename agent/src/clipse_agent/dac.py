@@ -199,10 +199,17 @@ async def drive_turn(
     exactly what this function does.
 
     Accumulates `usage_metadata` across every `AIMessage` seen in the
-    stream. If `max_tokens` is set and the running total exceeds it, the
-    stream is abandoned immediately — no further chunks are pulled — and
-    `token_ceiling_exceeded=True` is set on the result; the caller maps
-    that to `outcome=blocked, block_kind=capability`.
+    stream for reporting (`tokens_in`/`tokens_out` on the result are
+    cumulative across the whole turn). The ceiling check is per-round,
+    not cumulative: `max_tokens` caps the largest single round's input
+    (context) tokens, a post-compaction runaway guard — DAC's built-in
+    auto-summarizer already bounds each round's context, so a healthy
+    turn can run arbitrarily long without its cumulative spend ever
+    being compared against `max_tokens`. If any one round's input
+    tokens exceed `max_tokens`, the stream is abandoned immediately —
+    no further chunks are pulled — and `token_ceiling_exceeded=True` is
+    set on the result; the caller maps that to `outcome=blocked,
+    block_kind=capability`.
 
     Raises:
         ValueError: if `task_text`/`resume` are both or neither given.
@@ -240,9 +247,9 @@ async def drive_turn(
                 tokens_in += turn_in
                 tokens_out += turn_out
 
-            if max_tokens is not None and (tokens_in + tokens_out) > max_tokens:
-                token_ceiling_exceeded = True
-                break
+                if max_tokens is not None and turn_in > max_tokens:
+                    token_ceiling_exceeded = True
+                    break
     except Exception as exc:
         thread_id = config.get("configurable", {}).get("thread_id")
         raise DacError(

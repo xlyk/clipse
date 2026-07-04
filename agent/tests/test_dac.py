@@ -392,12 +392,36 @@ def test_drive_turn_ignores_non_ai_messages():
 # ---------------------------------------------------------------------------
 
 
-def test_drive_turn_trips_max_tokens_ceiling_and_stops_early():
+def test_drive_turn_cumulative_sum_across_rounds_does_not_trip_ceiling():
+    # Each round's input is below max_tokens, but the SUM across rounds
+    # exceeds it (60 + 60 + 60 = 180 > 100). The old cumulative-turn-sum
+    # behavior would have tripped on round 2 -- proving the ceiling is now
+    # per-round, not cumulative.
     graph = _FakeAgentGraph(
         [
-            ((), "messages", (_ai_message("a", tokens_in=40, tokens_out=10), {})),  # 50
-            ((), "messages", (_ai_message("b", tokens_in=40, tokens_out=20), {})),  # 110 total
-            ((), "messages", (_ai_message("c", tokens_in=1000, tokens_out=1000), {})),
+            ((), "messages", (_ai_message("a", tokens_in=60, tokens_out=10), {})),
+            ((), "messages", (_ai_message("b", tokens_in=60, tokens_out=10), {})),
+            ((), "messages", (_ai_message("c", tokens_in=60, tokens_out=10), {})),
+        ]
+    )
+
+    result = asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="go", max_tokens=100))
+
+    assert result.token_ceiling_exceeded is False
+    assert result.outcome_hint == "completed"
+    # Nothing trips early -- every chunk is consumed.
+    assert len(graph.consumed) == 3
+    # Reporting is still cumulative across the whole turn.
+    assert result.tokens_in == 180
+    assert result.tokens_out == 30
+
+
+def test_drive_turn_trips_ceiling_when_single_round_input_exceeds_max_tokens():
+    graph = _FakeAgentGraph(
+        [
+            ((), "messages", (_ai_message("a", tokens_in=40, tokens_out=10), {})),
+            ((), "messages", (_ai_message("b", tokens_in=150, tokens_out=20), {})),
+            ((), "messages", (_ai_message("c", tokens_in=1, tokens_out=1), {})),
         ]
     )
 
@@ -405,10 +429,11 @@ def test_drive_turn_trips_max_tokens_ceiling_and_stops_early():
 
     assert result.token_ceiling_exceeded is True
     assert result.outcome_hint == "interrupted"
-    assert result.tokens_in == 80
-    assert result.tokens_out == 30
     # The third chunk must never be pulled once the ceiling trips.
     assert len(graph.consumed) == 2
+    # Reporting still reflects cumulative in/out up to the point of stopping.
+    assert result.tokens_in == 190
+    assert result.tokens_out == 30
 
 
 def test_drive_turn_never_trips_ceiling_when_max_tokens_is_none():
@@ -422,12 +447,14 @@ def test_drive_turn_never_trips_ceiling_when_max_tokens_is_none():
     assert result.outcome_hint == "completed"
 
 
-def test_drive_turn_ceiling_is_exceeded_not_reached_boundary():
-    # Landing exactly on max_tokens must not trip the ceiling ("exceed").
+def test_drive_turn_ceiling_boundary_is_exceeds_not_reaches():
+    # A single round landing exactly on max_tokens must not trip the
+    # ceiling ("exceeds", not "reaches") -- only a strictly greater
+    # single-round input does.
     graph = _FakeAgentGraph(
         [
-            ((), "messages", (_ai_message("a", tokens_in=50, tokens_out=50), {})),
-            ((), "messages", (_ai_message("b", tokens_in=1, tokens_out=0), {})),
+            ((), "messages", (_ai_message("a", tokens_in=100, tokens_out=0), {})),
+            ((), "messages", (_ai_message("b", tokens_in=101, tokens_out=0), {})),
         ]
     )
 
@@ -435,7 +462,7 @@ def test_drive_turn_ceiling_is_exceeded_not_reached_boundary():
 
     assert result.token_ceiling_exceeded is True
     assert len(graph.consumed) == 2
-    assert result.tokens_in == 51
+    assert result.tokens_in == 201
 
 
 # ---------------------------------------------------------------------------
