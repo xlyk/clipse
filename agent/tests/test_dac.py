@@ -465,6 +465,28 @@ def test_drive_turn_ceiling_boundary_is_exceeds_not_reaches():
     assert result.tokens_in == 201
 
 
+def test_drive_turn_survives_leading_updates_chunk_with_ceiling_set():
+    # Regression guard: the ceiling check lives inside the `messages` branch
+    # because `turn_in` is only bound there. A stream that opens with an
+    # `updates`-mode chunk (a plain state update, not an interrupt) before
+    # any `messages` chunk arrives must not raise `UnboundLocalError` for
+    # `turn_in` -- which is exactly what hoisting the check to run after
+    # every chunk, regardless of mode, would reintroduce.
+    graph = _FakeAgentGraph(
+        [
+            ((), "updates", {}),
+            ((), "messages", (_ai_message("ok", tokens_in=10, tokens_out=5), {})),
+        ]
+    )
+
+    result = asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="go", max_tokens=100))
+
+    assert result.token_ceiling_exceeded is False
+    assert result.outcome_hint == "completed"
+    assert result.tokens_in == 10
+    assert result.tokens_out == 5
+
+
 # ---------------------------------------------------------------------------
 # drive_turn -- error wrapping
 # ---------------------------------------------------------------------------
