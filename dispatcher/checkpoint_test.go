@@ -89,3 +89,37 @@ func TestSpawnAttempt_CheckpointDBEmptyWhenCheckpointsDirUnset(t *testing.T) {
 		t.Errorf("MaxTokens = %d, want 0 (MaxTokensPerRun unset)", specs[0].MaxTokens)
 	}
 }
+
+// TestSpawnAttempt_WiresBaseBranch asserts a claimed Coder issue's spawned
+// worker gets WorkerSpec.BaseBranch set from cfg.Repo.BaseBranch — the same
+// direct cfg-to-spec forwarding as CheckpointDB/MaxTokens above, so the coder
+// graph can later `git merge origin/<base>` into its worktree each turn
+// (AGENTS.md Task 1: "thread the repo's base_branch to the Python worker").
+// testConfig() sets Repo.BaseBranch to "main", so this exercises the
+// production-shaped default rather than a hand-picked override.
+func TestSpawnAttempt_WiresBaseBranch(t *testing.T) {
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	cfg := testConfig()
+
+	d := dispatcher.New(cfg, s, lc, spawner, ws,
+		dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+	)
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	specs := spawner.Specs()
+	if len(specs) != 1 {
+		t.Fatalf("SpawnCount = %d, want exactly 1", len(specs))
+	}
+	if specs[0].BaseBranch != cfg.Repo.BaseBranch {
+		t.Errorf("BaseBranch = %q, want %q", specs[0].BaseBranch, cfg.Repo.BaseBranch)
+	}
+}

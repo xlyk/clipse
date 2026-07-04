@@ -85,6 +85,13 @@ type WorkerSpec struct {
 	// LocalSpawner appends --docs-model-params=<value> only when this is
 	// non-empty.
 	DocsModelParams string
+
+	// BaseBranch is the repo base branch (config.Repo.BaseBranch) the coder
+	// syncs its worktree to each turn, e.g. `git merge origin/<base>` (empty
+	// = omitted). Set for every lane; harmless for Reviewer/git-operator
+	// workers, which never sync a worktree. Optional: LocalSpawner appends
+	// --base-branch=<value> only when this is non-empty.
+	BaseBranch string
 }
 
 // Spawner starts a worker process for spec and returns a handle to observe

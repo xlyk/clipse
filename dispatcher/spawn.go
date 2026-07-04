@@ -71,6 +71,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		DocsModel:       docsModel,
 		ModelParams:     modelParams,
 		DocsModelParams: docsModelParams,
+		BaseBranch:      d.cfg.Repo.BaseBranch,
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but

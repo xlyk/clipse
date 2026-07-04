@@ -24,13 +24,19 @@ func main() {
 }
 
 func run() error {
-	var issue, lane, runID, thread, workspace, scenario string
+	var issue, lane, runID, thread, workspace, scenario, baseBranch string
 	flag.StringVar(&issue, "issue", "", "Linear issue identifier")
 	flag.StringVar(&lane, "lane", "", "worker lane")
 	flag.StringVar(&runID, "run", "", "dispatcher-assigned run id")
 	flag.StringVar(&thread, "thread", "", "checkpointer thread id")
 	flag.StringVar(&workspace, "workspace", "", "worker workspace directory")
 	flag.StringVar(&scenario, "scenario", "", "canned scenario to emit")
+	// base-branch is accepted but unused: real dispatcher configs (and
+	// testConfig(), used by the real-subprocess e2e tests) always carry a
+	// non-empty Repo.BaseBranch, so LocalSpawner appends --base-branch for
+	// every lane (see internal/spawn.workerArgs). testworker must at least
+	// parse it, even though only the real coder graph syncs a worktree.
+	flag.StringVar(&baseBranch, "base-branch", "", "repo base branch (accepted, unused by testworker)")
 	flag.Parse()
 
 	// The Spawner builds args strictly from WorkerSpec's fixed fields

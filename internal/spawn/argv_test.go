@@ -212,6 +212,34 @@ func TestWorkerArgs(t *testing.T) {
 				"--workspace=",
 			},
 		},
+		{
+			name: "base-branch appended when set",
+			spec: WorkerSpec{
+				Lane:       "coder",
+				BaseBranch: "main",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				"--base-branch=main",
+			},
+		},
+		{
+			name: "base-branch omitted when empty",
+			spec: WorkerSpec{
+				Lane: "coder",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+			},
+		},
 	}
 
 	for _, tt := range tests {
