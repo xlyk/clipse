@@ -65,6 +65,11 @@ PASS.
 
 _DEFAULT_MODEL = "anthropic:claude-opus-4-6"
 
+# Mirrors profiles.coder's own constant of the same name/value: lowers the
+# trigger DAC's already-installed auto-summarizer uses (see
+# dac.build_coder_agent) well below a big-context-window model's real limit.
+_DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+
 # Read-mostly: no write/execute-capable commands (no sed/mkdir/go/uv/python/
 # make/echo/etc, unlike the Coder lane's list in profiles/coder.py) -- a
 # reviewer inspects the code, it never edits it.
@@ -90,6 +95,12 @@ class ReviewerProfile:
     `dict`, mirroring `CoderProfile.model_params` -- frozen blocks
     *reassigning* the field, not mutating the dict it points to, and this
     value is only ever read after being built once.
+
+    `context_window_tokens` mirrors `CoderProfile.context_window_tokens`:
+    when not `None`, `dac.build_coder_agent` (reused unchanged for this lane
+    -- see `get_reviewer_profile`) writes it onto the built model's own
+    `profile["max_input_tokens"]` before `create_cli_agent`, lowering the
+    trigger DAC's already-installed auto-summarizer uses.
     """
 
     assistant_id: str
@@ -97,9 +108,14 @@ class ReviewerProfile:
     system_prompt: str
     shell_allow_list: tuple[str, ...]
     model_params: dict[str, Any] | None = None
+    context_window_tokens: int | None = _DEFAULT_CONTEXT_WINDOW_TOKENS
 
 
-def get_reviewer_profile(model: str | None = None, model_params: dict[str, Any] | None = None) -> ReviewerProfile:
+def get_reviewer_profile(
+    model: str | None = None,
+    model_params: dict[str, Any] | None = None,
+    context_window_tokens: int | None = None,
+) -> ReviewerProfile:
     """Return the Reviewer lane's DAC profile.
 
     `model` names a placeholder `provider:model` spec, never a live
@@ -115,6 +131,11 @@ def get_reviewer_profile(model: str | None = None, model_params: dict[str, Any] 
     (config.ModelParams's `Reviewer` map, threaded through as JSON via
     `worker.py`'s `--model-params` flag). Unlike `model`, it has no default
     to fall back to -- omitted (`None`) means exactly that: no overrides.
+
+    `context_window_tokens` mirrors `model`'s idiom: omitted (`None`) falls
+    back to `_DEFAULT_CONTEXT_WINDOW_TOKENS`, so this factory can never
+    produce a profile with `context_window_tokens=None` -- only a
+    directly-constructed `ReviewerProfile` can opt all the way out.
     """
     return ReviewerProfile(
         assistant_id="clipse-reviewer",
@@ -122,4 +143,7 @@ def get_reviewer_profile(model: str | None = None, model_params: dict[str, Any] 
         system_prompt=_SYSTEM_PROMPT,
         shell_allow_list=_SHELL_ALLOW_LIST,
         model_params=model_params,
+        context_window_tokens=(
+            context_window_tokens if context_window_tokens is not None else _DEFAULT_CONTEXT_WINDOW_TOKENS
+        ),
     )

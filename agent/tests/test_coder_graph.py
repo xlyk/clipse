@@ -15,6 +15,7 @@ import asyncio
 import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -699,7 +700,7 @@ def test_ensure_worktree_raises_when_not_a_git_dir(tmp_path):
 
 # ---------------------------------------------------------------------------
 # Default wiring really reaches clipse_agent.dac (only DAC's own innermost
-# create_cli_agent is faked, same seam test_dac.py uses).
+# create_cli_agent/create_model are faked, same seam test_dac.py uses).
 # ---------------------------------------------------------------------------
 
 
@@ -725,6 +726,12 @@ def test_build_coder_graph_default_wiring_uses_real_dac_module(tmp_path, monkeyp
         return _FakeAgentGraph(), "fake-backend"
 
     monkeypatch.setattr(dac, "create_cli_agent", fake_create_cli_agent)
+    # context_window_tokens defaults on, so build_coder_agent always resolves
+    # the model via create_model now -- fake it to a model-like object with a
+    # settable `.profile` (never a real credential/network call).
+    monkeypatch.setattr(
+        dac, "create_model", lambda spec, **kw: SimpleNamespace(model=SimpleNamespace(profile=None))
+    )
 
     runner = _base_runner()
     graph = coder.build_coder_graph(run_command=runner)

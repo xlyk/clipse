@@ -5,6 +5,14 @@ these tests exercise the wrapper's safety-critical wiring and its
 stream-driving logic, never a real model, real DAC agent, or real network
 call. `drive_turn` is async; plain `asyncio.run` drives it since the repo's
 approved Python dev deps are `pytest` + `ruff` only (no `pytest-asyncio`).
+
+One exception:
+`test_summarization_middleware_is_installed_with_our_lowered_trigger` builds
+a REAL `create_cli_agent`/`create_deep_agent` graph (a regression guard that
+DAC's built-in auto-summarizer is still there after a dependency bump) --
+still zero network, since building the graph's structure never calls the
+model, and only a placeholder API key string is needed to satisfy
+`init_chat_model`'s construction-time credential check.
 """
 
 from __future__ import annotations
@@ -14,7 +22,11 @@ import dataclasses
 from types import SimpleNamespace
 from typing import Any
 
+import deepagents.graph as deepagents_graph
 import pytest
+from deepagents.middleware.summarization import (
+    create_summarization_middleware as _real_create_summarization_middleware,
+)
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command, Interrupt
 
@@ -78,12 +90,18 @@ def test_build_coder_agent_uses_safe_shell_enforcement(monkeypatch):
         return ("agent-graph", "backend")
 
     monkeypatch.setattr(dac, "create_cli_agent", fake_create_cli_agent)
+    # context_window_tokens defaults on (200_000), so build_coder_agent always
+    # resolves the model via create_model now -- fake it to a model-like
+    # object (not a bare `object()`) so the profile-mutation branch has
+    # somewhere real to write.
+    model_stub = SimpleNamespace(profile=None)
+    monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=model_stub))
 
     profile = get_coder_profile()
     result = dac.build_coder_agent(profile, checkpointer=None, cwd="/tmp/work")
 
     assert result == ("agent-graph", "backend")
-    assert captured["model"] == profile.model
+    assert captured["model"] is model_stub
     assert captured["assistant_id"] == profile.assistant_id
 
     kwargs = captured["kwargs"]
@@ -114,6 +132,7 @@ def test_build_coder_agent_forwards_kernel_owned_checkpointer(monkeypatch):
         return ("agent-graph", "backend")
 
     monkeypatch.setattr(dac, "create_cli_agent", fake_create_cli_agent)
+    monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=SimpleNamespace(profile=None)))
 
     profile = get_coder_profile()
     dac.build_coder_agent(profile, checkpointer=sentinel_checkpointer, cwd="/work/issue-1")
@@ -127,6 +146,7 @@ def test_build_coder_agent_wraps_create_cli_agent_errors(monkeypatch):
         raise ValueError("bad model spec")
 
     monkeypatch.setattr(dac, "create_cli_agent", boom)
+    monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=SimpleNamespace(profile=None)))
 
     profile = get_coder_profile()
     with pytest.raises(dac.DacError, match="bad model spec") as exc_info:
@@ -139,7 +159,8 @@ def test_build_coder_agent_codex_prebuilds_model_object(monkeypatch):
     # init_chat_model can't resolve the DAC-only "openai_codex" provider, so
     # build_coder_agent must hand create_cli_agent the pre-built BaseChatModel
     # object from create_model, never the raw "openai_codex:..." string.
-    sentinel = object()
+    sentinel = SimpleNamespace()  # model-like: needs a settable `.profile` --
+    # context_window_tokens defaults on, so build_coder_agent always writes to it.
     captured_create_model: dict[str, Any] = {}
 
     def fake_create_model(spec, *, extra_kwargs=None, **kwargs):
@@ -173,7 +194,7 @@ def test_build_coder_agent_codex_with_model_params_passes_extra_kwargs(monkeypat
     def fake_create_model(spec, *, extra_kwargs=None, **kwargs):
         captured_create_model["spec"] = spec
         captured_create_model["extra_kwargs"] = extra_kwargs
-        return SimpleNamespace(model=object())
+        return SimpleNamespace(model=SimpleNamespace())
 
     monkeypatch.setattr(dac, "create_model", fake_create_model)
     monkeypatch.setattr(dac, "create_cli_agent", lambda model, aid, **kw: (object(), object()))
@@ -185,12 +206,42 @@ def test_build_coder_agent_codex_with_model_params_passes_extra_kwargs(monkeypat
     assert captured_create_model["extra_kwargs"] == model_params
 
 
-def test_build_coder_agent_anthropic_passes_string(monkeypatch):
-    # Every other provider keeps the plain-string path untouched -- create_model
-    # must not even be called.
+def test_build_coder_agent_default_profile_routes_through_create_model(monkeypatch):
+    # context_window_tokens defaults to 200_000 (not None), so even a plain
+    # Anthropic profile with no model_params now routes through create_model
+    # by default -- create_cli_agent needs a model *object* (not a bare spec
+    # string) to carry the mutated `.profile`. This supersedes the old
+    # "every other provider keeps the plain-string path" assumption; see
+    # test_build_coder_agent_opts_out_of_create_model_when_context_window_tokens_is_none
+    # for the (now opt-in) plain-string path.
+    captured_create_model: dict[str, Any] = {}
+    model_stub = SimpleNamespace(profile=None)
+
+    def fake_create_model(spec, *, extra_kwargs=None, **kwargs):
+        captured_create_model["spec"] = spec
+        captured_create_model["extra_kwargs"] = extra_kwargs
+        return SimpleNamespace(model=model_stub)
+
+    monkeypatch.setattr(dac, "create_model", fake_create_model)
+    monkeypatch.setattr(dac, "create_cli_agent", lambda model, aid, **kw: (object(), object()))
+
+    dac.build_coder_agent(get_coder_profile(model="anthropic:claude-sonnet-4-6"), None, "/tmp")
+
+    assert captured_create_model["spec"] == "anthropic:claude-sonnet-4-6"
+    assert not captured_create_model["extra_kwargs"]
+    assert model_stub.profile == {"max_input_tokens": 200_000}
+
+
+def test_build_coder_agent_opts_out_of_create_model_when_context_window_tokens_is_none(monkeypatch):
+    # A hand-built profile can still opt all the way out of the trigger-
+    # lowering lever: with context_window_tokens=None and no model_params,
+    # the plain-string path is preserved -- create_model must not even be
+    # called. (get_coder_profile(context_window_tokens=None) still yields the
+    # default, exactly like `model`'s own idiom -- only a direct
+    # dataclasses.replace/CoderProfile construction can produce this.)
     called = {"create_model": False}
     monkeypatch.setattr(
-        dac, "create_model", lambda spec: called.__setitem__("create_model", True)
+        dac, "create_model", lambda spec, **kw: called.__setitem__("create_model", True)
     )
     captured: dict[str, Any] = {}
     monkeypatch.setattr(
@@ -199,7 +250,10 @@ def test_build_coder_agent_anthropic_passes_string(monkeypatch):
         lambda model, aid, **kw: captured.update(model=model) or (object(), object()),
     )
 
-    dac.build_coder_agent(get_coder_profile(model="anthropic:claude-sonnet-4-6"), None, "/tmp")
+    profile = dataclasses.replace(
+        get_coder_profile(model="anthropic:claude-sonnet-4-6"), context_window_tokens=None
+    )
+    dac.build_coder_agent(profile, None, "/tmp")
 
     assert captured["model"] == "anthropic:claude-sonnet-4-6"
     assert called["create_model"] is False
@@ -211,7 +265,7 @@ def test_build_coder_agent_anthropic_with_model_params_routes_through_create_mod
     # way per-lane thinking/reasoning params reach the constructed model
     # object, so a non-codex provider with model_params must also give up
     # the plain-string path.
-    sentinel = object()
+    sentinel = SimpleNamespace()  # settable `.profile`, see the codex test above
     model_params = {"thinking": {"type": "enabled", "budget_tokens": 2048}}
     captured_create_model: dict[str, Any] = {}
 
@@ -246,6 +300,87 @@ def test_build_coder_agent_wraps_create_model_failure(monkeypatch):
         dac.build_coder_agent(get_coder_profile(model="openai_codex:gpt-5.5"), None, "/tmp")
 
     assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# build_coder_agent -- trigger-lowering (Task 2)
+# ---------------------------------------------------------------------------
+
+
+def test_build_coder_agent_sets_model_profile_max_input_tokens_from_context_window_tokens(monkeypatch):
+    # Task 2's core lever: DAC's already-installed SummarizationMiddleware
+    # trigger is 0.85 x model.profile["max_input_tokens"] per round
+    # (compute_summarization_defaults) -- build_coder_agent lowers it by
+    # writing profile.context_window_tokens onto the built model's own
+    # `.profile` dict before create_cli_agent ever sees it. Any other profile
+    # keys already on the model must survive the merge untouched.
+    model_stub = SimpleNamespace(profile={"max_input_tokens": 1_000_000, "supports_pdf": True})
+
+    monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=model_stub))
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        dac,
+        "create_cli_agent",
+        lambda model, aid, **kw: captured.update(model=model, kwargs=kw) or (object(), object()),
+    )
+
+    profile = get_coder_profile(context_window_tokens=150_000)
+    dac.build_coder_agent(profile, None, "/tmp")
+
+    assert captured["model"] is model_stub
+    assert model_stub.profile["max_input_tokens"] == 150_000
+    assert model_stub.profile["supports_pdf"] is True  # untouched by the merge
+
+    # SAFETY args are byte-for-byte the same regardless of this lever.
+    kwargs = captured["kwargs"]
+    assert kwargs["auto_approve"] is False
+    assert kwargs["interrupt_shell_only"] is True
+    assert kwargs["shell_allow_list"] == list(profile.shell_allow_list)
+    assert kwargs["enable_ask_user"] is True
+    assert kwargs["enable_shell"] is True
+
+
+# ---------------------------------------------------------------------------
+# build_coder_agent -- auto-summarizer regression guard (Task 2)
+# ---------------------------------------------------------------------------
+
+
+def test_summarization_middleware_is_installed_with_our_lowered_trigger(monkeypatch):
+    """Regression guard for the auto-compaction spike's headline finding:
+    `create_cli_agent` builds on `create_deep_agent`, which unconditionally
+    installs `create_summarization_middleware(model, backend)`
+    (`deepagents/graph.py`) under the public name "SummarizationMiddleware"
+    -- pinning both that it's still installed and still named that after a
+    `deepagents`/`deepagents-code` dependency bump.
+
+    Spies on (never replaces) `deepagents.graph.create_summarization_middleware`
+    so `dac.build_coder_agent` runs the REAL `create_model` /
+    `create_cli_agent` / `create_deep_agent` -- no fake standing in for any of
+    DAC's own code -- while observing exactly what gets installed and against
+    which model. `ANTHROPIC_API_KEY` is set to a placeholder string purely to
+    satisfy `init_chat_model`'s construction-time credential check; building
+    the graph's structure never calls the model, so this makes no network
+    call.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    captured: dict[str, Any] = {}
+
+    def spy(model, backend):
+        middleware = _real_create_summarization_middleware(model, backend)
+        captured["model"] = model
+        captured["middleware"] = middleware
+        return middleware
+
+    monkeypatch.setattr(deepagents_graph, "create_summarization_middleware", spy)
+
+    profile = get_coder_profile(context_window_tokens=150_000)
+    dac.build_coder_agent(profile, checkpointer=None, cwd=".")
+
+    assert captured["middleware"].name == "SummarizationMiddleware"
+    # Built against the SAME model instance we just lowered the trigger on --
+    # proving the lever actually reaches the installed summarizer, not some
+    # other, unrelated model object.
+    assert captured["model"].profile["max_input_tokens"] == 150_000
 
 
 # ---------------------------------------------------------------------------

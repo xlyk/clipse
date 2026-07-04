@@ -68,6 +68,16 @@ def test_get_reviewer_profile_model_params_default_is_none():
     assert get_reviewer_profile().model_params is None
 
 
+def test_get_reviewer_profile_context_window_tokens_default():
+    assert get_reviewer_profile().context_window_tokens == 200_000
+
+
+def test_get_reviewer_profile_context_window_tokens_override():
+    profile = get_reviewer_profile(context_window_tokens=100_000)
+
+    assert profile.context_window_tokens == 100_000
+
+
 def test_reviewer_model_is_distinct_from_coder_model():
     # Design doc: "Optionally run the Reviewer lane on a stronger or
     # distinct model to reduce correlated blind spots" -- Coder and

@@ -41,12 +41,22 @@ not bundle in unrelated edits.
 ambiguous requirement, a missing credential, a decision only a human can \
 make — stop and report blocked with a clear summary of what you need. Do \
 not guess, and do not loop.
+- If your context grows large, call the `compact_conversation` tool to \
+summarize older history before continuing.
 - Only run commands from your shell allow-list.
 """
 
 # Single-sourced so get_coder_profile and get_coder_docs_profile -- which
 # share the same default model -- can't drift apart.
 _DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
+
+# Lowers the trigger DAC's already-installed auto-summarizer uses (it fires
+# at ~85% of model.profile["max_input_tokens"] per round -- see
+# dac.build_coder_agent) well below a big-context-window model's real limit,
+# so a long-running turn compacts its own history instead of ballooning past
+# a fixed per-round ceiling. Single-sourced for the same reason as
+# _DEFAULT_MODEL above.
+_DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 
 _SHELL_ALLOW_LIST: tuple[str, ...] = (
     "git",
@@ -83,6 +93,16 @@ class CoderProfile:
     value is never mutated in place — it is built once (config.ModelParams,
     threaded through the kernel and `worker.py`'s `--model-params` JSON) and
     only ever read.
+
+    `context_window_tokens`, when not `None`, is the ceiling
+    `dac.build_coder_agent` writes onto the built model's own
+    `profile["max_input_tokens"]` before handing it to `create_cli_agent` --
+    lowering the trigger DAC's already-installed auto-summarizer
+    (`SummarizationMiddleware`) uses, which is a fraction (0.85) of that same
+    profile value per round. Defaults on (`_DEFAULT_CONTEXT_WINDOW_TOKENS`)
+    so every lane gets this for free; `None` opts a hand-built profile out
+    entirely, leaving `create_cli_agent` to see the model's own real (and
+    possibly much larger) advertised window.
     """
 
     assistant_id: str
@@ -90,9 +110,14 @@ class CoderProfile:
     system_prompt: str
     shell_allow_list: tuple[str, ...]
     model_params: dict[str, Any] | None = None
+    context_window_tokens: int | None = _DEFAULT_CONTEXT_WINDOW_TOKENS
 
 
-def get_coder_profile(model: str | None = None, model_params: dict[str, Any] | None = None) -> CoderProfile:
+def get_coder_profile(
+    model: str | None = None,
+    model_params: dict[str, Any] | None = None,
+    context_window_tokens: int | None = None,
+) -> CoderProfile:
     """Return the Coder lane's DAC profile.
 
     `model` is a placeholder `provider:model` spec, never a live credential
@@ -105,6 +130,11 @@ def get_coder_profile(model: str | None = None, model_params: dict[str, Any] | N
     (config.ModelParams's `Coder` map, threaded through as JSON via
     `worker.py`'s `--model-params` flag). Unlike `model`, it has no default
     to fall back to — omitted (`None`) means exactly that: no overrides.
+
+    `context_window_tokens` mirrors `model`'s idiom: omitted (`None`) falls
+    back to `_DEFAULT_CONTEXT_WINDOW_TOKENS`, so this factory can never
+    produce a profile with `context_window_tokens=None` -- only a
+    directly-constructed `CoderProfile` can opt all the way out.
     """
     return CoderProfile(
         assistant_id="clipse-coder",
@@ -112,6 +142,9 @@ def get_coder_profile(model: str | None = None, model_params: dict[str, Any] | N
         system_prompt=_SYSTEM_PROMPT,
         shell_allow_list=_SHELL_ALLOW_LIST,
         model_params=model_params,
+        context_window_tokens=(
+            context_window_tokens if context_window_tokens is not None else _DEFAULT_CONTEXT_WINDOW_TOKENS
+        ),
     )
 
 
@@ -150,6 +183,8 @@ something to commit.
 commits your documentation edits together with the code change, in the SAME \
 commit and the SAME pull request. Use git only to inspect the uncommitted \
 change and context.
+- If your context grows large, call the `compact_conversation` tool to \
+summarize older history before continuing.
 - When you have written the docs (or decided none are needed), stop. Do not \
 loop. Only run commands from your shell allow-list.
 """
@@ -169,7 +204,11 @@ _DOCS_SHELL_ALLOW_LIST: tuple[str, ...] = (
 )
 
 
-def get_coder_docs_profile(model: str | None = None, model_params: dict[str, Any] | None = None) -> CoderProfile:
+def get_coder_docs_profile(
+    model: str | None = None,
+    model_params: dict[str, Any] | None = None,
+    context_window_tokens: int | None = None,
+) -> CoderProfile:
     """Return the DAC profile for the Coder lane's documentation sub-step.
 
     A distinct `assistant_id` ("clipse-coder-docs") keeps the docs turn's
@@ -181,6 +220,9 @@ def get_coder_docs_profile(model: str | None = None, model_params: dict[str, Any
     `model_params` mirrors `get_coder_profile`'s: an opaque, no-default kwargs
     bag (config.ModelParams's `CoderDocs` map, threaded through as JSON via
     `worker.py`'s `--docs-model-params` flag) that stays `None` when omitted.
+
+    `context_window_tokens` mirrors `get_coder_profile`'s idiom too: omitted
+    (`None`) falls back to `_DEFAULT_CONTEXT_WINDOW_TOKENS`.
     """
     return CoderProfile(
         assistant_id="clipse-coder-docs",
@@ -188,4 +230,7 @@ def get_coder_docs_profile(model: str | None = None, model_params: dict[str, Any
         system_prompt=_DOCS_SYSTEM_PROMPT,
         shell_allow_list=_DOCS_SHELL_ALLOW_LIST,
         model_params=model_params,
+        context_window_tokens=(
+            context_window_tokens if context_window_tokens is not None else _DEFAULT_CONTEXT_WINDOW_TOKENS
+        ),
     )

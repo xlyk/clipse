@@ -48,6 +48,16 @@ def test_get_coder_profile_model_params_default_is_none():
     assert get_coder_profile().model_params is None
 
 
+def test_get_coder_profile_context_window_tokens_default():
+    assert get_coder_profile().context_window_tokens == 200_000
+
+
+def test_get_coder_profile_context_window_tokens_override():
+    profile = get_coder_profile(context_window_tokens=100_000)
+
+    assert profile.context_window_tokens == 100_000
+
+
 def test_assistant_id_is_clipse_coder():
     profile = get_coder_profile()
 
@@ -80,6 +90,16 @@ def test_system_prompt_covers_worktree_commits_and_stop_conditions():
     # Must stop on either terminal condition, not loop forever.
     assert "done" in prompt
     assert "blocked" in prompt
+
+
+def test_system_prompt_nudges_compact_conversation_tool():
+    # Option 5 (belt-and-suspenders): DAC's compact_conversation tool never
+    # auto-fires (it's model-invoked only), so the prompt nudges the model to
+    # call it proactively -- complementary to the auto-summarizer trigger
+    # lowered in dac.build_coder_agent, not a replacement for it.
+    profile = get_coder_profile()
+
+    assert "compact_conversation" in profile.system_prompt
 
 
 def test_system_prompt_defers_git_and_pr_to_the_platform():

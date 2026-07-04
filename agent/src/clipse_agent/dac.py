@@ -100,6 +100,16 @@ def build_coder_agent(
     `blocked(needs_input)`. With `enable_ask_user=False` that path is dead
     and an ambiguous issue can never block for input.
 
+    When `profile.context_window_tokens` is set (the default), the model is
+    always resolved via `create_model` -- even for a plain-string provider
+    with no `model_params` -- and its `.profile["max_input_tokens"]` is set
+    to that value before `create_cli_agent` sees it. This lowers the trigger
+    DAC's already-installed auto-summarizer (`SummarizationMiddleware`) uses,
+    which is a fraction (0.85) of that same profile value per round (see the
+    auto-compaction spike, docs/design's "DAC API spike findings", Option
+    3). This is the SAFETY-neutral lever: only the model's advertised
+    profile changes, never the `create_cli_agent` SAFETY args below.
+
     Raises:
         DacError: wrapping anything `create_model` or `create_cli_agent` raises
             (including a `MissingCredentialsError` from either).
@@ -107,15 +117,33 @@ def build_coder_agent(
     try:
         provider = profile.model.split(":", 1)[0]
         # create_cli_agent takes a bare model spec string; create_model is the
-        # only one of the two that accepts extra_kwargs. So any lane carrying
-        # model_params needs create_model even off the codex provider -- not
-        # just openai_codex, whose plain string init_chat_model can't resolve
-        # (raises ValueError) and which create_model's on-disk OAuth token
-        # store handles regardless of model_params.
-        use_create_model = provider == CODEX_PROVIDER or bool(profile.model_params)
+        # only one of the two that accepts extra_kwargs, and the only one
+        # that returns a model *object* (vs. a bare spec string) whose
+        # `.profile` can be mutated. So any lane carrying model_params or
+        # context_window_tokens needs create_model even off the codex
+        # provider -- not just openai_codex, whose plain string
+        # init_chat_model can't resolve (raises ValueError) and which
+        # create_model's on-disk OAuth token store handles regardless of
+        # model_params.
+        use_create_model = (
+            provider == CODEX_PROVIDER
+            or bool(profile.model_params)
+            or profile.context_window_tokens is not None
+        )
         model: str | Any = profile.model
         if use_create_model:
             model = create_model(profile.model, extra_kwargs=profile.model_params or None).model
+        if profile.context_window_tokens is not None:
+            # Lower DAC's already-installed SummarizationMiddleware trigger
+            # (0.85 x model.profile["max_input_tokens"] per round --
+            # compute_summarization_defaults) well below a big-context-window
+            # model's real limit, so a long turn compacts itself instead of
+            # ballooning. Any other profile keys the model already carries
+            # survive the merge untouched.
+            model.profile = {
+                **(getattr(model, "profile", None) or {}),
+                "max_input_tokens": profile.context_window_tokens,
+            }
         return create_cli_agent(
             model,
             profile.assistant_id,

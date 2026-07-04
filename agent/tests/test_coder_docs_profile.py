@@ -60,6 +60,20 @@ def test_get_coder_docs_profile_model_params_default_is_none():
     assert get_coder_docs_profile().model_params is None
 
 
+def test_get_coder_docs_profile_context_window_tokens_default():
+    assert get_coder_docs_profile().context_window_tokens == 200_000
+
+
+def test_get_coder_docs_profile_context_window_tokens_override():
+    profile = get_coder_docs_profile(context_window_tokens=100_000)
+
+    assert profile.context_window_tokens == 100_000
+
+
+def test_docs_system_prompt_nudges_compact_conversation_tool():
+    assert "compact_conversation" in get_coder_docs_profile().system_prompt
+
+
 def test_prompt_targets_the_uncommitted_pre_review_change_not_a_merge():
     prompt = get_coder_docs_profile().system_prompt
     assert prompt.strip()

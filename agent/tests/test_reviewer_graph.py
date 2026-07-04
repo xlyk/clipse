@@ -16,6 +16,7 @@ import asyncio
 import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -551,6 +552,12 @@ def test_build_reviewer_graph_default_wiring_uses_real_dac_module_with_safety_in
         return _FakeAgentGraph(), "fake-backend"
 
     monkeypatch.setattr(dac, "create_cli_agent", fake_create_cli_agent)
+    # context_window_tokens defaults on, so build_coder_agent always resolves
+    # the model via create_model now -- fake it to a model-like object with a
+    # settable `.profile` (never a real credential/network call).
+    monkeypatch.setattr(
+        dac, "create_model", lambda spec, **kw: SimpleNamespace(model=SimpleNamespace(profile=None))
+    )
 
     runner = _base_runner()
     graph = reviewer.build_reviewer_graph(run_command=runner)
