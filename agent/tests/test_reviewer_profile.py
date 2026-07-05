@@ -111,6 +111,20 @@ def test_system_prompt_forbids_editing():
     assert "commit" in prompt  # explicitly told this is NOT its job
 
 
+def test_system_prompt_forbids_reading_binary_and_image_files():
+    # Regression: the reviewer used to `cat` fixture images for context, and
+    # DAC attaches a read image file to the model as an image content block,
+    # which the review API rejects with a 400 "Could not process image" --
+    # failing the entire review (observed on the image-fixture ticket).
+    profile = get_reviewer_profile()
+    prompt = profile.system_prompt.lower()
+
+    assert "binary" in prompt
+    assert "image" in prompt
+    # Names at least one concrete non-text extension so the guidance is actionable.
+    assert any(ext in prompt for ext in (".png", ".jpg", ".jpeg"))
+
+
 def test_shell_allow_list_is_read_mostly_no_destructive_commands():
     profile = get_reviewer_profile()
 
