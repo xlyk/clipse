@@ -447,6 +447,49 @@ def test_open_pr_reuses_existing_pr_when_gh_pr_view_succeeds(tmp_path):
     assert create_calls == []
 
 
+def test_open_pr_skips_create_on_empty_branch_with_no_existing_pr(tmp_path):
+    # A blocked/no-op turn made zero commits ahead of base and has no PR yet:
+    # `gh pr create` would fail "No commits between..." and the kernel would
+    # retry that crash five times (REF-26). An empty pr_url is the honest result.
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(1, "", "no pull requests found for branch")),
+            (_starts_with("git", "rev-list", "--count"), coder.CommandResult(0, "0\n", "")),
+        ]
+    )
+    node = coder.make_open_pr(runner)
+
+    out = node({"branch": "clipse/spac-1", "cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"pr_url": ""}
+    create_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "create"]]
+    assert create_calls == []
+    # The count is probed against origin/<base>..HEAD, scoped to the worktree.
+    rev_list = [c for c in runner.calls if c.argv[:3] == ["git", "rev-list", "--count"]]
+    assert len(rev_list) == 1
+    assert rev_list[0].argv == ["git", "rev-list", "--count", "origin/main..HEAD"]
+    assert rev_list[0].cwd == str(tmp_path)
+
+
+def test_open_pr_creates_when_branch_has_commits_ahead(tmp_path):
+    # Guard negative: a non-empty branch (commits ahead of base) must still
+    # open the PR -- the empty-branch guard must not over-block real work.
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(1, "", "no pull requests found for branch")),
+            (_starts_with("git", "rev-list", "--count"), coder.CommandResult(0, "3\n", "")),
+            (_starts_with("gh", "pr", "create"), coder.CommandResult(0, "https://github.com/acme/widgets/pull/5\n", "")),
+        ]
+    )
+    node = coder.make_open_pr(runner)
+
+    out = node({"branch": "clipse/spac-1", "cwd": str(tmp_path), "base_branch": "main"})
+
+    assert out == {"pr_url": "https://github.com/acme/widgets/pull/5"}
+    create_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "create"]]
+    assert len(create_calls) == 1
+
+
 def test_open_pr_creates_when_gh_pr_view_finds_nothing(tmp_path):
     runner = _base_runner(pr_exists=False, pr_url="https://github.com/acme/widgets/pull/9")
     turn_result = DacTurnResult(outcome_hint="completed", final_text="done", tokens_in=1, tokens_out=1)
@@ -519,6 +562,56 @@ def test_interrupt_emits_blocked_needs_input_and_skips_git_and_pr(tmp_path):
     assert ("git", "commit") not in verbs
     assert ("git", "push") not in verbs
     assert ("gh", "pr") not in verbs
+
+
+def test_blocked_status_tail_routes_to_emit_result_and_skips_git_and_pr(tmp_path):
+    # A coder that completes the turn but reports STATUS: blocked made no
+    # review-ready change: route straight to emit_result (skip run_docs/commit/
+    # push/open_PR), emit blocked(needs_input) with the reason in the summary,
+    # and never run git commit or gh pr create on the empty branch (REF-26).
+    runner = _base_runner()
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="I investigated but can't proceed.",
+        tokens_in=10,
+        tokens_out=5,
+        last_text="Looked into it.\n\nSTATUS: blocked: need REFLEX_CEREBRAS_API_KEY\nTITLE: n/a",
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: coder.CoderState = {
+        "issue_id": "SPAC-13",
+        "run_id": "run-1",
+        "thread_id": "thread-13",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-13"}}))
+
+    assert order == ["load_context", "ensure_worktree", "sync_base", "run_DAC", "emit_result"]
+    assert "run_docs" not in order
+    _assert_valid_result(result, blocked=True)
+    assert result.block_kind == BlockKind.needs_input
+    assert "REFLEX_CEREBRAS_API_KEY" in result.summary
+    assert result.pr_url is None
+
+    verbs = [tuple(c.argv[:2]) for c in runner.calls]
+    assert ("git", "commit") not in verbs
+    assert ("git", "push") not in verbs
+    assert ("gh", "pr") not in verbs
+
+
+def test_route_after_dac_routes_to_emit_result_on_blocked_tail():
+    state = {
+        "interrupt_payload": None,
+        "token_ceiling_exceeded": False,
+        "dac_last_text": "STATUS: blocked: need a decision",
+    }
+    assert coder.route_after_dac(state) == "emit_result"
 
 
 def test_token_ceiling_exceeded_emits_blocked_capability_even_if_interrupted(tmp_path):
@@ -1346,6 +1439,25 @@ def test_emit_result_blocked_capability_shape_takes_priority_over_interrupt():
     result = out["result"]
     _assert_valid_result(result, blocked=True)
     assert result.block_kind == BlockKind.capability
+
+
+def test_emit_result_blocked_from_status_tail_shape():
+    state = {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "turn_count": 0,
+        "tokens_in": 5,
+        "tokens_out": 5,
+        "dac_last_text": "STATUS: blocked: need the API key",
+        "blocked_reason": "need the API key",
+    }
+    out = coder.emit_result(state)
+    result = out["result"]
+    _assert_valid_result(result, blocked=True)
+    assert result.block_kind == BlockKind.needs_input
+    assert "need the API key" in result.summary
+    assert result.pr_url is None
 
 
 def test_emit_result_requires_issue_run_and_thread_ids():

@@ -182,6 +182,7 @@ class CoderState(TypedDict, total=False):
     dac_outcome_hint: str  # "completed" | "interrupted" (dac.OutcomeHint)
     dac_summary: str  # the whole turn's text (audit trail / PR body)
     dac_last_text: str  # only the FINAL message's text (the STATUS/TITLE/HANDOFF tail source)
+    blocked_reason: str  # tail's "blocked: <reason>" text when STATUS: blocked; "" otherwise
     tokens_in: int
     tokens_out: int
     interrupt_payload: list[Any] | None
@@ -483,10 +484,16 @@ def make_run_dac(
                 agent_graph, config, task_text=_coding_task_text(state), max_tokens=max_tokens
             )
 
+        # Parse the STATUS/TITLE/HANDOFF tail once here and stash blocked_reason
+        # so both route_after_dac (blocked -> emit_result) and emit_result (the
+        # blocked summary) read a single derived value. Always written -- "" on a
+        # non-blocked turn -- so a checkpointed prior turn's reason can't linger.
+        tail = parse_structured_tail(turn_result.last_text)
         return {
             "dac_outcome_hint": turn_result.outcome_hint,
             "dac_summary": turn_result.final_text,
             "dac_last_text": turn_result.last_text,
+            "blocked_reason": tail.blocked_reason if tail.status == "blocked" else "",
             "tokens_in": turn_result.tokens_in,
             "tokens_out": turn_result.tokens_out,
             "interrupt_payload": turn_result.interrupt_payload,
@@ -501,11 +508,17 @@ def route_after_dac(state: CoderState) -> str:
 
     A token-ceiling abort or a genuine interrupt both skip straight to
     `emit_result` as blocked (see the module docstring on why `blocked`
-    covers both); anything else proceeds to the documentation turn (which
-    then flows to commit). Docs therefore never run when the code turn didn't
-    produce a review-ready change.
+    covers both). A turn that COMPLETED but reported `STATUS: blocked` in its
+    final-message tail also skips straight to `emit_result`: the coder made no
+    review-ready change, so running commit/push/open_PR would try to open a PR
+    from an empty branch, which `gh pr create` rejects and the kernel retries
+    five times (REF-26). Anything else proceeds to the documentation turn
+    (which then flows to commit). Docs therefore never run when the code turn
+    didn't produce a review-ready change.
     """
     if state.get("token_ceiling_exceeded") or state.get("interrupt_payload") is not None:
+        return "emit_result"
+    if parse_structured_tail(state.get("dac_last_text") or "").status == "blocked":
         return "emit_result"
     return "run_docs"
 
@@ -814,6 +827,20 @@ def make_open_pr(run_command: CommandRunner) -> Callable[[CoderState], dict[str,
             return {"pr_url": json.loads(view.stdout)["url"]}
 
         base_branch = state.get("base_branch") or "main"
+        ahead = _run(
+            run_command,
+            ["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"],
+            cwd,
+            check=False,
+        )
+        if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+            # Nothing to open a PR from: the turn made no commits (a blocked
+            # or no-op turn). gh pr create would fail "No commits between..."
+            # and the kernel would classify that crash as transient and
+            # retry it five times (REF-26). An empty pr_url is the honest
+            # result.
+            return {"pr_url": ""}
+
         created = _run(
             run_command,
             [
@@ -853,6 +880,11 @@ def _capability_summary(tokens_in: int, tokens_out: int) -> str:
 
 def _needs_input_summary(interrupt_payload: list[Any]) -> str:
     return f"DAC paused for input it can't resolve on its own: {interrupt_payload!r}"
+
+
+def _coder_blocked_summary(reason: str) -> str:
+    reason = (reason or "").strip()
+    return f"coder blocked: {reason}" if reason else "coder blocked: no reason given"
 
 
 def _needs_review_summary(state: CoderState) -> str:
@@ -906,6 +938,7 @@ def emit_result(state: CoderState) -> dict[str, Any]:
     }
 
     interrupt_payload = state.get("interrupt_payload")
+    tail = parse_structured_tail(state.get("dac_last_text") or "")
     if state.get("token_ceiling_exceeded"):
         result = WorkerResult(
             **common,
@@ -920,6 +953,19 @@ def emit_result(state: CoderState) -> dict[str, Any]:
             outcome=Outcome.blocked,
             block_kind=BlockKind.needs_input,
             summary=_needs_input_summary(interrupt_payload),
+            artifacts=state.get("artifacts", []),
+        )
+    elif tail.status == "blocked":
+        # The turn completed but the coder self-reported STATUS: blocked -- an
+        # ambiguity/missing-credential it can't resolve on its own, needing a
+        # human. Mapped to needs_input (a non-retrying block) with the reason
+        # the run_DAC node stashed. route_after_dac already skipped
+        # commit/push/open_PR, so there is never a pr_url here.
+        result = WorkerResult(
+            **common,
+            outcome=Outcome.blocked,
+            block_kind=BlockKind.needs_input,
+            summary=_coder_blocked_summary(state.get("blocked_reason") or tail.blocked_reason),
             artifacts=state.get("artifacts", []),
         )
     else:
