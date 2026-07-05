@@ -290,6 +290,20 @@ func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store
 
 	now := d.now()
 	comment := commentFor(outcome, lane, result)
+	// Post the lane's structured handoff note on this terminal outcome (the
+	// write side of the per-run handoff loop). When the outcome already has a
+	// dispatcher comment (a gitops stale-base changes_requested, a block
+	// reason), the handoff rides after it separated by a blank line; otherwise
+	// it stands alone. A "continue" outcome never reaches here, so a handoff is
+	// only ever posted on a genuinely terminal transition.
+	if result.Handoff != nil && *result.Handoff != "" {
+		hc := handoffComment(lane, outcome, *result.Handoff)
+		if comment == "" {
+			comment = hc
+		} else {
+			comment += "\n\n" + hc
+		}
+	}
 
 	req := store.TransitionReq{
 		IssueID:         issue.ID,

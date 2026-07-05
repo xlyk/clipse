@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/xlyk/clipse/internal/contract"
@@ -286,5 +287,88 @@ func TestTick_FailureResultsBlockWithoutRetry(t *testing.T) {
 				t.Errorf("re-spawn after failure block: SpawnCount = %d, want %d (no auto-retry)", spawner.SpawnCount(), spawnsAfterBlock)
 			}
 		})
+	}
+}
+
+// TestTick_NeedsReviewOutcome_PostsHandoffComment asserts a terminal
+// needs_review outcome carrying a Handoff note mirrors that note to Linear as
+// a handoff comment — the write side of the per-run handoff loop (Task 19).
+// needs_review normally posts no dispatcher comment, so the handoff is the
+// only comment on this transition.
+func TestTick_NeedsReviewOutcome_PostsHandoffComment(t *testing.T) {
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	spawner := newFakeSpawner()
+	handoff := "- chose drop semantics for the queue\n- added Widget.build(spec) -> Widget"
+	spawner.Results["issue-1"] = spawn.Result{
+		Worker: contract.WorkerResult{
+			Lane:    contract.LaneCoder,
+			Outcome: contract.WorkerResultOutcomeNeedsReview,
+			Summary: "opened a PR",
+			Handoff: &handoff,
+			Tokens:  contract.WorkerResultTokens{In: 10, Out: 20},
+		},
+	}
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 1 (claim+spawn): unexpected error: %v", err)
+	}
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 2 (apply result + drain outbox): unexpected error: %v", err)
+	}
+
+	snap, err := s.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	if snap.Issues[0].BoardStatus != string(contract.ColumnReview) {
+		t.Fatalf("BoardStatus = %q, want review", snap.Issues[0].BoardStatus)
+	}
+
+	if len(lc.CommentCalls) != 1 {
+		t.Fatalf("Comment calls = %d, want exactly 1 (the handoff)", len(lc.CommentCalls))
+	}
+	body := lc.CommentCalls[0].Body
+	if !strings.Contains(body, "### coder handoff — needs_review") {
+		t.Errorf("comment missing handoff heading, got:\n%s", body)
+	}
+	if !strings.Contains(body, "chose drop semantics for the queue") {
+		t.Errorf("comment missing handoff body, got:\n%s", body)
+	}
+}
+
+// TestTick_NeedsReviewOutcome_NoHandoffPostsNoComment guards that the handoff
+// wiring is strictly additive: a needs_review outcome with a nil Handoff posts
+// no comment, exactly as before Task 19.
+func TestTick_NeedsReviewOutcome_NoHandoffPostsNoComment(t *testing.T) {
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	spawner := newFakeSpawner()
+	spawner.Results["issue-1"] = spawn.Result{
+		Worker: contract.WorkerResult{
+			Lane:    contract.LaneCoder,
+			Outcome: contract.WorkerResultOutcomeNeedsReview,
+			Summary: "opened a PR",
+			Tokens:  contract.WorkerResultTokens{In: 10, Out: 20},
+		},
+	}
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	d := newTestDispatcher(t, testConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 1 (claim+spawn): unexpected error: %v", err)
+	}
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("tick 2 (apply result + drain outbox): unexpected error: %v", err)
+	}
+
+	if len(lc.CommentCalls) != 0 {
+		t.Errorf("Comment calls = %d, want 0 for a needs_review with no handoff", len(lc.CommentCalls))
 	}
 }
