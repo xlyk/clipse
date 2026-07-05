@@ -42,6 +42,9 @@ pr)
 		draft)
 			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"MERGEABLE","mergeStateStatus":"DRAFT","isDraft":true}'
 			;;
+		update_branch_refused)
+			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY"}'
+			;;
 		stale_base_merges | stale_base_conflict)
 			if [ -f "$updated_marker" ]; then
 				if [ "$scenario" = "stale_base_conflict" ]; then
@@ -93,9 +96,17 @@ pr)
 		esac
 		;;
 	update-branch)
-		mkdir -p "$state_dir"
-		touch "$updated_marker"
-		echo 'Updated branch clp-1 with latest changes from main'
+		case "$scenario" in
+		update_branch_refused)
+			echo 'GraphQL: merge conflict between base and head' >&2
+			exit 1
+			;;
+		*)
+			mkdir -p "$state_dir"
+			touch "$updated_marker"
+			echo 'Updated branch clp-1 with latest changes from main'
+			;;
+		esac
 		;;
 	ready)
 		echo 'https://github.com/x/y/pull/7'
