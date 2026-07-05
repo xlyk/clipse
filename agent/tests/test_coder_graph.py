@@ -1354,6 +1354,77 @@ def test_emit_result_requires_issue_run_and_thread_ids():
 
 
 # ---------------------------------------------------------------------------
+# Structured-tail consumers: _commit_message / _pr_title read dac_last_text's
+# TITLE (Task 11) instead of scraping the DAC summary's first narration line.
+# ---------------------------------------------------------------------------
+
+
+def test_commit_message_uses_structured_tail_title():
+    state = {
+        "issue_id": "REF-9",
+        "dac_last_text": "Wrapped up.\n\nSTATUS: done\nTITLE: feat: add widget",
+        "dac_summary": "Reading the ticket, then I built the thing.",
+    }
+    assert coder._commit_message(state) == "REF-9: feat: add widget"
+
+
+def test_commit_message_falls_back_to_summary_headline_without_tail():
+    # No TITLE in the tail -> legacy behavior: the DAC summary's first line.
+    state = {
+        "issue_id": "REF-9",
+        "dac_summary": "Implemented the widget factory.\nmore detail",
+        "turn_count": 0,
+    }
+    assert coder._commit_message(state) == "REF-9: Implemented the widget factory."
+
+
+def test_commit_message_caps_at_72_chars():
+    state = {"issue_id": "REF-9", "dac_last_text": "TITLE: feat: " + "x" * 200}
+    assert len(coder._commit_message(state)) == 72
+
+
+def test_pr_title_uses_structured_tail_title():
+    state = {
+        "issue_id": "REF-9",
+        "dac_last_text": "STATUS: done\nTITLE: feat: add widget",
+        "dac_summary": "narration line that must not be scraped",
+    }
+    assert coder._pr_title(state) == "REF-9: feat: add widget"
+
+
+def test_pr_title_falls_back_to_summary_headline_without_tail():
+    state = {"issue_id": "REF-9", "dac_summary": "Built the thing.\nrest"}
+    assert coder._pr_title(state) == "REF-9: Built the thing."
+
+
+def test_run_dac_stores_dac_last_text_from_turn_result(tmp_path):
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="all narration across the turn",
+        tokens_in=1,
+        tokens_out=1,
+        last_text="STATUS: done\nTITLE: feat: add widget",
+    )
+    node = coder.make_run_dac(
+        "unused-profile",
+        _fake_agent_factory([]),
+        _fake_turn_driver(turn_result, turn_calls),
+        None,
+    )
+    state: coder.CoderState = {
+        "cwd": str(tmp_path),
+        "thread_id": "thread-tail",
+        "task_text": "Build it.",
+    }
+
+    out = asyncio.run(node(state))
+
+    assert out["dac_last_text"] == "STATUS: done\nTITLE: feat: add widget"
+    assert out["dac_summary"] == "all narration across the turn"
+
+
+# ---------------------------------------------------------------------------
 # commit (needs an injected run_command)
 # ---------------------------------------------------------------------------
 

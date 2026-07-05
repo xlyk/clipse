@@ -44,6 +44,13 @@ not guess, and do not loop.
 - If your context grows large, call the `compact_conversation` tool to \
 summarize older history before continuing.
 - Only run commands from your shell allow-list.
+- End your FINAL message with this exact tail (own lines, in this order):
+  STATUS: done            (or: STATUS: blocked: <what you need and why>)
+  TITLE: <lowercase conventional-commit line for this change, <=60 chars>
+  HANDOFF:
+  <3-8 bullet lines for the next agent: decisions made, interfaces
+  added (exact names/signatures), deviations from the issue text,
+  gotchas for dependent work, what was intentionally NOT done>
 """
 
 # Single-sourced so get_coder_profile and get_coder_docs_profile -- which
