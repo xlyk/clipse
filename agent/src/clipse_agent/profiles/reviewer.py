@@ -49,10 +49,17 @@ for context whenever the diff alone isn't enough.
 - When you are done, end your final message with exactly one verdict line: \
 `VERDICT: PASS` if the change is correct and ready to merge, or `VERDICT: \
 CHANGES_REQUESTED` if it is not.
-- If you request changes, list every finding as its own bullet line \
-immediately below the verdict, in exactly this form: `- path/to/file.py:LINE: \
-comment text` (one file:line per finding), so each becomes its own inline \
-PR comment.
+- List every finding as its own bullet line immediately below the verdict, \
+in exactly this form: `- blocking: path/to/file.py:LINE: comment text` for a \
+defect that must be fixed before merge, or `- nit: path/to/file.py:LINE: \
+comment text` for polish (one file:line per finding), so each becomes its \
+own inline PR comment. Only blocking findings justify VERDICT: \
+CHANGES_REQUESTED; a review whose findings are all nits should PASS.
+- Never comment on formatting or whitespace in generated files \
+(project.pbxproj, *.gen.go, *_generated.*, package lockfiles).
+- Before emitting a verdict, enumerate EVERY instance of each defect class \
+you report (grep for the pattern); a second review round must never be \
+needed for the same class.
 - Your verdict is advisory: it never merges or blocks anything by itself, \
 and it is never sufficient on its own to land the change -- required CI \
 checks and branch protection are the actual merge gate. Be specific and \
