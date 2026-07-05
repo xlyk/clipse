@@ -741,6 +741,82 @@ def test_classify_tolerates_empty_dac_summary():
 
 
 # ---------------------------------------------------------------------------
+# Severity protocol (Task 14): only `blocking:` findings force a rework cycle;
+# `nit:` findings still post as comments but never flip the verdict.
+# ---------------------------------------------------------------------------
+
+
+def test_severity_nit_prefixed_finding_parses_with_nit_severity():
+    out = reviewer.classify(
+        {"dac_summary": "VERDICT: CHANGES_REQUESTED\n- nit: app/x.pbxproj:12: tab width\n"}
+    )
+    assert [c.severity for c in out["review_comments"]] == ["nit"]
+    assert out["review_comments"][0].path == "app/x.pbxproj"
+    assert out["review_comments"][0].line == 12
+    assert out["review_comments"][0].body == "tab width"
+
+
+def test_severity_blocking_prefixed_finding_parses_with_blocking_severity():
+    out = reviewer.classify(
+        {"dac_summary": "VERDICT: CHANGES_REQUESTED\n- blocking: src/a.py:3: null deref\n"}
+    )
+    assert [c.severity for c in out["review_comments"]] == ["blocking"]
+    assert out["review_comments"][0].body == "null deref"
+
+
+def test_severity_only_nits_pass_despite_changes_requested_verdict():
+    # Even a CHANGES_REQUESTED verdict passes when every finding is a nit --
+    # nits post as comments but must never trigger a rework cycle.
+    text = (
+        "VERDICT: CHANGES_REQUESTED\n"
+        "- nit: app/x.pbxproj:12: tab width\n"
+        "- nit: app/y.swift:4: trailing whitespace\n"
+    )
+    out = reviewer.classify({"dac_summary": text})
+    assert out["review_passed"] is True
+    assert len(out["review_comments"]) == 2
+
+
+def test_severity_one_blocking_among_nits_still_blocks():
+    text = (
+        "VERDICT: CHANGES_REQUESTED\n"
+        "- nit: app/x.pbxproj:12: tab width\n"
+        "- blocking: src/a.py:3: null deref\n"
+        "- nit: app/y.swift:4: trailing whitespace\n"
+    )
+    out = reviewer.classify({"dac_summary": text})
+    assert out["review_passed"] is False
+    assert len(out["review_comments"]) == 3
+
+
+def test_severity_unprefixed_finding_still_blocks():
+    # Back-compat: an unprefixed finding parses as blocking (conservative).
+    text = "VERDICT: CHANGES_REQUESTED\n- src/a.py:3: null deref\n"
+    out = reviewer.classify({"dac_summary": text})
+    assert [c.severity for c in out["review_comments"]] == ["blocking"]
+    assert out["review_passed"] is False
+
+
+def test_severity_passed_verdict_still_parses_nit_comments():
+    # A PASS verdict with nit findings still surfaces them as comments so
+    # they land on the PR (route sends them to post_comments).
+    text = "VERDICT: PASS\n- nit: app/x.pbxproj:12: tab width\n"
+    out = reviewer.classify({"dac_summary": text})
+    assert out["review_passed"] is True
+    assert len(out["review_comments"]) == 1
+
+
+def test_severity_passed_with_comments_routes_to_post_comments():
+    # Passed-with-comments must still visit post_comments, not skip straight
+    # to emit_result, so the nits get posted.
+    state = {
+        "review_passed": True,
+        "review_comments": [reviewer.InlineComment(path="a.py", line=1, body="nit", severity="nit")],
+    }
+    assert reviewer.route_after_classify(state) == "post_comments"
+
+
+# ---------------------------------------------------------------------------
 # route_after_dac / route_after_classify (pure)
 # ---------------------------------------------------------------------------
 

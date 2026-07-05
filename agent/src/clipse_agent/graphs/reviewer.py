@@ -137,11 +137,18 @@ class InlineComment:
     """One structured review finding, parsed from the DAC turn's final
     message: a file/line pair plus the comment text `post_comments` attaches
     there as a real inline PR review comment.
+
+    `severity` is `"blocking"` or `"nit"`. Only a `blocking` finding forces a
+    rework cycle; a `nit` still posts to the PR but never flips the verdict
+    away from PASS. An unprefixed finding defaults to `blocking` -- the
+    conservative reading, so a model that skips the protocol can never
+    silently downgrade a real defect to polish.
     """
 
     path: str
     line: int
     body: str
+    severity: str = "blocking"
 
 
 class ReviewerState(TypedDict, total=False):
@@ -326,7 +333,7 @@ def route_after_dac(state: ReviewerState) -> str:
 _VERDICT_PASS = "PASS"
 
 _VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|CHANGES_REQUESTED)\b", re.IGNORECASE)
-_INLINE_COMMENT_RE = re.compile(r"^-\s*([^\s:]+):(\d+):\s*(.+)$")
+_INLINE_COMMENT_RE = re.compile(r"^-\s*(?:(blocking|nit):\s*)?([^\s:]+):(\d+):\s*(.+)$", re.IGNORECASE)
 
 
 def _find_verdict(dac_summary: str) -> re.Match[str] | None:
@@ -351,35 +358,57 @@ def _parse_inline_comments(dac_summary: str, start: int) -> list[InlineComment]:
     for line in dac_summary[start:].splitlines():
         match = _INLINE_COMMENT_RE.match(line.strip())
         if match:
-            path, line_no, body = match.groups()
-            comments.append(InlineComment(path=path, line=int(line_no), body=body.strip()))
+            severity_raw, path, line_no, body = match.groups()
+            severity = severity_raw.lower() if severity_raw else "blocking"
+            comments.append(
+                InlineComment(path=path, line=int(line_no), body=body.strip(), severity=severity)
+            )
     return comments
 
 
 def classify(state: ReviewerState) -> dict[str, Any]:
     """Decide PASS vs CHANGES_REQUESTED from this turn's DAC output.
 
-    Conservative by design: only an explicit `VERDICT: PASS` line clears a
-    PR. A missing or unparseable verdict -- the model rambled, or forgot the
-    protocol -- is treated as CHANGES_REQUESTED with no comments, never as
-    PASS. This lane is advisory-only (design doc: "reviewer pass is
-    advisory input, never sufficient alone"), but the one thing it must
-    never do is wrongly signal "safe to merge".
+    Conservative by design: a review clears a PR only on an explicit
+    `VERDICT: PASS` line OR a CHANGES_REQUESTED whose every finding is a
+    `nit` -- three of the Reflex build's six rework cycles were pbxproj
+    whitespace nits, so a nit-only verdict must not burn a rework round. A
+    missing or unparseable verdict -- the model rambled, or forgot the
+    protocol -- is still treated as not-passed with no comments, never as
+    PASS. This lane is advisory-only (design doc: "reviewer pass is advisory
+    input, never sufficient alone"), but the one thing it must never do is
+    wrongly signal "safe to merge".
     """
     dac_summary = state.get("dac_summary") or ""
     verdict_match = _find_verdict(dac_summary)
-    passed = verdict_match is not None and verdict_match.group(1).upper() == _VERDICT_PASS
 
     comments: list[InlineComment] = []
-    if not passed and verdict_match is not None:
+    if verdict_match is not None:
         comments = _parse_inline_comments(dac_summary, verdict_match.end())
+    blocking = [c for c in comments if c.severity == "blocking"]
+    # A review clears the PR on an explicit PASS, or on a CHANGES_REQUESTED
+    # whose parsed findings are ALL nits. A CHANGES_REQUESTED with no
+    # machine-parseable findings still blocks (conservative): the reviewer
+    # asked for changes in prose we couldn't parse -- never silently upgrade
+    # that to a pass.
+    passed = verdict_match is not None and (
+        verdict_match.group(1).upper() == _VERDICT_PASS or (bool(comments) and not blocking)
+    )
 
     return {"review_passed": passed, "review_comments": comments}
 
 
 def route_after_classify(state: ReviewerState) -> str:
-    """A pass goes straight to `emit_result`; anything else must post its
-    findings to the PR first."""
+    """Post findings to the PR whenever any exist -- so nits land even on a
+    pass -- otherwise go straight to `emit_result` on a clean pass, or to
+    `post_comments` (which posts the summary) on a bare fail.
+
+    `post_comments` never flips the outcome; it only posts. So routing a
+    passed-with-nits review through it still emits `done` from
+    `emit_result`, while the nit comments still reach the PR.
+    """
+    if state.get("review_comments"):
+        return "post_comments"
     return "emit_result" if state.get("review_passed") else "post_comments"
 
 
