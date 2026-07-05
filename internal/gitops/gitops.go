@@ -40,11 +40,12 @@ const (
 	// is returned.
 	OutcomeMerged Outcome = "merged"
 
-	// OutcomeNotMergeable means required checks are failing or absent, or
-	// branch protection is unsatisfied (or the merge attempt itself
-	// failed). The dispatcher maps this to a "blocked" outcome from the
-	// merging column (board.Next transitions merging -> blocked);
-	// Result.Reason is the blocking comment.
+	// OutcomeNotMergeable means required checks are failing, branch
+	// protection is unsatisfied, the merge attempt itself failed, or no PR
+	// exists for the branch at all. The dispatcher maps this to a "blocked"
+	// outcome from the merging column (board.Next transitions merging ->
+	// blocked); Result.Reason is the blocking comment and Result.Retriable
+	// says whether a later poll could plausibly clear it without human action.
 	OutcomeNotMergeable Outcome = "not_mergeable"
 
 	// OutcomeStaleBaseConflict means the PR was only blocked by an
@@ -163,7 +164,7 @@ type Result struct {
 	// resolve on its own (true: e.g. a refused merge from a transient GitHub
 	// state, or unsatisfied protection fixable out of band) or is
 	// deterministic until a human or coder acts (false: failing required
-	// checks). The dispatcher maps false to a non-retrying block kind --
+	// checks, or no PR at all). The dispatcher maps false to a non-retrying block kind --
 	// re-running an identical merge gate against identical inputs burned 5
 	// retries per incident in the Reflex build.
 	Retriable bool `json:"retriable,omitempty"`
@@ -175,6 +176,65 @@ type Result struct {
 // whether a later poll could plausibly succeed without human/coder action.
 func notMergeable(view prView, reason string, retriable bool) Result {
 	return Result{Outcome: OutcomeNotMergeable, Reason: reason, PRURL: view.URL, PRNumber: view.Number, Retriable: retriable}
+}
+
+// noPullRequestErr reports whether err is gh's "no pull requests found" --
+// the branch has no PR (deleted after a manual merge, or never pushed). That
+// is a terminal, deterministic state (retrying can never grow a PR), not an
+// infrastructure failure, so both fetchPRView callers below map it to a
+// parked Result rather than propagating it as an error.
+func noPullRequestErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no pull requests found")
+}
+
+// noPRNotMergeable is the terminal Result for a branch with no PR: a
+// non-retriable block so the dispatcher parks it for a human (Retriable=false
+// -> BlockKindNeedsInput) instead of re-claiming the merging card every poll,
+// which also re-created the hand-deleted worktree/branch each time (the
+// Reflex retro's zombie runs).
+func noPRNotMergeable(spec Spec) Result {
+	return Result{
+		Outcome:   OutcomeNotMergeable,
+		Retriable: false,
+		Reason:    fmt.Sprintf("no pull request exists for branch %s", spec.Branch),
+	}
+}
+
+// PreCheckPRState performs a READ-ONLY classification of spec.Branch's PR
+// (a single `gh pr view` from spec.Workspace -- the dispatcher passes its
+// primary clone), gating the full, side-effecting Run on the two states where
+// ensuring the issue's worktree is pointless or harmful. It never merges,
+// cleans up, tags, or probes conflicts -- so it can safely run from the
+// primary clone, unlike Run (whose local operations need the PR-branch
+// worktree). runCommand nil defaults to DefaultCommandRunner, matching Run.
+//
+// It returns resolved=true with a Result the caller should apply directly for
+// the two terminal states a worktree cannot help with:
+//
+//   - no PR for the branch -> a terminal OutcomeNotMergeable (noPRNotMergeable):
+//     park it for a human rather than resurrect a hand-deleted worktree/branch
+//     every poll only to re-discover the branch has no PR (the zombie run).
+//   - the PR already merged -> OutcomeMerged: transition the board to done
+//     without ensuring a worktree just to re-confirm the merge.
+//
+// For every other state it returns resolved=false and a zero Result: the
+// caller ensures the worktree and runs the full Run against it, which owns the
+// real merge, tag, cleanup, and (for a stale base) the conflict-file probe.
+func PreCheckPRState(ctx context.Context, spec Spec, runCommand CommandRunner) (result Result, resolved bool, err error) {
+	if runCommand == nil {
+		runCommand = DefaultCommandRunner
+	}
+	view, err := fetchPRView(ctx, spec, runCommand)
+	if err != nil {
+		if noPullRequestErr(err) {
+			return noPRNotMergeable(spec), true, nil
+		}
+		return Result{}, false, fmt.Errorf("gitops: pre-checking PR state for branch %s: %w", spec.Branch, err)
+	}
+	if view.State == prStateMerged {
+		return Result{Outcome: OutcomeMerged, PRURL: view.URL, PRNumber: view.Number}, true, nil
+	}
+	return Result{}, false, nil
 }
 
 // Run executes one deterministic pass of the Git-operator lane against
@@ -199,6 +259,13 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 
 	view, err := fetchPRView(ctx, spec, runCommand)
 	if err != nil {
+		// A missing PR is a terminal verdict, not an infrastructure error,
+		// even reached from the full pass (the dispatcher's read-only
+		// PreCheckPRState catches it first, but the branch could lose its PR
+		// between the pre-check and here). See noPRNotMergeable.
+		if noPullRequestErr(err) {
+			return noPRNotMergeable(spec), nil
+		}
 		return Result{}, fmt.Errorf("gitops: fetching PR state for branch %s: %w", spec.Branch, err)
 	}
 	if view.State == prStateMerged {

@@ -156,6 +156,14 @@ func (w *stubWorkspacer) Ensure(issue store.Issue) (string, error) {
 	return path, nil
 }
 
+// EnsuredIssues returns the issue IDs Ensure was called for, in call order,
+// so a test can assert whether a worktree was (or was never) resurrected.
+func (w *stubWorkspacer) EnsuredIssues() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.ensured...)
+}
+
 // sequentialRunIDs returns a deterministic run id generator: "run-1",
 // "run-2", ... in call order, safe for concurrent use even though the
 // dispatcher itself only ever calls newRunID from the Tick goroutine.

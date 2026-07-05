@@ -22,6 +22,21 @@ func defaultGitOpsRunner(ctx context.Context, spec gitops.Spec) (gitops.Result, 
 	return gitops.Run(ctx, spec, nil)
 }
 
+// GitOpsPreChecker performs the READ-ONLY PR pre-check runGitopsClaim runs
+// from the primary clone BEFORE ensuring a worktree (see
+// Dispatcher.gitOpsPreCheck). resolved reports whether the pre-check already
+// decided the pass (a merged or missing PR); when false the caller ensures the
+// worktree and runs the full gitops pass. Production uses
+// defaultGitOpsPreChecker; tests substitute a fake via WithGitOpsPreChecker so
+// the merging path never touches a real gh subprocess.
+type GitOpsPreChecker func(ctx context.Context, spec gitops.Spec) (result gitops.Result, resolved bool, err error)
+
+// defaultGitOpsPreChecker is New's default GitOpsPreChecker: a real,
+// read-only gitops.PreCheckPRState call against the default CommandRunner.
+func defaultGitOpsPreChecker(ctx context.Context, spec gitops.Spec) (gitops.Result, bool, error) {
+	return gitops.PreCheckPRState(ctx, spec, nil)
+}
+
 // mergingTTL is the claim TTL (seconds) used for a "merging" ClaimColumn
 // claim: deliberately cfg.PollIntervalS, NOT d.ttl() (cfg.MaxRuntimeS) —
 // R3. gitops runs synchronously and returns within one tick, so this claim
@@ -69,17 +84,44 @@ func (d *Dispatcher) claimAndRunGitops(ctx context.Context, now int64) error {
 	return nil
 }
 
-// runGitopsClaim resolves claim's workspace (the issue's existing worktree —
-// the same one the Coder lane committed/pushed from) and runs d.gitOps
-// against it, then maps the result onto a board transition
-// (applyGitopsResult). An infrastructure failure — either preparing the
-// workspace or from d.gitOps itself (gitops.Run's own error return is
-// reserved for exactly this: gh/git plumbing failures, never a meaningful
-// PR decision) — is logged and the claim is left in place: it expires per
-// the short mergingTTL and the next poll's claimAndRunGitops retries it,
-// exactly like an OutcomeCIPending result.
+// runGitopsClaim first PRE-CHECKS claim's PR from the primary clone with a
+// READ-ONLY d.gitOpsPreCheck (a single `gh pr view`, no merge/cleanup/probe)
+// and short-circuits on a terminal verdict — a merged PR (board -> done) or a
+// missing one (parked needs_input) — so a deleted branch/PR never resurrects a
+// hand-deleted worktree just to fail on it forever (the Reflex retro's zombie
+// runs). Only when the pre-check does NOT resolve the pass does it ensure the
+// issue's worktree (the same one the Coder lane committed/pushed from) and run
+// the full, side-effecting d.gitOps against it — which owns the real merge,
+// cleanup, tag, and conflict-file probe, all of which need the PR-branch
+// worktree, never the primary clone. The result maps onto a board transition
+// (applyGitopsResult). An infrastructure failure — the read-only pre-check's
+// gh call, preparing the workspace, or d.gitOps itself (gitops.Run's own error
+// return is reserved for exactly this: gh/git plumbing failures, never a
+// meaningful PR decision) — is logged and the claim is left in place: it
+// expires per the short mergingTTL and the next poll's claimAndRunGitops
+// retries it, exactly like an OutcomeCIPending result.
 func (d *Dispatcher) runGitopsClaim(ctx context.Context, claim store.Claim) error {
 	issue := claim.Issue
+
+	// Read-only pre-check from the primary clone (no worktree): `gh pr view`
+	// resolves the repo from its working directory, so the primary clone
+	// answers it without ensuring the issue's worktree first. It short-circuits
+	// only the two states a worktree can't help with — a merged or missing PR;
+	// everything else falls through to the full worktree pass below.
+	preSpec := gitops.Spec{
+		Branch:           issue.BranchName,
+		BaseBranch:       d.cfg.Repo.BaseBranch,
+		Workspace:        d.cfg.Repo.Path,
+		PrimaryClonePath: d.cfg.Repo.Path,
+	}
+	result, resolved, err := d.gitOpsPreCheck(ctx, preSpec)
+	if err != nil {
+		d.logger.Error("gitops pr pre-check failed, leaving merging claim in place", "issue_id", issue.ID, "run_id", claim.Run.RunID, "error", err)
+		return nil
+	}
+	if resolved {
+		return d.applyGitopsResult(ctx, issue, claim.Run.RunID, claim.Run.Lane, result)
+	}
 
 	workspace, err := d.ws.Ensure(issue)
 	if err != nil {
@@ -100,7 +142,7 @@ func (d *Dispatcher) runGitopsClaim(ctx context.Context, claim store.Claim) erro
 		IssueTitle: issue.Title,
 	}
 
-	result, err := d.gitOps(ctx, spec)
+	result, err = d.gitOps(ctx, spec)
 	if err != nil {
 		d.logger.Error("gitops run failed, leaving merging claim in place", "issue_id", issue.ID, "run_id", claim.Run.RunID, "error", err)
 		return nil

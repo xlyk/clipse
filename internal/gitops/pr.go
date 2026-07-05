@@ -22,10 +22,10 @@ type prView struct {
 }
 
 // fetchPRView runs `gh pr view` for spec.Branch and decodes its --json
-// response. Unlike fetchChecks, a non-zero exit here always means a real
-// failure (most commonly: no PR exists for this branch), so it's always an
-// error -- there is no analogous "empty is a meaningful, non-error result"
-// case.
+// response. A non-zero exit is always an error here (unlike fetchChecks,
+// which has a meaningful empty result); the most common one -- gh's "no pull
+// requests found" for a branch with no PR -- is recognized and mapped by Run
+// to a terminal OutcomeNotMergeable rather than an infrastructure failure.
 func fetchPRView(ctx context.Context, spec Spec, runner CommandRunner) (prView, error) {
 	argv := []string{"gh", "pr", "view", spec.Branch, "--json", "number,url,state,mergeable,mergeStateStatus,isDraft"}
 	res, err := runner(ctx, argv, spec.Workspace)
