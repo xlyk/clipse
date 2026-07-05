@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 
@@ -143,7 +145,15 @@ func (w *stubWorkspacer) Ensure(issue store.Issue) (string, error) {
 	w.mu.Lock()
 	w.ensured = append(w.ensured, issue.ID)
 	w.mu.Unlock()
-	return w.root + "/" + issue.ID, nil
+	// Create the directory on disk so the returned path is a real workspace,
+	// matching the real Workspacer's contract. LocalSpawner now runs workers
+	// with this path as cmd.Dir (so DAC resolves the target repo's guides), so
+	// a returned-but-nonexistent path would fail the worker's chdir.
+	path := filepath.Join(w.root, issue.ID)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return "", fmt.Errorf("stub ensure workspace %s: %w", path, err)
+	}
+	return path, nil
 }
 
 // sequentialRunIDs returns a deterministic run id generator: "run-1",

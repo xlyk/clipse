@@ -106,6 +106,17 @@ func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, e
 	args := append(append([]string{}, s.command[1:]...), workerArgs(spec)...)
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = spec.Env
+	// Run the worker in its own issue worktree, not the dispatcher's cwd. DAC
+	// (create_cli_agent) resolves the injected memory/AGENTS.md guides from
+	// settings.project_root, which is bootstrapped from the worker process's
+	// working directory (Path.cwd()) -- NOT from the cwd= argument
+	// dac.build_coder_agent passes (that only sets the filesystem/shell backend
+	// root and prompt text). Leaving Dir unset made every coder round carry the
+	// dispatcher repo's own AGENTS.md instead of the target repo's guides
+	// (Reflex retro). Empty Workspace leaves Dir at the caller's cwd (exec.Cmd
+	// semantics), matching the pre-fix behavior for specs that carry no
+	// worktree.
+	cmd.Dir = spec.Workspace
 	cmd.Stderr = logFile
 
 	var stdout bytes.Buffer

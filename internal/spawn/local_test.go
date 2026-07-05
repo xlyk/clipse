@@ -117,6 +117,58 @@ func TestLocalSpawner_Success(t *testing.T) {
 	assertStderrLog(t, boardDir, "CLP-1")
 }
 
+// TestLocalSpawner_RunsInWorkspaceDir asserts the Spawner runs the worker
+// process with the issue worktree as its working directory, not the
+// dispatcher's own cwd. This matters because DAC (create_cli_agent) resolves
+// the injected memory/AGENTS.md guides from settings.project_root, which is
+// bootstrapped from the worker process's Path.cwd() -- not from the cwd=
+// argument dac.build_coder_agent passes (that only sets the filesystem/shell
+// backend root and prompt text). Before cmd.Dir was set, every coder round
+// carried the dispatcher repo's AGENTS.md instead of the target repo's guides
+// (Reflex retro). The "pwd" testworker scenario reports its own os.Getwd().
+func TestLocalSpawner_RunsInWorkspaceDir(t *testing.T) {
+	bin := buildTestworker(t)
+	boardDir := t.TempDir()
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	workspace := t.TempDir()
+	// os.Getwd() in the worker reports the symlink-resolved path (on macOS
+	// t.TempDir() lives under /var -> /private/var), so resolve the expected
+	// path the same way before comparing.
+	wantDir, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", workspace, err)
+	}
+
+	spec := spawn.WorkerSpec{
+		Issue:     "CLP-1",
+		Lane:      "coder",
+		RunID:     "run-1",
+		ThreadID:  "thread-1",
+		Workspace: workspace,
+		Env:       append(os.Environ(), "TESTWORKER_SCENARIO=pwd"),
+	}
+
+	handle, err := s.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn: unexpected error: %v", err)
+	}
+
+	res, err := handle.Wait()
+	if err != nil {
+		t.Fatalf("Wait: unexpected top-level error: %v", err)
+	}
+	if res.Err != nil {
+		t.Fatalf("Result.Err = %v, want nil", res.Err)
+	}
+	if res.Worker.Summary != wantDir {
+		t.Errorf("worker working directory = %q, want the issue worktree %q", res.Worker.Summary, wantDir)
+	}
+}
+
 // TestLocalSpawner_MultiElementCommand asserts a configured command PREFIX
 // longer than one element (e.g. the ["uv", "--project", ..., "run",
 // "clipse-worker"] shape config.Worker.Command documents) execs correctly:
