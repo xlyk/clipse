@@ -25,7 +25,7 @@ func setupScenario(t *testing.T, scenario string) (spec Spec, callLog string) {
 	branch := "clp-1-feature"
 	worktree := newIssueWorktree(t, primary, branch, "main")
 
-	if scenario == "stale_base_conflict" {
+	if scenario == "stale_base_conflict" || scenario == "update_branch_refused" {
 		writeFileT(t, worktree, "README.md", "issue branch changed this line\n")
 		runGitT(t, worktree, "commit", "-am", "issue branch edits README")
 		writeFileT(t, primary, "README.md", "main branch changed this line differently\n")
@@ -346,6 +346,39 @@ func TestRun_StaleBaseConflict_RoutesToRework(t *testing.T) {
 	calls := readCallLog(t, callLog)
 	if got := countCallsWithPrefix(calls, "pr merge"); got != 0 {
 		t.Errorf("gh pr merge should never be called on a conflict, calls: %v", calls)
+	}
+}
+
+// TestRunUpdateBranchRefusedOnConflictIsRework asserts that when the
+// triggering view already shows a conflict and `gh pr update-branch` is
+// refused outright (GitHub won't update a branch that conflicts with its
+// base), that refusal IS the conflict verdict -- OutcomeStaleBaseConflict
+// naming the real conflicting file -- not an infrastructure error. Returning
+// an error here re-claims the card forever (the Reflex build's 193-attempt
+// loop); routing to rework hands the coder a conflict-resolution turn.
+func TestRunUpdateBranchRefusedOnConflictIsRework(t *testing.T) {
+	spec, callLog := setupScenario(t, "update_branch_refused")
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("expected a Result, not an infrastructure error: %v", err)
+	}
+	if res.Outcome != OutcomeStaleBaseConflict {
+		t.Fatalf("Run() Outcome = %q, want %q (Reason: %q)", res.Outcome, OutcomeStaleBaseConflict, res.Reason)
+	}
+	if len(res.ConflictingFiles) != 1 || res.ConflictingFiles[0] != "README.md" {
+		t.Errorf("Run() ConflictingFiles = %v, want [README.md]", res.ConflictingFiles)
+	}
+	if res.Reason == "" {
+		t.Error("Run() Reason is empty, want an explanation naming the refused update-branch")
+	}
+
+	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+	assertNoMergeInProgress(t, spec.Workspace)
+
+	calls := readCallLog(t, callLog)
+	if got := countCallsWithPrefix(calls, "pr merge"); got != 0 {
+		t.Errorf("gh pr merge should never be called on a refused-update conflict, calls: %v", calls)
 	}
 }
 

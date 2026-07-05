@@ -228,7 +228,7 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 	}
 
 	if needsBaseUpdate(view) || hasConflict(view) {
-		result, proceed, err := resolveStaleBase(ctx, spec, runCommand)
+		result, proceed, err := resolveStaleBase(ctx, spec, view, runCommand)
 		if err != nil {
 			return Result{}, err
 		}
@@ -288,9 +288,27 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 // merges" scenario. Any other outcome (a real conflict, or the update
 // still catching up) is terminal for this pass: proceed=false and result is
 // what Run should return as-is.
-func resolveStaleBase(ctx context.Context, spec Spec, runner CommandRunner) (result Result, proceed bool, err error) {
-	if _, err := updateBranch(ctx, spec, runner); err != nil {
-		return Result{}, false, fmt.Errorf("gitops: updating branch %s onto %s: %w", spec.Branch, spec.BaseBranch, err)
+func resolveStaleBase(ctx context.Context, spec Spec, view prView, runner CommandRunner) (result Result, proceed bool, err error) {
+	if _, updateErr := updateBranch(ctx, spec, runner); updateErr != nil {
+		if !hasConflict(view) {
+			return Result{}, false, fmt.Errorf("gitops: updating branch %s onto %s: %w", spec.Branch, spec.BaseBranch, updateErr)
+		}
+		// GitHub refuses update-branch outright when the PR conflicts with
+		// its base -- that refusal IS the conflict verdict, not an
+		// infrastructure failure. Returning an error here re-claims the card
+		// forever (the Reflex build's 193-attempt loop); routing to rework
+		// hands the coder a conflict-resolution turn instead.
+		files, probeErr := probeConflictFiles(ctx, spec)
+		if probeErr != nil {
+			return Result{}, false, fmt.Errorf("gitops: probing conflicting files for branch %s against %s: %w", spec.Branch, spec.BaseBranch, probeErr)
+		}
+		return Result{
+			Outcome:          OutcomeStaleBaseConflict,
+			Reason:           fmt.Sprintf("gh pr update-branch refused for %s (conflict with base %s)", spec.Branch, spec.BaseBranch),
+			ConflictingFiles: files,
+			PRURL:            view.URL,
+			PRNumber:         view.Number,
+		}, false, nil
 	}
 
 	recheck, err := fetchPRView(ctx, spec, runner)
