@@ -57,6 +57,14 @@ func hasConflict(view prView) bool {
 	return view.Mergeable == "CONFLICTING" || view.MergeStateStatus == "DIRTY"
 }
 
+// mergeabilityUnknown reports GitHub's transient UNKNOWN state: the
+// mergeability computation was invalidated (typically by a concurrent merge
+// advancing the base) and hasn't finished recomputing. A merge attempt now
+// is guaranteed to be refused; the only correct move is to re-check next poll.
+func mergeabilityUnknown(view prView) bool {
+	return view.Mergeable == "UNKNOWN"
+}
+
 // updateBranch runs `gh pr update-branch` for spec.Branch, asking GitHub to
 // bring it up to date with its base (a merge commit by default; gh has no
 // separate rebase mode wired here since Run always re-checks mergeability

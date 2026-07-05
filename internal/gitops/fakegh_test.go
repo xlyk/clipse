@@ -45,6 +45,9 @@ pr)
 		update_branch_refused)
 			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY"}'
 			;;
+		mergeability_unknown)
+			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN"}'
+			;;
 		stale_base_merges | stale_base_conflict)
 			if [ -f "$updated_marker" ]; then
 				if [ "$scenario" = "stale_base_conflict" ]; then

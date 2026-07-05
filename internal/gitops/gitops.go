@@ -227,6 +227,15 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 		return notMergeable(view, fmt.Sprintf("branch protection unsatisfied for %s: %s", spec.BaseBranch, protectionReason)), nil
 	}
 
+	if mergeabilityUnknown(view) {
+		// GitHub's mergeability computation is mid-recompute (a concurrent
+		// merge just advanced the base); a `gh pr merge` now is guaranteed
+		// refused. Treat it like a pending check (R3): re-check next poll,
+		// rather than firing the doomed merge and leaning on mergeNotReady's
+		// string-matching to rescue it.
+		return Result{Outcome: OutcomeCIPending, PRURL: view.URL, PRNumber: view.Number}, nil
+	}
+
 	if needsBaseUpdate(view) || hasConflict(view) {
 		result, proceed, err := resolveStaleBase(ctx, spec, view, runCommand)
 		if err != nil {

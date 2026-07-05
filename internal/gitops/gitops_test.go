@@ -382,6 +382,29 @@ func TestRunUpdateBranchRefusedOnConflictIsRework(t *testing.T) {
 	}
 }
 
+// TestRun_MergeabilityUnknown_CIPending asserts GitHub's transient UNKNOWN
+// mergeability (the computation was invalidated -- typically by a concurrent
+// merge advancing the base -- and hasn't recomputed) short-circuits to
+// OutcomeCIPending after the checks/protection gates pass, WITHOUT attempting
+// the doomed `gh pr merge` that UNKNOWN guarantees GitHub will refuse.
+func TestRun_MergeabilityUnknown_CIPending(t *testing.T) {
+	spec, callLog := setupScenario(t, "mergeability_unknown")
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+	if res.Outcome != OutcomeCIPending {
+		t.Fatalf("Run() Outcome = %q, want %q (transient UNKNOWN, retry next poll)", res.Outcome, OutcomeCIPending)
+	}
+	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+
+	calls := readCallLog(t, callLog)
+	if got := countCallsWithPrefix(calls, "pr merge"); got != 0 {
+		t.Errorf("gh pr merge should never be called while mergeability is UNKNOWN, calls: %v", calls)
+	}
+}
+
 // TestRun_MergeCommandFails_NotMergeable asserts that even after every
 // upfront gate passes, a `gh pr merge` failure itself (e.g. a race against
 // a newly-required check) is reported as OutcomeNotMergeable, not treated
