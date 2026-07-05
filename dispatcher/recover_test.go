@@ -433,6 +433,61 @@ func TestRecoverOrphans_ReworkColumnRequeue_DoesNotDoubleCountReworkCount(t *tes
 	}
 }
 
+// TestRecoverOrphans_TerminalIssueTerminalizesRunWithoutFlapping asserts that
+// an open run whose issue already finished (board_status done/cancelled) is
+// just closed as leftover restart debris -- NOT flapped back to blocked and
+// mirrored to Linear (the Reflex retro: done tickets un-done by every
+// restart). The check must win even when the run is past max_attempts (which
+// would otherwise block it).
+func TestRecoverOrphans_TerminalIssueTerminalizesRunWithoutFlapping(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	const runID = "orphan-run"
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+	if _, err := s.ClaimReady(ctx, "coder", runID, 1000, 3600); err != nil {
+		t.Fatalf("ClaimReady: unexpected error: %v", err)
+	}
+	cfg := testConfig()
+	// Past max_attempts so, absent the terminal-state guard, blockOrphan would
+	// flap the done issue to blocked.
+	if _, err := s.DB().ExecContext(ctx, `UPDATE runs SET attempt = ? WHERE run_id = ?`, cfg.MaxAttempts, runID); err != nil {
+		t.Fatalf("bumping run attempt: unexpected error: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE issues SET board_status = 'done' WHERE id = ?`, "issue-1"); err != nil {
+		t.Fatalf("marking issue done: unexpected error: %v", err)
+	}
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(ctx); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+
+	issue, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnDone) {
+		t.Errorf("BoardStatus = %q, want unchanged done (terminal issue must not flap)", issue.BoardStatus)
+	}
+
+	if run := getRunStatus(t, s, runID); run != "terminalized" {
+		t.Errorf("run status = %q, want terminalized", run)
+	}
+
+	pending, err := s.DrainPendingLinearWrites(ctx, 100)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("pending linear writes = %+v, want 0 (no set-state or comment for a terminal issue)", pending)
+	}
+}
+
 // getRunStatus fetches a single run's status by id via the store's raw DB
 // handle (there is no dedicated GetRun accessor for a single row).
 func getRunStatus(t *testing.T, s *store.Store, runID string) string {
