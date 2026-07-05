@@ -39,6 +39,15 @@ type MockClient struct {
 	CommentErr error
 	// CommentCalls accumulates every Comment call, in order.
 	CommentCalls []CommentCall
+
+	// Comments maps an issueID to the comments IssueComments returns for it
+	// (nil/absent yields an empty slice, matching HTTPClient's behavior).
+	Comments map[string][]Comment
+	// IssueCommentsErr, if set, is returned (wrapped) by every IssueComments
+	// call. The call is still recorded even when this is set.
+	IssueCommentsErr error
+	// IssueCommentsCalls accumulates every IssueComments call's issueID, in order.
+	IssueCommentsCalls []string
 }
 
 // CandidateIssues returns m.Issues, or a wrapped m.Err if set.
@@ -65,4 +74,14 @@ func (m *MockClient) Comment(ctx context.Context, issueID, body string) error {
 		return fmt.Errorf("mock comment: %w", m.CommentErr)
 	}
 	return nil
+}
+
+// IssueComments records the call and returns the scripted comments for
+// issueID, or a wrapped m.IssueCommentsErr if set.
+func (m *MockClient) IssueComments(ctx context.Context, issueID string) ([]Comment, error) {
+	m.IssueCommentsCalls = append(m.IssueCommentsCalls, issueID)
+	if m.IssueCommentsErr != nil {
+		return nil, fmt.Errorf("mock issue comments: %w", m.IssueCommentsErr)
+	}
+	return m.Comments[issueID], nil
 }

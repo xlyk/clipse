@@ -88,6 +88,21 @@ const CommentMutation = `mutation Comment($issueId: String!, $body: String!) {
   }
 }`
 
+// IssueCommentsQuery fetches the comments on a single issue (by id), newest
+// batch capped at 50, with the body and createdAt each normalized Comment
+// needs. The dispatcher reads these at coder-spawn time to thread an issue's
+// and its blockers' decision history into the worker prompt.
+const IssueCommentsQuery = `query IssueComments($id: String!) {
+  issue(id: $id) {
+    comments(first: 50) {
+      nodes {
+        body
+        createdAt
+      }
+    }
+  }
+}`
+
 // graphqlRequest is the wire shape of a GraphQL POST body.
 type graphqlRequest struct {
 	Query     string         `json:"query"`
@@ -124,6 +139,13 @@ func BuildCommentRequest(issueID, body string) ([]byte, error) {
 	return marshalGraphQLRequest(CommentMutation, map[string]any{
 		"issueId": issueID,
 		"body":    body,
+	})
+}
+
+// BuildIssueCommentsRequest builds the request body for IssueCommentsQuery.
+func BuildIssueCommentsRequest(issueID string) ([]byte, error) {
+	return marshalGraphQLRequest(IssueCommentsQuery, map[string]any{
+		"id": issueID,
 	})
 }
 
@@ -237,6 +259,44 @@ func (c *HTTPClient) Comment(ctx context.Context, issueID, body string) error {
 		return fmt.Errorf("comment: %w", err)
 	}
 	return nil
+}
+
+// IssueComments runs IssueCommentsQuery for issueID and decodes the response
+// into Comments. A missing issue or empty comment list decodes to an empty
+// slice, not an error.
+func (c *HTTPClient) IssueComments(ctx context.Context, issueID string) ([]Comment, error) {
+	reqBody, err := BuildIssueCommentsRequest(issueID)
+	if err != nil {
+		return nil, fmt.Errorf("issue comments: %w", err)
+	}
+
+	respBody, err := c.do(ctx, reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("issue comments: %w", err)
+	}
+
+	var payload struct {
+		Data struct {
+			Issue struct {
+				Comments struct {
+					Nodes []struct {
+						Body      string `json:"body"`
+						CreatedAt string `json:"createdAt"`
+					} `json:"nodes"`
+				} `json:"comments"`
+			} `json:"issue"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return nil, fmt.Errorf("issue comments: decoding response: %w", err)
+	}
+
+	nodes := payload.Data.Issue.Comments.Nodes
+	comments := make([]Comment, 0, len(nodes))
+	for _, n := range nodes {
+		comments = append(comments, Comment{Body: n.Body, CreatedAt: n.CreatedAt})
+	}
+	return comments, nil
 }
 
 // do POSTs a prebuilt GraphQL request body to Linear's API and returns the

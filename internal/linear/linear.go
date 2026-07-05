@@ -48,6 +48,16 @@ type Issue struct {
 	UpdatedAt int64
 }
 
+// Comment is a single Linear issue comment: its body plus the ISO-8601
+// createdAt timestamp Linear returns. CreatedAt is retained only for
+// oldest-first ordering when the dispatcher assembles dependency notes; it
+// sorts chronologically as a plain string. Comment bodies are untrusted user
+// input threaded into the coder prompt and must never be logged.
+type Comment struct {
+	Body      string
+	CreatedAt string
+}
+
 // Client is the seam the dispatcher depends on for all Linear interaction.
 // The real implementation (HTTPClient) talks GraphQL over HTTP; tests use
 // MockClient so Phase-1 dispatch logic never touches the network.
@@ -63,4 +73,9 @@ type Client interface {
 	// Comment posts body as a comment on the issue identified by issueID
 	// (used, for example, to record a Blocked reason).
 	Comment(ctx context.Context, issueID, body string) error
+
+	// IssueComments returns the comments on the issue identified by issueID,
+	// as Linear returns them. Used at coder-spawn time to thread an issue's
+	// and its blockers' comment history into the worker's prompt.
+	IssueComments(ctx context.Context, issueID string) ([]Comment, error)
 }
