@@ -117,8 +117,17 @@ func readyPR(ctx context.Context, spec Spec, runner CommandRunner) error {
 // the captured output as the reason, the same as a failing-checks or
 // unsatisfied-protection verdict, since "gh refused to merge" is exactly
 // as ordinary an outcome as those.
-func mergePR(ctx context.Context, spec Spec, runner CommandRunner) (CommandResult, error) {
+//
+// When the spec carries both an issue id and title, mergePR adds an explicit
+// --subject "<lower(issueID)>: <title> (#<pr>)" so the squash commit's
+// subject reads from the issue rather than the PR title (which is coder
+// narration). Both empty leaves gh's default (the PR title).
+func mergePR(ctx context.Context, spec Spec, prNumber int, runner CommandRunner) (CommandResult, error) {
 	argv := []string{"gh", "pr", "merge", spec.Branch, mergeFlag(spec.MergeMethod)}
+	if spec.IssueID != "" && spec.IssueTitle != "" {
+		subject := fmt.Sprintf("%s: %s (#%d)", strings.ToLower(spec.IssueID), spec.IssueTitle, prNumber)
+		argv = append(argv, "--subject", subject)
+	}
 	res, err := runner(ctx, argv, spec.Workspace)
 	if err != nil {
 		return CommandResult{}, fmt.Errorf("gh pr merge %s: %w", spec.Branch, err)

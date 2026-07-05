@@ -93,6 +93,11 @@ func (d *Dispatcher) runGitopsClaim(ctx context.Context, claim store.Claim) erro
 		Workspace:        workspace,
 		PrimaryClonePath: d.cfg.Repo.Path,
 		RequireChecks:    d.cfg.Repo.RequireChecks,
+		// Derive the squash subject from the issue, not the coder-narration
+		// PR title (the sink half of the fix; the coder graph fixes the
+		// source).
+		IssueID:    issue.ID,
+		IssueTitle: issue.Title,
 	}
 
 	result, err := d.gitOps(ctx, spec)

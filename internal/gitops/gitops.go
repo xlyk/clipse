@@ -106,6 +106,14 @@ type Spec struct {
 	// sets it from cfg.Repo.RequireChecks (yaml repo.require_checks, default
 	// true).
 	RequireChecks bool
+
+	// IssueID and IssueTitle, when both set, derive an explicit squash
+	// --subject ("<lower(issueID)>: <IssueTitle> (#<pr>)") so the merge commit
+	// reads from the issue rather than the coder-narration PR title. Both
+	// optional: empty leaves gh's default behavior (the PR title). The
+	// dispatcher sets them from issue.ID/issue.Title.
+	IssueID    string
+	IssueTitle string
 }
 
 // validate reports a descriptive error for a Spec missing a field Run
@@ -269,7 +277,7 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 		}
 	}
 
-	mergeRes, err := mergePR(ctx, spec, runCommand)
+	mergeRes, err := mergePR(ctx, spec, view.Number, runCommand)
 	if err != nil {
 		return Result{}, fmt.Errorf("gitops: merging PR for branch %s: %w", spec.Branch, err)
 	}
