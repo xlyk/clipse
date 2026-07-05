@@ -75,6 +75,7 @@ from langgraph.graph import END, START, StateGraph
 from clipse_agent import dac
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.profiles.coder import CoderProfile, get_coder_docs_profile, get_coder_profile
+from clipse_agent.tail import parse_structured_tail
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -179,7 +180,8 @@ class CoderState(TypedDict, total=False):
 
     # --- run_DAC ---
     dac_outcome_hint: str  # "completed" | "interrupted" (dac.OutcomeHint)
-    dac_summary: str
+    dac_summary: str  # the whole turn's text (audit trail / PR body)
+    dac_last_text: str  # only the FINAL message's text (the STATUS/TITLE/HANDOFF tail source)
     tokens_in: int
     tokens_out: int
     interrupt_payload: list[Any] | None
@@ -484,6 +486,7 @@ def make_run_dac(
         return {
             "dac_outcome_hint": turn_result.outcome_hint,
             "dac_summary": turn_result.final_text,
+            "dac_last_text": turn_result.last_text,
             "tokens_in": turn_result.tokens_in,
             "tokens_out": turn_result.tokens_out,
             "interrupt_payload": turn_result.interrupt_payload,
@@ -633,6 +636,11 @@ def _parse_porcelain_paths(porcelain_output: str) -> list[str]:
 
 def _commit_message(state: CoderState) -> str:
     issue_id = state.get("issue_id", "")
+    tail = parse_structured_tail(state.get("dac_last_text") or "")
+    if tail.title:
+        return f"{issue_id}: {tail.title}"[:72]
+    # Legacy fallback: a turn that skipped the STATUS/TITLE tail still gets a
+    # message from the DAC summary's first narration line.
     turn = state.get("turn_count", 0) + 1
     summary_lines = (state.get("dac_summary") or "").strip().splitlines()
     headline = summary_lines[0] if summary_lines else f"turn {turn}"
@@ -759,6 +767,10 @@ def make_push(run_command: CommandRunner) -> Callable[[CoderState], dict[str, An
 
 def _pr_title(state: CoderState) -> str:
     issue_id = state.get("issue_id", "")
+    tail = parse_structured_tail(state.get("dac_last_text") or "")
+    if tail.title:
+        return f"{issue_id}: {tail.title}"[:120]
+    # Legacy fallback: no TITLE tail -> the DAC summary's first narration line.
     lines = (state.get("dac_summary") or "").strip().splitlines()
     headline = lines[0] if lines else "Implement issue"
     return f"{issue_id}: {headline}"[:120]
