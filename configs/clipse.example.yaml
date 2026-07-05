@@ -10,6 +10,12 @@ repo:
   path: "/home/you/code/yourrepo"
   # base_branch is the branch workers branch off and PRs target.
   base_branch: "main"
+  # require_checks controls how the Git-operator lane treats a PR with no
+  # required CI checks reported. true (the default) waits for CI to register
+  # (a repo whose CI registers late must not be blocked or merged early);
+  # false lets the merge proceed on branch protection alone (a repo with no
+  # CI). Optional; defaults to true.
+  require_checks: true
 
 # team_key / team_id: the Linear team clipse operates against. team_key
 # scopes the candidate-issues query to this team; team_id resolves board

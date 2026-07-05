@@ -253,6 +253,37 @@ worker:
 	if cfg.Models.Reviewer != "anthropic:claude-opus-4-6" {
 		t.Errorf("Models.Reviewer = %q, want default %q", cfg.Models.Reviewer, "anthropic:claude-opus-4-6")
 	}
+	// repo.require_checks defaults to true (the safe default: absent checks
+	// wait for CI to register rather than proceeding to merge).
+	if !cfg.Repo.RequireChecks {
+		t.Errorf("Repo.RequireChecks = %v, want default true", cfg.Repo.RequireChecks)
+	}
+}
+
+// TestLoad_RequireChecksExplicitFalse asserts an explicit repo.require_checks:
+// false is honored (a repo declaring it has no CI at all), distinct from the
+// absent-key default of true.
+func TestLoad_RequireChecksExplicitFalse(t *testing.T) {
+	path := writeYAML(t, `
+repo:
+  remote: "https://github.com/yourorg/yourrepo.git"
+  path: "/home/you/code/yourrepo"
+  base_branch: "main"
+  require_checks: false
+team_key: "CLI"
+team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
+worker:
+  command:
+    - clipse-worker
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	if cfg.Repo.RequireChecks {
+		t.Errorf("Repo.RequireChecks = %v, want explicit false", cfg.Repo.RequireChecks)
+	}
 }
 
 // TestLoad_RecoverBackoffDefaultsToPollInterval asserts recover_backoff_s

@@ -98,6 +98,14 @@ type Spec struct {
 	// it is genuinely optional, per the design doc's Git-operator
 	// responsibilities.
 	Tag string
+
+	// RequireChecks controls the checksAbsent verdict: true (the safe
+	// default -- CI that registers late must be WAITED for, not blocked on)
+	// maps absent checks to OutcomeCIPending; false (a repo with no CI at
+	// all) lets the merge proceed on branch protection alone. The dispatcher
+	// sets it from cfg.Repo.RequireChecks (yaml repo.require_checks, default
+	// true).
+	RequireChecks bool
 }
 
 // validate reports a descriptive error for a Spec missing a field Run
@@ -196,7 +204,14 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 	}
 	switch state, failing := classifyChecks(checks); state {
 	case checksAbsent:
-		return notMergeable(view, fmt.Sprintf("no required CI checks reported on branch %s", spec.Branch)), nil
+		if spec.RequireChecks {
+			// No checks *yet*: on this repo CI may just not have registered
+			// (observed ~40 min late during the Reflex build). Same handling
+			// as pending -- wait, don't block. Blocking here strands a PR
+			// that just needed CI to catch up.
+			return Result{Outcome: OutcomeCIPending, PRURL: view.URL, PRNumber: view.Number}, nil
+		}
+		// No CI on this repo by declaration: fall through to protection/merge.
 	case checksFailing:
 		return notMergeable(view, fmt.Sprintf("required checks failing: %s", joinNames(failing))), nil
 	case checksPending:

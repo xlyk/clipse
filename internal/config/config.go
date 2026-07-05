@@ -96,6 +96,13 @@ type Repo struct {
 	Remote     string `yaml:"remote"`
 	Path       string `yaml:"path"`
 	BaseBranch string `yaml:"base_branch"`
+	// RequireChecks controls how the Git-operator lane treats a PR with no
+	// required CI checks reported (see gitops.Spec.RequireChecks): true (the
+	// default) waits for CI to register (a repo whose CI registers late must
+	// not be blocked or merged prematurely); false lets the merge proceed on
+	// branch protection alone (a repo with no CI at all). Defaults to true
+	// when absent from the YAML document.
+	RequireChecks bool `yaml:"require_checks"`
 }
 
 // PerLaneCaps caps concurrent workers per lane.
@@ -232,6 +239,18 @@ type Config struct {
 	EnvAllowlist []string `yaml:"env_allowlist"`
 }
 
+// rawRepo mirrors Repo but pointer-wraps RequireChecks so Load can tell
+// "absent from YAML" (nil, defaults to true) apart from an explicit
+// "require_checks: false". The string fields need no such indirection: their
+// zero value ("") already means absent, and validate rejects an empty
+// remote/path/base_branch either way.
+type rawRepo struct {
+	Remote        string `yaml:"remote"`
+	Path          string `yaml:"path"`
+	BaseBranch    string `yaml:"base_branch"`
+	RequireChecks *bool  `yaml:"require_checks"`
+}
+
 // rawPerLaneCaps mirrors PerLaneCaps with pointer fields so we can tell
 // "absent from YAML" (nil, gets a default) apart from "explicitly zero or
 // negative" (non-nil, must fail validation).
@@ -282,8 +301,10 @@ type rawModelParams struct {
 // it), and an explicit-but-empty list is a validate-time error either way
 // (see validate), so no pointer indirection is needed to tell the two apart.
 type rawConfig struct {
-	Repo    Repo   `yaml:"repo"`
-	TeamKey string `yaml:"team_key"`
+	// Repo is rawRepo (not Repo) so require_checks can default to true when
+	// absent — its string fields still copy straight through.
+	Repo    rawRepo `yaml:"repo"`
+	TeamKey string  `yaml:"team_key"`
 	TeamID  string `yaml:"team_id"`
 	// Worker is plain (not pointer-wrapped) like Repo: it's required, with
 	// no default to apply, so Load copies it straight through and validate
@@ -330,7 +351,14 @@ func Load(path string) (*Config, error) {
 	pollIntervalS := intOrDefault(raw.PollIntervalS, defaultPollIntervalS)
 
 	cfg := &Config{
-		Repo:    raw.Repo,
+		Repo: Repo{
+			Remote:     raw.Repo.Remote,
+			Path:       raw.Repo.Path,
+			BaseBranch: raw.Repo.BaseBranch,
+			// Absent require_checks defaults to true: the safe default is to
+			// wait for CI to register rather than merge without it.
+			RequireChecks: boolOrDefault(raw.Repo.RequireChecks, true),
+		},
 		TeamKey: raw.TeamKey,
 		TeamID:  raw.TeamID,
 		Worker:  raw.Worker,
@@ -377,6 +405,16 @@ func Load(path string) (*Config, error) {
 }
 
 func intOrDefault(v *int, def int) int {
+	if v == nil {
+		return def
+	}
+	return *v
+}
+
+// boolOrDefault returns def when v is nil (the key was absent from YAML),
+// otherwise the explicitly-set value -- so an explicit `false` is honored
+// distinctly from a default of true.
+func boolOrDefault(v *bool, def bool) bool {
 	if v == nil {
 		return def
 	}
