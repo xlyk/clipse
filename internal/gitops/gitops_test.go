@@ -216,19 +216,41 @@ func TestRun_MergeNotReady_CIPending(t *testing.T) {
 	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
 }
 
-// TestRun_AbsentChecks_NotMergeable asserts no required checks at all
-// blocks the merge (never treated as "nothing to wait for, go ahead").
-func TestRun_AbsentChecks_NotMergeable(t *testing.T) {
+// TestRunAbsentChecksPendsWhenRequired asserts that with RequireChecks (the
+// safe default), no required checks reported yet is treated as "wait for CI
+// to register", NOT a block: on a repo whose CI registers late this is the
+// only correct move (observed ~40 min late during the Reflex build), so it
+// maps to OutcomeCIPending and leaves the worktree intact.
+func TestRunAbsentChecksPendsWhenRequired(t *testing.T) {
 	spec, _ := setupScenario(t, "absent_checks")
+	spec.RequireChecks = true
 
 	res, err := Run(ctxWithTimeout(t), spec, nil)
 	if err != nil {
 		t.Fatalf("Run: unexpected error: %v", err)
 	}
-	if res.Outcome != OutcomeNotMergeable {
-		t.Fatalf("Run() Outcome = %q, want %q", res.Outcome, OutcomeNotMergeable)
+	if res.Outcome != OutcomeCIPending {
+		t.Fatalf("Run() Outcome = %q, want %q (absent checks wait for registration)", res.Outcome, OutcomeCIPending)
 	}
 	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+}
+
+// TestRunAbsentChecksProceedsWhenNotRequired asserts that a repo declaring it
+// has no CI at all (RequireChecks=false) lets an absent-checks PR merge on
+// branch protection alone, rather than blocking or waiting forever for checks
+// that will never register.
+func TestRunAbsentChecksProceedsWhenNotRequired(t *testing.T) {
+	spec, _ := setupScenario(t, "absent_checks")
+	spec.RequireChecks = false
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+	if res.Outcome != OutcomeMerged {
+		t.Fatalf("Run() Outcome = %q, want %q (checks not required)", res.Outcome, OutcomeMerged)
+	}
+	assertWorktreeRemoved(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
 }
 
 // TestRun_ProtectionUnsatisfied_NotMergeable asserts green checks alone are

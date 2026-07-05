@@ -92,6 +92,7 @@ func (d *Dispatcher) runGitopsClaim(ctx context.Context, claim store.Claim) erro
 		BaseBranch:       d.cfg.Repo.BaseBranch,
 		Workspace:        workspace,
 		PrimaryClonePath: d.cfg.Repo.Path,
+		RequireChecks:    d.cfg.Repo.RequireChecks,
 	}
 
 	result, err := d.gitOps(ctx, spec)
