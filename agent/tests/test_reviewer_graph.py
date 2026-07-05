@@ -288,6 +288,83 @@ def test_load_diff_degrades_gracefully_when_git_diff_fails(tmp_path):
     assert result.outcome == Outcome.done
 
 
+def test_load_diff_truncated_names_the_omitted_files(tmp_path):
+    # A diff over the cap: first.py's `diff --git` header is inside the kept
+    # prefix, but second.py/third.py's headers fall beyond it. The task text
+    # must end with a DIFF TRUNCATED section naming the cut files and telling
+    # the reviewer to read each one (the 60k cap silently dropped three files
+    # from one Reflex review).
+    first = (
+        "diff --git a/first.py b/first.py\n--- a/first.py\n+++ b/first.py\n"
+        "@@ -0,0 +1,12000 @@\n" + ("+line\n" * 12000)
+    )
+    second = "diff --git a/second.py b/second.py\n--- a/second.py\n+++ b/second.py\n@@ -0,0 +1 @@\n+hi\n"
+    third = "diff --git a/third.py b/third.py\n--- a/third.py\n+++ b/third.py\n@@ -0,0 +1 @@\n+yo\n"
+    diff_text = first + second + third
+    assert len(diff_text) > reviewer._MAX_DIFF_CHARS
+
+    runner = _base_runner()
+    runner.rules.insert(
+        0,
+        (_starts_with("git", "diff", "--name-only"), coder.CommandResult(0, "first.py\nsecond.py\nthird.py\n", "")),
+    )
+    runner.rules.insert(1, (_starts_with("git", "diff"), coder.CommandResult(0, diff_text, "")))
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-15",
+        "run_id": "run-1",
+        "thread_id": "thread-15",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-15"}}))
+
+    task_text = turn_calls[0]["task_text"]
+    assert "DIFF TRUNCATED" in task_text
+    section = task_text[task_text.index("DIFF TRUNCATED") :]
+    # cut files are named; the fully-kept first file is not
+    assert "- second.py" in section
+    assert "- third.py" in section
+    assert "- first.py" not in section
+    # instructs per-file reads, and the section is the tail of the task text
+    assert "git diff main...HEAD -- <file>" in section
+    assert task_text.rstrip().endswith("- third.py")
+
+
+def test_load_diff_small_diff_has_no_truncation_note(tmp_path):
+    runner = _base_runner()
+    runner.rules.insert(0, (_starts_with("git", "diff"), coder.CommandResult(0, "diff --git a/x b/x\n+one line\n", "")))
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-15b",
+        "run_id": "run-1",
+        "thread_id": "thread-15b",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-15b"}}))
+
+    assert "DIFF TRUNCATED" not in turn_calls[0]["task_text"]
+    # a small diff never even asks for the file list
+    assert not any(c.argv[:3] == ["git", "diff", "--name-only"] for c in runner.calls)
+
+
 # ---------------------------------------------------------------------------
 # changes_requested: inline comments posted via gh + a summary review
 # ---------------------------------------------------------------------------

@@ -246,6 +246,7 @@ def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict
         base = state.get("base_branch") or "main"
         cwd = state["cwd"]
         result = _run(run_command, ["git", "diff", f"{base}...HEAD"], cwd, check=False)
+        truncation_note = ""
         if result.returncode != 0:
             diff_block = (
                 f"(could not compute `git diff {base}...HEAD` "
@@ -254,7 +255,9 @@ def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict
         else:
             diff = result.stdout
             if len(diff) > _MAX_DIFF_CHARS:
-                diff = diff[:_MAX_DIFF_CHARS] + f"\n... (diff truncated at {_MAX_DIFF_CHARS} chars)"
+                kept = diff[:_MAX_DIFF_CHARS]
+                diff = kept + f"\n... (diff truncated at {_MAX_DIFF_CHARS} chars)"
+                truncation_note = _truncated_files_note(run_command, base, cwd, kept)
             diff_block = diff.strip() or "(empty diff -- no changes between base and HEAD)"
 
         task_text = state.get("task_text", "")
@@ -262,9 +265,35 @@ def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict
             f"{task_text}\n\n---\nPR diff (`git diff {base}...HEAD`), provided for your review:\n\n"
             f"```diff\n{diff_block}\n```\n"
         )
-        return {"task_text": augmented}
+        return {"task_text": augmented + truncation_note}
 
     return _node
+
+
+def _truncated_files_note(run_command: CommandRunner, base: str, cwd: str, kept: str) -> str:
+    """Name the files whose diff was cut by the `_MAX_DIFF_CHARS` cap.
+
+    The cap silently dropped three files from one Reflex review, and a
+    reviewer that never sees a file cannot review it. This compares the full
+    changed-file list (`git diff --name-only`) against the kept prefix: a
+    file whose `diff --git a/<f>` header didn't survive the cut was omitted
+    wholly or in part, so it is enumerated with an instruction to read it
+    directly before verdict. Degrades to no note (never raises) if the file
+    list can't be produced.
+    """
+    names = _run(run_command, ["git", "diff", "--name-only", f"{base}...HEAD"], cwd, check=False)
+    if names.returncode != 0:
+        return ""
+    all_files = [f for f in names.stdout.splitlines() if f.strip()]
+    omitted = [f for f in all_files if f"diff --git a/{f}" not in kept]
+    if not omitted:
+        return ""
+    return (
+        "\n\nDIFF TRUNCATED: the diffs for these files were cut from the text "
+        "above. You MUST read each one (e.g. "
+        f"`git diff {base}...HEAD -- <file>` or `cat <file>`) before emitting "
+        "a verdict:\n" + "\n".join(f"- {f}" for f in omitted)
+    )
 
 
 # ---------------------------------------------------------------------------
