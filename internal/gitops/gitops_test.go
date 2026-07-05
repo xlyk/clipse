@@ -382,6 +382,38 @@ func TestRunUpdateBranchRefusedOnConflictIsRework(t *testing.T) {
 	}
 }
 
+// TestRun_NotMergeableRetriability asserts each OutcomeNotMergeable path
+// declares whether a retry could plausibly succeed: failing required checks
+// are deterministic (Retriable=false -- re-running the identical merge gate
+// against identical inputs just burns retries, the Reflex build's 5-retries-
+// per-incident), while unsatisfied branch protection can be fixed out of band
+// and is cheap to re-check (Retriable=true).
+func TestRun_NotMergeableRetriability(t *testing.T) {
+	tests := []struct {
+		name          string
+		scenario      string
+		wantRetriable bool
+	}{
+		{"failing checks are deterministic", "failing_checks", false},
+		{"unsatisfied protection is retriable", "protection_unsatisfied", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, _ := setupScenario(t, tt.scenario)
+			res, err := Run(ctxWithTimeout(t), spec, nil)
+			if err != nil {
+				t.Fatalf("Run: unexpected error: %v", err)
+			}
+			if res.Outcome != OutcomeNotMergeable {
+				t.Fatalf("Run() Outcome = %q, want %q", res.Outcome, OutcomeNotMergeable)
+			}
+			if res.Retriable != tt.wantRetriable {
+				t.Errorf("Run() Retriable = %v, want %v", res.Retriable, tt.wantRetriable)
+			}
+		})
+	}
+}
+
 // TestRun_MergeabilityUnknown_CIPending asserts GitHub's transient UNKNOWN
 // mergeability (the computation was invalidated -- typically by a concurrent
 // merge advancing the base -- and hasn't recomputed) short-circuits to

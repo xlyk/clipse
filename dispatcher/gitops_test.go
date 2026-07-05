@@ -127,6 +127,83 @@ func TestTick_MergingClaim_NotMergeable_Blocks(t *testing.T) {
 	}
 }
 
+// TestTick_MergingClaim_NotMergeable_NonRetriable_ParksNeedsInput asserts
+// that a deterministic (Retriable=false) not-mergeable verdict -- e.g.
+// required checks failing -- maps to block_kind=needs_input, so the
+// dispatcher parks it for a human instead of auto-retrying the identical
+// merge gate (the Reflex build burned 5 identical retries per ticket). The
+// posted comment names the "Needs input" kind.
+func TestTick_MergingClaim_NotMergeable_NonRetriable_ParksNeedsInput(t *testing.T) {
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", "merging", 1, 100)
+
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	cfg := testConfig()
+
+	gitOpsFn := func(context.Context, gitops.Spec) (gitops.Result, error) {
+		return gitops.Result{Outcome: gitops.OutcomeNotMergeable, Retriable: false, Reason: "required checks failing: build"}, nil
+	}
+	d := dispatcher.New(cfg, s, lc, spawner, ws,
+		dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+		dispatcher.WithGitOpsRunner(gitOpsFn),
+	)
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnBlocked) {
+		t.Errorf("BoardStatus = %q, want blocked", issue.BoardStatus)
+	}
+	if len(lc.CommentCalls) != 1 {
+		t.Fatalf("Comment calls = %d, want 1", len(lc.CommentCalls))
+	}
+	if body := lc.CommentCalls[0].Body; !strings.Contains(body, "Needs input") {
+		t.Errorf("comment body = %q, want it to name the needs_input block kind", body)
+	}
+}
+
+// TestTick_MergingClaim_NotMergeable_Retriable_MapsTransient asserts that a
+// retriable not-mergeable verdict (e.g. unsatisfied protection, fixable out
+// of band) maps to block_kind=transient -- its comment names the "Transient
+// error" kind (with RecoverCap=0 in tests it still parks, but as a transient
+// kind eligible for auto-retry when a real deploy sets RecoverCap>0).
+func TestTick_MergingClaim_NotMergeable_Retriable_MapsTransient(t *testing.T) {
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", "merging", 1, 100)
+
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	cfg := testConfig()
+
+	gitOpsFn := func(context.Context, gitops.Spec) (gitops.Result, error) {
+		return gitops.Result{Outcome: gitops.OutcomeNotMergeable, Retriable: true, Reason: "branch protection unsatisfied for main"}, nil
+	}
+	d := dispatcher.New(cfg, s, lc, spawner, ws,
+		dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+		dispatcher.WithGitOpsRunner(gitOpsFn),
+	)
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+	if len(lc.CommentCalls) != 1 {
+		t.Fatalf("Comment calls = %d, want 1", len(lc.CommentCalls))
+	}
+	if body := lc.CommentCalls[0].Body; !strings.Contains(body, "Transient error") {
+		t.Errorf("comment body = %q, want it to name the transient block kind", body)
+	}
+}
+
 // TestTick_MergingClaim_StaleBaseConflict_RoutesToRework asserts R1: gitops'
 // OutcomeStaleBaseConflict maps to changes_requested from merging, which
 // board.Next's ONE new additive entry routes to rework — the same
