@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/store"
@@ -99,20 +100,50 @@ func sortedByCreatedAt(comments []linear.Comment) []linear.Comment {
 // capDependencyNotes renders sections and, while the document exceeds the cap,
 // evicts the oldest blocker comment (dropping a blocker's heading once its last
 // comment goes); only once no blocker comments remain does it start evicting
-// the issue's own oldest comments. A single comment larger than the cap is hard
-// truncated as a last resort.
+// the issue's own oldest comments. Eviction stops while one comment still
+// remains rather than draining to nothing, so a lone comment that alone
+// exceeds the cap is truncated to its head (on a rune boundary) instead of
+// dropped entirely -- the coder still gets the start of it.
 func capDependencyNotes(sections []depSection) string {
 	doc := renderDependencyNotes(sections)
-	for len(doc) > dependencyNotesCap {
+	for len(doc) > dependencyNotesCap && totalComments(sections) > 1 {
 		if !evictOldestComment(sections) {
 			break
 		}
 		doc = renderDependencyNotes(sections)
 	}
 	if len(doc) > dependencyNotesCap {
-		doc = doc[:dependencyNotesCap]
+		doc = truncateToRuneBoundary(doc, dependencyNotesCap)
 	}
 	return doc
+}
+
+// totalComments counts the comments still held across all sections, so
+// capDependencyNotes can stop evicting before it drains the last one.
+func totalComments(sections []depSection) int {
+	n := 0
+	for i := range sections {
+		n += len(sections[i].comments)
+	}
+	return n
+}
+
+// truncateToRuneBoundary returns at most maxBytes bytes of s, backing off any
+// trailing byte that would split a multibyte UTF-8 rune, so the result is
+// always valid UTF-8 and never longer than maxBytes.
+func truncateToRuneBoundary(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	trunc := s[:maxBytes]
+	for len(trunc) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(trunc); r == utf8.RuneError && size <= 1 {
+			trunc = trunc[:len(trunc)-1]
+			continue
+		}
+		break
+	}
+	return trunc
 }
 
 // evictOldestComment removes one comment to shrink the document: the oldest
