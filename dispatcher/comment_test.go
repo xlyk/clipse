@@ -68,6 +68,17 @@ func TestChangesRequestedComment_NamesFilesFromSummary(t *testing.T) {
 	}
 }
 
+// The handoff comment names the lane and outcome in its heading (every
+// API-posted comment renders as the same Linear user), then the body verbatim
+// after a blank line.
+func TestHandoffComment_RendersHeaderThenBody(t *testing.T) {
+	got := handoffComment("coder", "done", "- chose drop semantics")
+
+	if want := "### coder handoff — done\n\n- chose drop semantics"; got != want {
+		t.Errorf("handoffComment = %q, want %q", got, want)
+	}
+}
+
 // The rework-cap block must surface the cap, the PR link, and the last review
 // summary as scannable markdown — the fields rework_test.go asserts on.
 func TestReworkCapComment_HasCapPRAndReview(t *testing.T) {

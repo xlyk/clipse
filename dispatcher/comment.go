@@ -100,6 +100,13 @@ func retryComment(attempt, cap int, reason string) string {
 	return heading
 }
 
+// handoffComment renders a lane's structured handoff note as the Linear
+// comment body posted on terminal outcomes. The header names the lane and
+// outcome because every API-posted comment renders as the same Linear user.
+func handoffComment(lane, outcome, handoff string) string {
+	return fmt.Sprintf("### %s handoff — %s\n\n%s", lane, outcome, handoff)
+}
+
 // reworkCapComment renders the rework-cap block: the cap, the PR under review,
 // and the last review summary that tipped it over, as a scannable bullet list
 // so a human triaging the Blocked column sees why without opening the store.
