@@ -305,7 +305,7 @@ type rawConfig struct {
 	// absent — its string fields still copy straight through.
 	Repo    rawRepo `yaml:"repo"`
 	TeamKey string  `yaml:"team_key"`
-	TeamID  string `yaml:"team_id"`
+	TeamID  string  `yaml:"team_id"`
 	// Worker is plain (not pointer-wrapped) like Repo: it's required, with
 	// no default to apply, so Load copies it straight through and validate
 	// checks it.
