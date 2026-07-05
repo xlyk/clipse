@@ -126,6 +126,53 @@ func TestWorkerResult_BlockKind_PresentIffBlocked(t *testing.T) {
 	}
 }
 
+func TestWorkerResult_Handoff_OptionalRoundTrip(t *testing.T) {
+	// A result carrying a handoff note round-trips the field.
+	const withHandoff = `{
+		"run_id": "run-1",
+		"issue_id": "SPAC-1",
+		"lane": "coder",
+		"outcome": "needs_review",
+		"summary": "did the thing",
+		"artifacts": [],
+		"handoff": "- chose drop semantics\n- added Widget.build",
+		"thread_id": "thread-1",
+		"turn_count": 1,
+		"tokens": {"in": 1, "out": 2}
+	}`
+	var got WorkerResult
+	if err := json.Unmarshal([]byte(withHandoff), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Handoff == nil {
+		t.Fatal("Handoff = nil, want the handoff note")
+	}
+	if want := "- chose drop semantics\n- added Widget.build"; *got.Handoff != want {
+		t.Errorf("Handoff = %q, want %q", *got.Handoff, want)
+	}
+
+	// A result without a handoff omits the key entirely when marshalled
+	// (the PrUrl optional-pointer pattern — omitempty,omitzero).
+	var noHandoff WorkerResult
+	if err := json.Unmarshal([]byte(validWorkerResultJSON), &noHandoff); err != nil {
+		t.Fatalf("Unmarshal (no handoff): %v", err)
+	}
+	if noHandoff.Handoff != nil {
+		t.Errorf("Handoff = %v, want nil when absent", noHandoff.Handoff)
+	}
+	out, err := json.Marshal(noHandoff)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var asMap map[string]interface{}
+	if err := json.Unmarshal(out, &asMap); err != nil {
+		t.Fatalf("Unmarshal into map: %v", err)
+	}
+	if _, present := asMap["handoff"]; present {
+		t.Errorf("marshalled result without handoff has handoff key, want omitted: %s", out)
+	}
+}
+
 func TestWorkerResult_UnmarshalJSON_RejectsMissingRequiredField(t *testing.T) {
 	missingLane := `{
 		"run_id": "run-1",
