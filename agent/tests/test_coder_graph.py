@@ -1365,6 +1365,32 @@ def test_load_context_falls_back_to_review_feedback_env_var(monkeypatch):
     assert "address the review" in out["task_text"]
 
 
+def test_load_context_appends_dependency_notes_from_env_var(monkeypatch):
+    monkeypatch.setenv(
+        "CLIPSE_DEPENDENCY_NOTES",
+        "## REF-5 (blocker) comments\n\n### coder handoff — done\n- schema uses integer epoch-ms timestamps",
+    )
+    out = coder.load_context({"issue_text": "Fix the bug."})
+    assert "Fix the bug." in out["task_text"]
+    assert "## Dependency notes (Linear comments)" in out["task_text"]
+    assert "schema uses integer epoch-ms timestamps" in out["task_text"]
+
+
+def test_load_context_dependency_notes_precede_review_feedback(monkeypatch):
+    # Dependency notes are background context; review feedback is the most
+    # actionable instruction and must stay last.
+    monkeypatch.setenv("CLIPSE_DEPENDENCY_NOTES", "blocker decision X")
+    out = coder.load_context({"issue_text": "Fix the bug.", "review_feedback": "remove the config section"})
+    task_text = out["task_text"]
+    assert task_text.index("blocker decision X") < task_text.index("remove the config section")
+
+
+def test_load_context_without_dependency_notes_is_unchanged(monkeypatch):
+    monkeypatch.delenv("CLIPSE_DEPENDENCY_NOTES", raising=False)
+    out = coder.load_context({"issue_text": "Fix the bug."})
+    assert out["task_text"] == "Fix the bug."
+
+
 def test_load_context_folds_both_prior_summary_and_review_feedback():
     out = coder.load_context(
         {

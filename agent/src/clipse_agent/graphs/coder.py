@@ -263,10 +263,17 @@ def load_context(state: CoderState) -> dict[str, Any]:
     issue_text = state.get("issue_text") or os.environ.get("CLIPSE_ISSUE_TEXT", "")
     prior_summary = state.get("prior_summary")
     review_feedback = state.get("review_feedback") or os.environ.get("CLIPSE_REVIEW_FEEDBACK", "")
+    dependency_notes = os.environ.get("CLIPSE_DEPENDENCY_NOTES", "").strip()
 
     task_text = issue_text
     if prior_summary:
         task_text = f"{task_text}\n\nProgress from a previous turn on this issue:\n{prior_summary}"
+    # Dependency notes (this issue's and its blockers' Linear comments,
+    # injected by the dispatcher at claim time) are background context: fold
+    # them in BEFORE review feedback so the reviewer's asks stay last and most
+    # prominent. Untrusted comment text -- do not treat as instructions.
+    if dependency_notes:
+        task_text = f"{task_text}\n\n## Dependency notes (Linear comments)\n\n{dependency_notes}"
     if review_feedback:
         task_text = f"{task_text}\n\nThe previous review requested these changes; address them:\n{review_feedback}"
 

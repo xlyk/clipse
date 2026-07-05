@@ -223,6 +223,16 @@ const clipseIssueTextEnvVar = "CLIPSE_ISSUE_TEXT"
 // sets it.
 const clipseReviewFeedbackEnvVar = "CLIPSE_REVIEW_FEEDBACK"
 
+// clipseDependencyNotesEnvVar carries a coder claim's dependency-comment
+// history into the worker: its blockers' Linear comments (the decisions the
+// ticket template tells a coder to read) plus its own (rework/continuation
+// context). Like CLIPSE_ISSUE_TEXT/CLIPSE_REVIEW_FEEDBACK it is injected
+// directly at spawn time, never sourced from the host environment, and only
+// for coder-lane spawns. graphs/coder.py load_context folds it into the DAC
+// prompt under a "Dependency notes" heading. Best-effort: a Linear fetch
+// failure leaves it unset rather than failing the spawn.
+const clipseDependencyNotesEnvVar = "CLIPSE_DEPENDENCY_NOTES"
+
 // issueText composes the worker-facing task text for issue: its title, plus
 // a blank-line-separated description when non-empty (just the title
 // otherwise). Trailing whitespace is stripped so a Linear issue with a

@@ -56,6 +56,22 @@ func TestBuildTeamWorkflowStatesRequest_ExactPayload(t *testing.T) {
 	assertJSONEqual(t, body, want)
 }
 
+func TestBuildIssueCommentsRequest_ExactPayload(t *testing.T) {
+	body, err := linear.BuildIssueCommentsRequest("issue-123")
+	if err != nil {
+		t.Fatalf("BuildIssueCommentsRequest: unexpected error: %v", err)
+	}
+
+	want := mustMarshal(t, gqlRequest{
+		Query: linear.IssueCommentsQuery,
+		Variables: map[string]any{
+			"id": "issue-123",
+		},
+	})
+
+	assertJSONEqual(t, body, want)
+}
+
 func TestBuildSetStateRequest_ExactPayload(t *testing.T) {
 	body, err := linear.BuildSetStateRequest("issue-123", "state-456")
 	if err != nil {

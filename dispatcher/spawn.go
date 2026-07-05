@@ -56,6 +56,16 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		env = append(env, clipseReviewFeedbackEnvVar+"="+reviewFeedback)
 	}
 
+	// The coder reads its blockers' and its own Linear comments at claim time
+	// (the read side of the handoff loop). Coder-lane only -- reviewers get the
+	// PR diff, not the thread. Best-effort: dependencyNotes returns "" on any
+	// fetch failure, so a slow Linear never fails the spawn.
+	if lane == string(contract.LaneCoder) {
+		if notes := d.dependencyNotes(ctx, issue); notes != "" {
+			env = append(env, clipseDependencyNotesEnvVar+"="+notes)
+		}
+	}
+
 	model, docsModel := d.modelsFor(lane)
 	modelParams, docsModelParams := d.modelParamsFor(lane)
 	spec := spawn.WorkerSpec{

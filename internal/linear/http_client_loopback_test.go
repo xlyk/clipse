@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/xlyk/clipse/internal/linear"
@@ -127,6 +128,48 @@ func TestHTTPClient_Comment_SendsExactBody(t *testing.T) {
 		t.Fatalf("BuildCommentRequest: unexpected error: %v", err)
 	}
 	assertJSONEqual(t, gotBody, want)
+}
+
+func TestHTTPClient_IssueComments_DecodesCannedResponse(t *testing.T) {
+	const resp = `{"data":{"issue":{"comments":{"nodes":[
+		{"body":"### coder handoff — done\n- schema uses integer epoch-ms timestamps","createdAt":"2026-07-01T00:00:00.000Z"},
+		{"body":"second comment","createdAt":"2026-07-02T00:00:00.000Z"}
+	]}}}}`
+
+	var gotBody []byte
+	c := newLoopbackClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = readAll(r)
+		if err != nil {
+			t.Fatalf("reading request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(resp))
+	})
+
+	comments, err := c.IssueComments(context.Background(), "issue-123")
+	if err != nil {
+		t.Fatalf("IssueComments: unexpected error: %v", err)
+	}
+
+	want, err := linear.BuildIssueCommentsRequest("issue-123")
+	if err != nil {
+		t.Fatalf("BuildIssueCommentsRequest: unexpected error: %v", err)
+	}
+	assertJSONEqual(t, gotBody, want)
+
+	if len(comments) != 2 {
+		t.Fatalf("len(comments) = %d, want 2", len(comments))
+	}
+	if !strings.Contains(comments[0].Body, "schema uses integer epoch-ms timestamps") {
+		t.Errorf("comments[0].Body = %q, want the handoff body", comments[0].Body)
+	}
+	if comments[0].CreatedAt != "2026-07-01T00:00:00.000Z" {
+		t.Errorf("comments[0].CreatedAt = %q, want the fixture timestamp", comments[0].CreatedAt)
+	}
+	if comments[1].Body != "second comment" {
+		t.Errorf("comments[1].Body = %q, want %q", comments[1].Body, "second comment")
+	}
 }
 
 func TestHTTPClient_GraphQLErrors_ReturnsError(t *testing.T) {
