@@ -79,6 +79,13 @@ class DacTurnResult:
     tokens_out: int
     interrupt_payload: list[Any] | None = None
     token_ceiling_exceeded: bool = False
+    # last_text is the text blocks of only the FINAL AIMessage (by message id)
+    # in the stream, whereas final_text concatenates every AIMessage's text
+    # across the whole turn. A consumer that parses a structured tail
+    # (STATUS/TITLE/HANDOFF) reads last_text so it never scrapes earlier
+    # narration; final_text stays the full-turn audit trail (checkpoint/PR
+    # body). Defaults to "" so callers that never set it are unaffected.
+    last_text: str = ""
 
 
 def build_coder_agent(
@@ -192,14 +199,21 @@ def _extract_interrupt_payload(data: dict[str, Any]) -> list[Any] | None:
 def _accumulate_message_chunk(
     data: tuple[Any, dict[str, Any]],
     text_parts: list[str],
+    last_message: dict[str, Any],
 ) -> tuple[int, int]:
     """Fold one `messages`-mode chunk's usage/text into the running turn.
 
-    Mutates `text_parts` in place with any text blocks found. Returns the
-    `(input_tokens, output_tokens)` this chunk contributes; always `(0,
-    0)` for anything that is not an `AIMessage` (e.g. a `ToolMessage`,
-    which has no `usage_metadata` and whose `content_blocks` are tool
-    output, not assistant text).
+    Mutates `text_parts` in place with any text blocks found (the whole
+    turn's text), and `last_message` (its `"id"`/`"parts"` keys) so that
+    only the FINAL AIMessage's text survives: streaming delivers one
+    logical message as several chunks sharing an id, so `parts` accumulates
+    across those, and resets whenever a chunk carrying a new message id
+    arrives. Returns the `(input_tokens, output_tokens)` this chunk
+    contributes; always `(0, 0)` for anything that is not an `AIMessage`
+    (e.g. a `ToolMessage`, which has no `usage_metadata` and whose
+    `content_blocks` are tool output, not assistant text -- and which never
+    touches `last_message`, so an interleaved tool result can't reset the
+    final message's accumulated text).
     """
     message_obj, _metadata = data
     if not isinstance(message_obj, AIMessage):
@@ -209,11 +223,17 @@ def _accumulate_message_chunk(
     tokens_in = usage.get("input_tokens", 0) or 0
     tokens_out = usage.get("output_tokens", 0) or 0
 
+    message_id = getattr(message_obj, "id", None)
+    if "parts" not in last_message or message_id != last_message.get("id"):
+        last_message["id"] = message_id
+        last_message["parts"] = []
+
     for block in getattr(message_obj, "content_blocks", None) or ():
         if isinstance(block, dict) and block.get("type") == "text":
             text = block.get("text", "")
             if text:
                 text_parts.append(text)
+                last_message["parts"].append(text)
 
     return tokens_in, tokens_out
 
@@ -265,6 +285,7 @@ async def drive_turn(
     tokens_in = 0
     tokens_out = 0
     text_parts: list[str] = []
+    last_message: dict[str, Any] = {}
     interrupt_payload: list[Any] | None = None
     token_ceiling_exceeded = False
 
@@ -280,7 +301,7 @@ async def drive_turn(
                 if payload is not None:
                     interrupt_payload = payload
             elif mode == "messages":
-                turn_in, turn_out = _accumulate_message_chunk(data, text_parts)
+                turn_in, turn_out = _accumulate_message_chunk(data, text_parts, last_message)
                 tokens_in += turn_in
                 tokens_out += turn_out
 
@@ -305,4 +326,5 @@ async def drive_turn(
         tokens_out=tokens_out,
         interrupt_payload=interrupt_payload,
         token_ceiling_exceeded=token_ceiling_exceeded,
+        last_text="".join(last_message.get("parts", [])),
     )

@@ -36,8 +36,11 @@ from clipse_agent.profiles.coder import get_coder_profile
 _CONFIG: dict[str, Any] = {"configurable": {"thread_id": "thread-1"}}
 
 
-def _ai_message(text: str, *, tokens_in: int, tokens_out: int) -> AIMessage:
+def _ai_message(
+    text: str, *, tokens_in: int, tokens_out: int, message_id: str | None = None
+) -> AIMessage:
     return AIMessage(
+        id=message_id,
         content=[{"type": "text", "text": text}],
         usage_metadata={
             "input_tokens": tokens_in,
@@ -507,6 +510,40 @@ def test_drive_turn_aggregates_tokens_and_text_across_chunks():
     assert result.tokens_in == 17
     assert result.tokens_out == 5
     assert result.final_text == "hello world"
+
+
+def test_drive_turn_last_text_is_final_message_only():
+    # last_text is the text of only the FINAL AIMessage (by id) in the stream,
+    # so a consumer parsing a structured tail never scrapes earlier narration.
+    # final_text keeps its all-text meaning (the whole turn's audit trail).
+    graph = _FakeAgentGraph(
+        [
+            ((), "messages", (_ai_message("Reading the ticket docs now.", tokens_in=3, tokens_out=1, message_id="m1"), {})),
+            ((), "messages", (ToolMessage(content="ran a search", tool_call_id="call-1"), {})),
+            ((), "messages", (_ai_message("STATUS: done\nTITLE: feat: add widget", tokens_in=2, tokens_out=2, message_id="m2"), {})),
+        ]
+    )
+
+    result = asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="t", max_tokens=None))
+
+    assert result.last_text == "STATUS: done\nTITLE: feat: add widget"
+    assert "Reading the ticket docs now." in result.final_text
+
+
+def test_drive_turn_last_text_concatenates_parts_of_the_same_final_message():
+    # Streaming delivers one logical message as several chunks sharing an id;
+    # last_text must join every part of the final message, not just the last chunk.
+    graph = _FakeAgentGraph(
+        [
+            ((), "messages", (_ai_message("earlier narration", tokens_in=1, tokens_out=1, message_id="m1"), {})),
+            ((), "messages", (_ai_message("STATUS: ", tokens_in=1, tokens_out=1, message_id="m2"), {})),
+            ((), "messages", (_ai_message("blocked: need a key", tokens_in=1, tokens_out=1, message_id="m2"), {})),
+        ]
+    )
+
+    result = asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="t", max_tokens=None))
+
+    assert result.last_text == "STATUS: blocked: need a key"
 
 
 def test_drive_turn_ignores_non_ai_messages():
