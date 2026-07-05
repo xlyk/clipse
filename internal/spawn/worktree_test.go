@@ -100,6 +100,57 @@ func TestEnsureWorktree_CreatesNewBranch(t *testing.T) {
 	}
 }
 
+// newRemoteAndClone builds a real "origin" repo (with an initial commit on
+// baseBranch) and a separate primary clone of it, mirroring the dispatcher's
+// managed-clone-with-a-remote topology. It returns both paths.
+func newRemoteAndClone(t *testing.T, baseBranch string) (origin, primary string) {
+	t.Helper()
+	origin = newPrimaryRepo(t, baseBranch)
+	parent := t.TempDir()
+	primary = filepath.Join(parent, "primary")
+	runGit(t, parent, "clone", origin, primary)
+	return origin, primary
+}
+
+// TestEnsureWorktree_BranchesFromFetchedRemoteBase asserts a new worktree is
+// branched from the REMOTE base tip (fetched at creation time), not the
+// primary clone's stale clone-time local base: a commit landing on origin's
+// base branch AFTER the clone must appear in a freshly-created worktree. The
+// Reflex build ran an external fast-forward cron as a workaround because the
+// kernel never fetched.
+func TestEnsureWorktree_BranchesFromFetchedRemoteBase(t *testing.T) {
+	origin, primary := newRemoteAndClone(t, "main")
+
+	// A commit on origin's main AFTER the clone, so the primary clone's local
+	// main is now stale relative to the remote.
+	writeFile(t, origin, "post-clone.txt", "landed after the clone\n")
+	runGit(t, origin, "add", "post-clone.txt")
+	runGit(t, origin, "commit", "-m", "post-clone change on origin main")
+	wantSHA := runGit(t, origin, "rev-parse", "HEAD")
+
+	worktreeRoot := t.TempDir()
+	path, err := spawn.EnsureWorktree(ctxWithTimeout(t), primary, "clp-1-fresh", "main", worktreeRoot)
+	if err != nil {
+		t.Fatalf("EnsureWorktree: unexpected error: %v", err)
+	}
+
+	if got := runGit(t, path, "rev-parse", "HEAD"); got != wantSHA {
+		t.Errorf("worktree HEAD = %q, want the post-clone origin tip %q (branched from stale local base?)", got, wantSHA)
+	}
+	if _, err := os.Stat(filepath.Join(path, "post-clone.txt")); err != nil {
+		t.Errorf("post-clone.txt missing from worktree: %v (worktree branched from stale local base)", err)
+	}
+}
+
+// writeFile writes name (relative to dir) with contents, failing the test on
+// error.
+func writeFile(t *testing.T, dir, name, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+		t.Fatalf("writing %s: %v", name, err)
+	}
+}
+
 // TestEnsureWorktree_ReusesExisting asserts a second EnsureWorktree call for
 // the same branch reuses the existing worktree: same path, no error, and no
 // duplicate worktree entry created.
