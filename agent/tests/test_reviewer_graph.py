@@ -893,6 +893,35 @@ def test_severity_passed_with_comments_routes_to_post_comments():
     assert reviewer.route_after_classify(state) == "post_comments"
 
 
+def test_severity_bare_changes_requested_with_no_parseable_findings_still_blocks():
+    # SAFETY-CRITICAL: an explicit CHANGES_REQUESTED whose findings are only
+    # unparseable prose must NOT pass. This is exactly the case that would
+    # silently flip to PASS if classify used the plan's literal `not blocking`
+    # (no findings -> `not [] == True`) instead of `bool(comments) and not
+    # blocking`. The verdict is present, so this is distinct from the
+    # missing-verdict fail-safe -- both must land as not-passed.
+    out = reviewer.classify({"dac_summary": "VERDICT: CHANGES_REQUESTED\nprose only, no parseable bullets"})
+    assert out["review_passed"] is False
+    assert out["review_comments"] == []
+
+
+def test_severity_prefix_is_case_insensitive():
+    # `re.IGNORECASE` + `.lower()` normalize any casing to the two canonical
+    # severities.
+    out = reviewer.classify(
+        {
+            "dac_summary": (
+                "VERDICT: CHANGES_REQUESTED\n"
+                "- NIT: app/x.pbxproj:12: tab width\n"
+                "- Blocking: src/a.py:3: null deref\n"
+            )
+        }
+    )
+    assert [c.severity for c in out["review_comments"]] == ["nit", "blocking"]
+    # a Blocking finding (any casing) still forces a rework cycle
+    assert out["review_passed"] is False
+
+
 # ---------------------------------------------------------------------------
 # route_after_dac / route_after_classify (pure)
 # ---------------------------------------------------------------------------
