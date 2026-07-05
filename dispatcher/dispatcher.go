@@ -80,6 +80,13 @@ type Dispatcher struct {
 	// subprocess.
 	gitOps GitOpsRunner
 
+	// gitOpsPreCheck runs the READ-ONLY PR pre-check runGitopsClaim performs
+	// from the primary clone before ensuring a worktree (a merged/missing PR
+	// short-circuits without resurrecting a hand-deleted worktree). Defaults to
+	// defaultGitOpsPreChecker (a real gitops.PreCheckPRState call); tests
+	// substitute a fake via WithGitOpsPreChecker.
+	gitOpsPreCheck GitOpsPreChecker
+
 	logger *slog.Logger
 
 	// pollInterval overrides the Tick interval Run uses when set (via
@@ -129,6 +136,14 @@ func WithGitOpsRunner(fn GitOpsRunner) Option {
 	return func(d *Dispatcher) { d.gitOps = fn }
 }
 
+// WithGitOpsPreChecker overrides the default read-only PR pre-checker (see
+// Dispatcher.gitOpsPreCheck). Tests use this to script whether the pre-check
+// resolves the pass (merged/missing PR) or falls through to the worktree run,
+// without touching a real gh subprocess.
+func WithGitOpsPreChecker(fn GitOpsPreChecker) Option {
+	return func(d *Dispatcher) { d.gitOpsPreCheck = fn }
+}
+
 // WithResultsBuffer overrides the default results channel buffer size.
 func WithResultsBuffer(n int) Option {
 	return func(d *Dispatcher) { d.results = make(chan runResult, n) }
@@ -146,18 +161,19 @@ const defaultResultsBuffer = 256
 // slog.Default()).
 func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spawner, ws Workspacer, opts ...Option) *Dispatcher {
 	d := &Dispatcher{
-		cfg:      cfg,
-		store:    st,
-		linear:   lc,
-		spawner:  spawner,
-		ws:       ws,
-		now:      func() int64 { return time.Now().Unix() },
-		newRunID: newRandomRunID,
-		envFor:   defaultEnvFor(cfg.EnvAllowlist),
-		gitOps:   defaultGitOpsRunner,
-		logger:   slog.Default(),
-		results:  make(chan runResult, defaultResultsBuffer),
-		inflight: make(map[string]inflightRun),
+		cfg:            cfg,
+		store:          st,
+		linear:         lc,
+		spawner:        spawner,
+		ws:             ws,
+		now:            func() int64 { return time.Now().Unix() },
+		newRunID:       newRandomRunID,
+		envFor:         defaultEnvFor(cfg.EnvAllowlist),
+		gitOps:         defaultGitOpsRunner,
+		gitOpsPreCheck: defaultGitOpsPreChecker,
+		logger:         slog.Default(),
+		results:        make(chan runResult, defaultResultsBuffer),
+		inflight:       make(map[string]inflightRun),
 	}
 	for _, opt := range opts {
 		opt(d)

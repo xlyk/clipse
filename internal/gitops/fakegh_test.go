@@ -39,6 +39,12 @@ pr)
 		already_merged)
 			echo '{"number":7,"url":"https://github.com/x/y/pull/7","state":"MERGED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN"}'
 			;;
+		no_pr)
+			# gh prints this to stderr with exit 1 when the branch has no PR
+			# (deleted after a manual merge, or never pushed).
+			echo 'no pull requests found for branch "clp-1-feature"' >&2
+			exit 1
+			;;
 		draft)
 			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"MERGEABLE","mergeStateStatus":"DRAFT","isDraft":true}'
 			;;

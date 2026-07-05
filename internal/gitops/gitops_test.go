@@ -414,6 +414,93 @@ func TestRun_NotMergeableRetriability(t *testing.T) {
 	}
 }
 
+// TestRun_NoPR_TerminalNotMergeable asserts a branch with no open PR --
+// gh's `no pull requests found` (the PR was deleted after a manual merge, or
+// the branch was never pushed) -- is a TERMINAL, non-retriable verdict, not
+// an infrastructure error. Returning an error here loops the merging claim
+// forever against a branch that can never grow a PR on its own (the Reflex
+// retro's zombie runs); OutcomeNotMergeable with Retriable=false parks it for
+// a human instead. Nothing after the failed `gh pr view` should run, and the
+// worktree is left intact.
+func TestRun_NoPR_TerminalNotMergeable(t *testing.T) {
+	spec, callLog := setupScenario(t, "no_pr")
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("Run: expected a Result, not an infrastructure error: %v", err)
+	}
+	if res.Outcome != OutcomeNotMergeable {
+		t.Fatalf("Run() Outcome = %q, want %q (Reason: %q)", res.Outcome, OutcomeNotMergeable, res.Reason)
+	}
+	if res.Retriable {
+		t.Errorf("Run() Retriable = true, want false (a missing PR is deterministic)")
+	}
+	if !strings.Contains(res.Reason, "no pull request exists") {
+		t.Errorf("Run() Reason = %q, want it to say no pull request exists", res.Reason)
+	}
+	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+
+	calls := readCallLog(t, callLog)
+	if got := countCallsWithPrefix(calls, "pr checks"); got != 0 {
+		t.Errorf("gh pr checks should never be called when no PR exists, calls: %v", calls)
+	}
+	if got := countCallsWithPrefix(calls, "pr merge"); got != 0 {
+		t.Errorf("gh pr merge should never be called when no PR exists, calls: %v", calls)
+	}
+}
+
+// TestPreCheckPRState_ReadOnlyClassification asserts the read-only pre-check
+// resolves only the two terminal states a worktree can't help with -- a
+// missing PR (terminal NotMergeable, non-retriable) and an already-merged PR
+// (OutcomeMerged) -- and falls through (resolved=false) for a normal open PR.
+// Crucially it is READ-ONLY: it issues a single `gh pr view` and never the
+// checks/merge/update-branch/ready calls Run makes, so it is safe to run from
+// the primary clone and leaves the worktree untouched.
+func TestPreCheckPRState_ReadOnlyClassification(t *testing.T) {
+	tests := []struct {
+		name         string
+		scenario     string
+		wantResolved bool
+		wantOutcome  Outcome
+	}{
+		{"missing PR parks", "no_pr", true, OutcomeNotMergeable},
+		{"already merged", "already_merged", true, OutcomeMerged},
+		{"open PR falls through", "mergeable", false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, callLog := setupScenario(t, tt.scenario)
+
+			res, resolved, err := PreCheckPRState(ctxWithTimeout(t), spec, nil)
+			if err != nil {
+				t.Fatalf("PreCheckPRState: unexpected error: %v", err)
+			}
+			if resolved != tt.wantResolved {
+				t.Fatalf("resolved = %v, want %v (Result: %+v)", resolved, tt.wantResolved, res)
+			}
+			if res.Outcome != tt.wantOutcome {
+				t.Errorf("Outcome = %q, want %q", res.Outcome, tt.wantOutcome)
+			}
+			if tt.scenario == "no_pr" {
+				if res.Retriable {
+					t.Errorf("Retriable = true, want false for a missing PR")
+				}
+				if !strings.Contains(res.Reason, "no pull request exists") {
+					t.Errorf("Reason = %q, want it to say no pull request exists", res.Reason)
+				}
+			}
+
+			calls := readCallLog(t, callLog)
+			for _, c := range calls {
+				if !strings.HasPrefix(c, "pr view") {
+					t.Errorf("pre-check made a non-read-only gh call %q (calls: %v)", c, calls)
+				}
+			}
+			assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+		})
+	}
+}
+
 // TestRun_MergeabilityUnknown_CIPending asserts GitHub's transient UNKNOWN
 // mergeability (the computation was invalidated -- typically by a concurrent
 // merge advancing the base -- and hasn't recomputed) short-circuits to

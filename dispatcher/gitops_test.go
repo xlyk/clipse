@@ -37,6 +37,7 @@ func TestTick_MergingClaim_Mergeable_RoutesToDone(t *testing.T) {
 		dispatcher.WithClock(fixedClock(1000)),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
@@ -83,6 +84,126 @@ func TestTick_MergingClaim_Mergeable_RoutesToDone(t *testing.T) {
 	}
 }
 
+// fallThroughPreCheck is a GitOpsPreChecker that never resolves, so a test
+// drives the full worktree pass through its WithGitOpsRunner stub exactly as
+// before the read-only pre-check existed (the pre-check only short-circuits a
+// merged or missing PR; every other card falls through to the worktree pass).
+func fallThroughPreCheck(context.Context, gitops.Spec) (gitops.Result, bool, error) {
+	return gitops.Result{}, false, nil
+}
+
+// TestTick_MergingClaim_NoPR_PreCheckParksWithoutWorktree asserts Task 5's
+// core ordering fix: the READ-ONLY PR pre-check runs from the PRIMARY CLONE
+// (Spec.Workspace == cfg.Repo.Path) BEFORE any worktree is ensured, and a
+// terminal verdict (here a missing PR) parks the card without ever calling
+// ws.Ensure or the full worktree pass. This is what stops a hand-deleted
+// worktree/branch from being resurrected every poll only to fail again at
+// `gh pr view` -- the Reflex retro's zombie runs.
+func TestTick_MergingClaim_NoPR_PreCheckParksWithoutWorktree(t *testing.T) {
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", "merging", 1, 100)
+
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	cfg := testConfig()
+
+	var preWorkspace string
+	preChecker := func(_ context.Context, spec gitops.Spec) (gitops.Result, bool, error) {
+		preWorkspace = spec.Workspace
+		return gitops.Result{Outcome: gitops.OutcomeNotMergeable, Retriable: false, Reason: "no pull request exists for branch issue-1-branch"}, true, nil
+	}
+	var fullPassCalls int
+	gitOpsFn := func(context.Context, gitops.Spec) (gitops.Result, error) {
+		fullPassCalls++
+		return gitops.Result{}, nil
+	}
+	d := dispatcher.New(cfg, s, lc, spawner, ws,
+		dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(preChecker),
+	)
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	if preWorkspace != cfg.Repo.Path {
+		t.Errorf("pre-check Spec.Workspace = %q, want the primary clone %q (never the worktree)", preWorkspace, cfg.Repo.Path)
+	}
+	if fullPassCalls != 0 {
+		t.Errorf("full gitops pass ran %d times, want 0 (a terminal pre-check resolves the pass with no worktree)", fullPassCalls)
+	}
+	if ensured := ws.EnsuredIssues(); len(ensured) != 0 {
+		t.Errorf("ws.Ensure called for %v, want no worktree ensured for a terminal pre-check", ensured)
+	}
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnBlocked) {
+		t.Errorf("BoardStatus = %q, want blocked", issue.BoardStatus)
+	}
+}
+
+// TestTick_MergingClaim_OpenPR_PreCheckFallsThroughToWorktreeMerge asserts the
+// read-only pre-check does NOT merge from the primary clone for an open,
+// unmerged PR: it falls through, ws.Ensure runs, and the full side-effecting
+// pass merges from the ISSUE WORKTREE (Spec.Workspace != primary clone),
+// carrying the issue identity for the squash subject. Merging from the primary
+// clone instead would leak the worktree/branch on every merge and drop the
+// squash subject -- the two Criticals this read-only redesign fixes.
+func TestTick_MergingClaim_OpenPR_PreCheckFallsThroughToWorktreeMerge(t *testing.T) {
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", "merging", 1, 100)
+
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	cfg := testConfig()
+
+	var fullPassSpec gitops.Spec
+	var fullPassCalls int
+	gitOpsFn := func(_ context.Context, spec gitops.Spec) (gitops.Result, error) {
+		fullPassCalls++
+		fullPassSpec = spec
+		return gitops.Result{Outcome: gitops.OutcomeMerged, PRURL: "https://github.com/x/y/pull/7", PRNumber: 7}, nil
+	}
+	d := dispatcher.New(cfg, s, lc, spawner, ws,
+		dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
+	)
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	if fullPassCalls != 1 {
+		t.Fatalf("full gitops pass ran %d times, want 1 (the pre-check falls through for an open PR)", fullPassCalls)
+	}
+	if ensured := ws.EnsuredIssues(); len(ensured) != 1 || ensured[0] != "issue-1" {
+		t.Fatalf("ws.Ensure calls = %v, want [issue-1] (an open PR merges via its own worktree)", ensured)
+	}
+	if fullPassSpec.Workspace == cfg.Repo.Path {
+		t.Errorf("full pass Spec.Workspace = primary clone %q, want the issue worktree (no merge/cleanup from the primary clone)", cfg.Repo.Path)
+	}
+	if fullPassSpec.IssueID != "issue-1" {
+		t.Errorf("full pass Spec.IssueID = %q, want issue-1 (worktree pass carries the squash-subject identity, unlike the pre-check)", fullPassSpec.IssueID)
+	}
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnDone) {
+		t.Errorf("BoardStatus = %q, want done", issue.BoardStatus)
+	}
+}
+
 // TestTick_MergingClaim_NotMergeable_Blocks asserts OutcomeNotMergeable maps
 // to a "blocked" outcome from merging, with a comment carrying gitops'
 // Reason.
@@ -102,6 +223,7 @@ func TestTick_MergingClaim_NotMergeable_Blocks(t *testing.T) {
 		dispatcher.WithClock(fixedClock(1000)),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
@@ -149,6 +271,7 @@ func TestTick_MergingClaim_NotMergeable_NonRetriable_ParksNeedsInput(t *testing.
 		dispatcher.WithClock(fixedClock(1000)),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
@@ -191,6 +314,7 @@ func TestTick_MergingClaim_NotMergeable_Retriable_MapsTransient(t *testing.T) {
 		dispatcher.WithClock(fixedClock(1000)),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
@@ -217,21 +341,41 @@ func TestTick_MergingClaim_StaleBaseConflict_RoutesToRework(t *testing.T) {
 	spawner := newFakeSpawner()
 	cfg := testConfig()
 
-	gitOpsFn := func(context.Context, gitops.Spec) (gitops.Result, error) {
+	// The conflict-file probe only names files from the PR-branch worktree;
+	// the primary clone is checked out on the base branch and would probe
+	// "already up to date" -> no files. Returning files only for a worktree
+	// workspace proves the full pass ran there, not from the primary clone
+	// (Critical 2: a primary-clone probe short-circuited rework with an EMPTY
+	// file list, so the coder got a conflict turn naming nothing).
+	var fullPassWorkspace string
+	gitOpsFn := func(_ context.Context, spec gitops.Spec) (gitops.Result, error) {
+		fullPassWorkspace = spec.Workspace
+		files := []string{"foo.go"}
+		if spec.Workspace == cfg.Repo.Path {
+			files = nil
+		}
 		return gitops.Result{
 			Outcome:          gitops.OutcomeStaleBaseConflict,
 			Reason:           "branch still conflicts with base main after gh pr update-branch",
-			ConflictingFiles: []string{"foo.go"},
+			ConflictingFiles: files,
 		}, nil
 	}
 	d := dispatcher.New(cfg, s, lc, spawner, ws,
 		dispatcher.WithClock(fixedClock(1000)),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	if ensured := ws.EnsuredIssues(); len(ensured) != 1 {
+		t.Fatalf("ws.Ensure calls = %v, want [issue-1] (a conflict falls through to the worktree pass)", ensured)
+	}
+	if fullPassWorkspace == cfg.Repo.Path {
+		t.Errorf("full pass Spec.Workspace = primary clone %q, want the issue worktree (the conflict probe needs it)", cfg.Repo.Path)
 	}
 
 	issue, err := s.GetIssue(context.Background(), "issue-1")
@@ -282,6 +426,7 @@ func TestTick_MergingClaim_CIPending_NoTransition(t *testing.T) {
 		dispatcher.WithClock(fixedClock(1000)),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
@@ -352,6 +497,7 @@ func TestTick_MergingClaim_CIPendingThenExpiresAndRechecksNextPoll(t *testing.T)
 		dispatcher.WithClock(clock),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
@@ -416,6 +562,7 @@ func TestTick_MergingClaim_RespectsGitOperatorAndGlobalCaps(t *testing.T) {
 		dispatcher.WithClock(fixedClock(1000)),
 		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
 		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
 	)
 
 	if err := d.Tick(context.Background()); err != nil {
