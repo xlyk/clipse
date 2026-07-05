@@ -52,6 +52,20 @@ func (d *Dispatcher) recoverOrphanRun(ctx context.Context, run store.Run) error 
 		return fmt.Errorf("loading issue %s: %w", run.IssueID, err)
 	}
 
+	if issue.BoardStatus == "done" || issue.BoardStatus == "cancelled" {
+		// The issue already finished; this run row is just restart debris.
+		// Blocking here would flap a terminal ticket back to blocked and
+		// mirror that to Linear (Reflex retro: done tickets un-done by every
+		// restart). Close the run and leave the issue alone. CloseRun's extra
+		// args (resultJSON/errStr/tokens) are empty here -- there is no worker
+		// result to record for leftover debris.
+		if err := d.store.CloseRun(ctx, run.RunID, "terminalized", "", "", 0, 0); err != nil {
+			return fmt.Errorf("terminalizing leftover run %s on %s issue %s: %w", run.RunID, issue.BoardStatus, issue.ID, err)
+		}
+		d.logger.Info("orphan run terminalized (issue already terminal)", "issue_id", issue.ID, "run_id", run.RunID, "board_status", issue.BoardStatus)
+		return nil
+	}
+
 	if run.Attempt >= d.cfg.MaxAttempts {
 		return d.blockOrphan(ctx, *issue, run)
 	}
