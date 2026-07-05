@@ -52,13 +52,26 @@ def parse_structured_tail(text: str) -> StructuredTail:
     status = ""
     blocked_reason = ""
     title = ""
+    handoff = ""
     handoff_lines: list[str] | None = None
+
+    def finalize_handoff() -> None:
+        # Snapshot the captured handoff into the result before releasing the
+        # accumulator, so a HANDOFF section is retained -- not discarded --
+        # when another KEY: line follows it out of order. The documented tail
+        # puts HANDOFF last, but a model may emit a trailing STATUS/TITLE, and
+        # Task 18 consumes this value; dropping it would lose a real note.
+        nonlocal handoff, handoff_lines
+        if handoff_lines is not None:
+            handoff = "\n".join(handoff_lines).strip()
+            handoff_lines = None
+
     for line in text.splitlines()[-40:]:
         match = _KEY_RE.match(line.strip())
         if match:
             key, value = match.group(1).upper(), match.group(2).strip()
             if key == "STATUS":
-                handoff_lines = None
+                finalize_handoff()
                 lowered = value.lower()
                 if lowered.startswith("blocked"):
                     status = "blocked"
@@ -67,11 +80,14 @@ def parse_structured_tail(text: str) -> StructuredTail:
                 elif lowered.startswith("done"):
                     status = "done"
             elif key == "TITLE":
-                handoff_lines = None
+                finalize_handoff()
                 title = value
             elif key == "HANDOFF":
+                # A repeated HANDOFF finalizes the prior section first, so the
+                # last occurrence wins (consistent with STATUS/TITLE).
+                finalize_handoff()
                 handoff_lines = [value] if value else []
         elif handoff_lines is not None:
             handoff_lines.append(line)
-    handoff = "\n".join(handoff_lines).strip() if handoff_lines else ""
+    finalize_handoff()
     return StructuredTail(status=status, blocked_reason=blocked_reason, title=title, handoff=handoff)
