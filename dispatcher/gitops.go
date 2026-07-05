@@ -128,7 +128,16 @@ func (d *Dispatcher) applyGitopsResult(ctx context.Context, issue store.Issue, r
 		summary := staleBaseConflictSummary(result)
 		return d.applyTerminalWorkerOutcome(ctx, issue, runID, lane, gitopsWorkerResult(base, result, contract.WorkerResultOutcomeChangesRequested, summary, nil))
 	case gitops.OutcomeNotMergeable:
-		bk := contract.BlockKindTransient
+		// gitops declares retriability per not-mergeable reason (see
+		// gitops.Result.Retriable): a deterministic verdict (failing required
+		// checks) parks as needs_input rather than burning identical retries
+		// (the Reflex build's 5-retries-per-ticket); a plausibly-transient one
+		// (unsatisfied protection, an unrecognized merge refusal) stays
+		// transient and eligible for bounded auto-retry.
+		bk := contract.BlockKindNeedsInput
+		if result.Retriable {
+			bk = contract.BlockKindTransient
+		}
 		return d.applyTerminalWorkerOutcome(ctx, issue, runID, lane, gitopsWorkerResult(base, result, contract.WorkerResultOutcomeBlocked, result.Reason, &bk))
 	default:
 		return fmt.Errorf("gitops returned unknown outcome %q for issue %s", result.Outcome, issue.ID)

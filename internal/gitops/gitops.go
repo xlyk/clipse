@@ -150,13 +150,23 @@ type Result struct {
 	// error).
 	PRURL    string `json:"pr_url,omitempty"`
 	PRNumber int    `json:"pr_number,omitempty"`
+
+	// Retriable reports whether an OutcomeNotMergeable could plausibly
+	// resolve on its own (true: e.g. a refused merge from a transient GitHub
+	// state, or unsatisfied protection fixable out of band) or is
+	// deterministic until a human or coder acts (false: failing required
+	// checks). The dispatcher maps false to a non-retrying block kind --
+	// re-running an identical merge gate against identical inputs burned 5
+	// retries per incident in the Reflex build.
+	Retriable bool `json:"retriable,omitempty"`
 }
 
 // notMergeable builds an OutcomeNotMergeable Result carrying view's PR
-// identity, so every not-mergeable path (failing/absent checks, unsatisfied
-// protection, a failed merge attempt) reports the same shape.
-func notMergeable(view prView, reason string) Result {
-	return Result{Outcome: OutcomeNotMergeable, Reason: reason, PRURL: view.URL, PRNumber: view.Number}
+// identity, so every not-mergeable path (failing checks, unsatisfied
+// protection, a failed merge attempt) reports the same shape. retriable says
+// whether a later poll could plausibly succeed without human/coder action.
+func notMergeable(view prView, reason string, retriable bool) Result {
+	return Result{Outcome: OutcomeNotMergeable, Reason: reason, PRURL: view.URL, PRNumber: view.Number, Retriable: retriable}
 }
 
 // Run executes one deterministic pass of the Git-operator lane against
@@ -213,7 +223,9 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 		}
 		// No CI on this repo by declaration: fall through to protection/merge.
 	case checksFailing:
-		return notMergeable(view, fmt.Sprintf("required checks failing: %s", joinNames(failing))), nil
+		// Deterministic: an identical re-check against identical inputs just
+		// re-fails. Park for a human/coder, don't auto-retry.
+		return notMergeable(view, fmt.Sprintf("required checks failing: %s", joinNames(failing)), false), nil
 	case checksPending:
 		return Result{Outcome: OutcomeCIPending, PRURL: view.URL, PRNumber: view.Number}, nil
 	}
@@ -224,7 +236,9 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 		return Result{}, fmt.Errorf("gitops: checking branch protection for %s: %w", spec.BaseBranch, err)
 	}
 	if !protectionOK {
-		return notMergeable(view, fmt.Sprintf("branch protection unsatisfied for %s: %s", spec.BaseBranch, protectionReason)), nil
+		// Protection can be fixed out of band (a rule toggled, a required
+		// review added) and is cheap to re-check, so this is retriable.
+		return notMergeable(view, fmt.Sprintf("branch protection unsatisfied for %s: %s", spec.BaseBranch, protectionReason), true), nil
 	}
 
 	if mergeabilityUnknown(view) {
@@ -272,7 +286,9 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 			// PR that just needed a couple more minutes.
 			return Result{Outcome: OutcomeCIPending, PRURL: view.URL, PRNumber: view.Number}, nil
 		}
-		return notMergeable(view, fmt.Sprintf("gh pr merge failed: %s", reason)), nil
+		// A merge refusal mergeNotReady didn't recognize: the state may still
+		// shift under us, so let a later poll retry rather than park outright.
+		return notMergeable(view, fmt.Sprintf("gh pr merge failed: %s", reason), true), nil
 	}
 
 	if spec.Tag != "" {
