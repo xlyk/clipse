@@ -785,6 +785,26 @@ def test_main_tolerates_missing_args_via_the_real_graph(capsys):
     assert result.lane == Lane.coder
 
 
+# ---------------------------------------------------------------------------
+# handoff: optional WorkerResult field (Task 17). Omitted from the dumped JSON
+# when None, present when set -- exactly how the dispatcher decides whether to
+# post a handoff Linear comment (Task 19).
+# ---------------------------------------------------------------------------
+
+
+def test_worker_result_handoff_omitted_when_none():
+    result = _canned_result()
+    assert result.handoff is None
+    dumped = json.loads(result.model_dump_json(exclude_none=True))
+    assert "handoff" not in dumped
+
+
+def test_worker_result_handoff_included_when_set():
+    result = _canned_result(handoff="- chose drop semantics\n- added Widget.build")
+    dumped = json.loads(result.model_dump_json(exclude_none=True))
+    assert dumped["handoff"] == "- chose drop semantics\n- added Widget.build"
+
+
 def test_clipse_worker_module_emits_exactly_one_valid_json_line_with_no_args():
     proc = subprocess.run(
         [sys.executable, "-m", "clipse_agent.worker"],

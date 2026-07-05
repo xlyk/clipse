@@ -123,6 +123,11 @@ type WorkerResult struct {
 	// Present iff outcome == "blocked"; omitted otherwise.
 	BlockKind *BlockKind `json:"block_kind,omitempty,omitzero" yaml:"block_kind,omitempty" mapstructure:"block_kind,omitempty"`
 
+	// Structured handoff note for the issue's Linear thread: decisions, interfaces,
+	// deviations, gotchas for dependents. Optional; present only when the lane
+	// produced one.
+	Handoff *string `json:"handoff,omitempty,omitzero" yaml:"handoff,omitempty" mapstructure:"handoff,omitempty"`
+
 	// Linear issue identifier this run is working.
 	IssueId string `json:"issue_id" yaml:"issue_id" mapstructure:"issue_id"`
 

@@ -99,6 +99,10 @@ class WorkerResult(BaseModel):
     pr_url: str | None = Field(
         None, description='URL of the PR opened/updated this turn, if any. Optional.'
     )
+    handoff: str | None = Field(
+        None,
+        description="Structured handoff note for the issue's Linear thread: decisions, interfaces, deviations, gotchas for dependents. Optional; present only when the lane produced one.",
+    )
     thread_id: str = Field(
         ...,
         description='LangGraph checkpointer thread id, for resuming continuation turns.',
