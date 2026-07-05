@@ -72,13 +72,26 @@ func run() error {
 		return err
 	}
 
+	// The "pwd" scenario reports the worker process's working directory in
+	// Summary so a spawn test can assert the Spawner ran it in the issue
+	// worktree (cmd.Dir), not the dispatcher's own cwd (see
+	// internal/spawn.LocalSpawner.Spawn and TestLocalSpawner_RunsInWorkspaceDir).
+	summary := fmt.Sprintf("testworker scenario %q", scenario)
+	if scenario == "pwd" {
+		wd, wdErr := os.Getwd()
+		if wdErr != nil {
+			return fmt.Errorf("testworker pwd: reading working directory: %w", wdErr)
+		}
+		summary = wd
+	}
+
 	result := contract.WorkerResult{
 		RunId:     runID,
 		IssueId:   issue,
 		Lane:      contract.Lane(lane),
 		Outcome:   outcome,
 		BlockKind: blockKind,
-		Summary:   fmt.Sprintf("testworker scenario %q", scenario),
+		Summary:   summary,
 		Artifacts: []string{},
 		ThreadId:  thread,
 		TurnCount: 1,
@@ -96,7 +109,7 @@ func run() error {
 // emit. block_kind is set iff outcome is "blocked" (schema requirement).
 func outcomeFor(scenario string) (contract.WorkerResultOutcome, *contract.BlockKind, error) {
 	switch scenario {
-	case "done":
+	case "done", "pwd":
 		return contract.WorkerResultOutcomeDone, nil, nil
 	case "needs_review":
 		return contract.WorkerResultOutcomeNeedsReview, nil, nil
