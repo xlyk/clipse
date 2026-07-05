@@ -73,6 +73,17 @@ def test_key_line_after_handoff_terminates_its_capture():
     assert "STATUS" not in tail.handoff
 
 
+def test_handoff_is_retained_when_a_later_key_line_follows_it():
+    # A STATUS/TITLE line after HANDOFF terminates the capture but must NOT
+    # discard it: the captured handoff body survives to the result even when
+    # the model emits keys out of the documented order. Task 18 now consumes
+    # tail.handoff, so a silently-dropped handoff would lose a real note.
+    text = "HANDOFF:\n- chose drop semantics\n- added Widget.build\nSTATUS: done"
+    tail = parse_structured_tail(text)
+    assert tail.status == "done"
+    assert tail.handoff == "- chose drop semantics\n- added Widget.build"
+
+
 def test_handoff_inline_value_on_key_line():
     tail = parse_structured_tail("HANDOFF: single inline note")
     assert tail.handoff == "single inline note"
