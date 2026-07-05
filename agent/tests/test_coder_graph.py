@@ -298,6 +298,81 @@ def test_happy_path_runs_full_node_order_and_emits_needs_review(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# handoff (Task 18): emit_result surfaces the HANDOFF tail on WorkerResult so
+# the dispatcher can post it as a Linear comment (Task 19). Capped at 4000
+# chars; None when the tail carried no handoff.
+# ---------------------------------------------------------------------------
+
+
+def test_emit_result_sets_handoff_from_tail_on_needs_review(tmp_path):
+    runner = _base_runner()
+    code_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Implemented the widget factory.",
+        tokens_in=10,
+        tokens_out=5,
+        last_text=(
+            "Done.\n\n"
+            "STATUS: done\n"
+            "TITLE: feat: add widget factory\n"
+            "HANDOFF:\n"
+            "- chose drop semantics for the queue\n"
+            "- added Widget.build(spec) -> Widget"
+        ),
+    )
+    docs_result = DacTurnResult(outcome_hint="completed", final_text="docs", tokens_in=1, tokens_out=1)
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver_by_turn(code_result, docs_result, []),
+        run_command=runner,
+    )
+
+    _, result = asyncio.run(
+        _drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}})
+    )
+
+    assert result.outcome == Outcome.needs_review
+    assert result.handoff == ("- chose drop semantics for the queue\n- added Widget.build(spec) -> Widget")
+
+
+def test_emit_result_handoff_is_none_when_tail_has_no_handoff(tmp_path):
+    runner = _base_runner()
+    code_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Implemented it.",
+        tokens_in=10,
+        tokens_out=5,
+        last_text="STATUS: done\nTITLE: feat: add widget factory",
+    )
+    docs_result = DacTurnResult(outcome_hint="completed", final_text="docs", tokens_in=1, tokens_out=1)
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver_by_turn(code_result, docs_result, []),
+        run_command=runner,
+    )
+
+    _, result = asyncio.run(
+        _drive(graph, _needs_review_input(tmp_path), {"configurable": {"thread_id": "thread-docs"}})
+    )
+
+    assert result.handoff is None
+
+
+def test_emit_result_caps_handoff_at_4000_chars():
+    # A runaway HANDOFF section can't bloat the Linear comment: cap it.
+    long_body = "x" * 5000
+    state = {
+        "run_id": "run-1",
+        "issue_id": "SPAC-1",
+        "thread_id": "thread-1",
+        "dac_last_text": f"STATUS: done\nHANDOFF:\n{long_body}",
+    }
+    result = coder.emit_result(state)["result"]
+    assert result.handoff is not None
+    assert len(result.handoff) == 4000
+
+
+# ---------------------------------------------------------------------------
 # Documentation node: best-effort (never blocks the PR), clean-path only
 # ---------------------------------------------------------------------------
 

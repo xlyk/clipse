@@ -928,6 +928,13 @@ def emit_result(state: CoderState) -> dict[str, Any]:
     tokens_out = state.get("tokens_out", 0) + state.get("doc_tokens_out", 0)
     tokens = Tokens(**{"in": tokens_in, "out": tokens_out})
     turn_count = state.get("turn_count", 0) + 1
+    interrupt_payload = state.get("interrupt_payload")
+    tail = parse_structured_tail(state.get("dac_last_text") or "")
+    # Surface the STATUS/TITLE/HANDOFF tail's handoff note (decisions,
+    # interfaces, gotchas for dependents) on every terminal result so the
+    # dispatcher can post it as a Linear comment. Capped so a runaway section
+    # can't bloat the comment; None when the coder produced no handoff.
+    handoff = tail.handoff[:4000] or None
     common: dict[str, Any] = {
         "run_id": state["run_id"],
         "issue_id": state["issue_id"],
@@ -935,10 +942,8 @@ def emit_result(state: CoderState) -> dict[str, Any]:
         "thread_id": state["thread_id"],
         "turn_count": turn_count,
         "tokens": tokens,
+        "handoff": handoff,
     }
-
-    interrupt_payload = state.get("interrupt_payload")
-    tail = parse_structured_tail(state.get("dac_last_text") or "")
     if state.get("token_ceiling_exceeded"):
         result = WorkerResult(
             **common,
