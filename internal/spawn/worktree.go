@@ -46,7 +46,17 @@ func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, w
 	if branchExistsLocally {
 		args = []string{"worktree", "add", path, branch}
 	} else {
-		args = []string{"worktree", "add", "-b", branch, path, baseBranch}
+		// Branch from the REMOTE base tip, not the local ref: the primary
+		// clone's local base only advances when something fetches it, and
+		// nothing in the kernel did -- the Reflex build ran an external
+		// fast-forward cron as a workaround, so dependents kept building on a
+		// stale base. A fetch failure (offline dev, no reachable remote)
+		// falls back to the local ref rather than failing the spawn.
+		base := baseBranch
+		if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", baseBranch); err == nil {
+			base = "origin/" + baseBranch
+		}
+		args = []string{"worktree", "add", "-b", branch, path, base}
 	}
 	if err := runGitCmd(ctx, primaryClonePath, args...); err != nil {
 		if !isMissingButRegisteredWorktreeErr(err) {
