@@ -106,6 +106,34 @@ func TestFetchChecks_NonZeroExitWithNoOutputIsError(t *testing.T) {
 	}
 }
 
+// TestFetchChecks_NoChecksReportedIsAbsent asserts gh's other "no checks"
+// shape -- exit 1 with EMPTY stdout and a "no checks reported on the
+// '<branch>' branch" stderr, distinct from the documented "[]" stdout -- is
+// treated as zero checks (absent), not an error. On a repo whose CI
+// registers late, gh emits this form on every PR until the first check
+// registers; erroring here loops the merging claim forever (Reflex retro,
+// failure category 1).
+func TestFetchChecks_NoChecksReportedIsAbsent(t *testing.T) {
+	runner := fakeRunner(CommandResult{ExitCode: 1, Stdout: "", Stderr: "no checks reported on the 'kylehanks/ref-1-x' branch"}, nil)
+	checks, err := fetchChecks(context.Background(), Spec{Branch: "clp-1"}, runner)
+	if err != nil {
+		t.Fatalf("fetchChecks: expected no error for 'no checks reported', got: %v", err)
+	}
+	if len(checks) != 0 {
+		t.Errorf("fetchChecks() = %+v, want zero checks", checks)
+	}
+}
+
+// TestFetchChecks_EmptyStdoutOtherErrorStillFails asserts any other
+// empty-stdout failure (without the no-checks marker) is still surfaced as an
+// error, so a genuine gh outage isn't silently read as "no checks".
+func TestFetchChecks_EmptyStdoutOtherErrorStillFails(t *testing.T) {
+	runner := fakeRunner(CommandResult{ExitCode: 1, Stdout: "", Stderr: "gh: connection refused"}, nil)
+	if _, err := fetchChecks(context.Background(), Spec{Branch: "clp-1"}, runner); err == nil {
+		t.Fatal("fetchChecks: expected an error for empty stdout without the no-checks marker")
+	}
+}
+
 // TestFetchChecks_MalformedJSONIsError asserts unparseable stdout is
 // surfaced as an error rather than swallowed.
 func TestFetchChecks_MalformedJSONIsError(t *testing.T) {

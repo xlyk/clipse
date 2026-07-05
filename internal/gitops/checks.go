@@ -85,6 +85,16 @@ func fetchChecks(ctx context.Context, spec Spec, runner CommandRunner) ([]ghChec
 
 	stdout := strings.TrimSpace(res.Stdout)
 	if stdout == "" {
+		// gh prints "no checks reported on the '<branch>' branch" to stderr
+		// with exit 1 and NO stdout when a branch has zero checks -- distinct
+		// from the documented "[]" stdout case, but the same meaning: no
+		// required checks exist (yet). Observed on every PR of a repo whose CI
+		// registers late; treating it as an error loops the merging claim
+		// forever (Reflex retro, failure category 1). Any other empty-stdout
+		// failure (a real gh outage) still errors.
+		if strings.Contains(res.Stderr, "no checks reported") {
+			return []ghCheck{}, nil
+		}
 		return nil, fmt.Errorf("gh pr checks %s: exit %d: %s", spec.Branch, res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 
