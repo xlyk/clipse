@@ -920,7 +920,9 @@ def test_drive_turn_emits_error_turn_end_before_raising_on_mid_stream_failure():
     # Amendment 1: a turn that dies mid-stream must not go silent in the
     # transcript -- postmortems are the whole point of this feature. The
     # sink is assumed never to raise, so emitting here cannot mask the
-    # original exception, which must still surface as DacError.
+    # original exception, which must still surface as DacError. The
+    # still-pending partial message is flushed FIRST: whatever the agent
+    # said or called right before the crash is prime postmortem material.
     graph = _FakeAgentGraph(
         [
             ((), "messages", (_ai_message("working", tokens_in=1, tokens_out=1), {})),
@@ -934,6 +936,7 @@ def test_drive_turn_emits_error_turn_end_before_raising_on_mid_stream_failure():
             dac.drive_turn(graph, _CONFIG, task_text="go", max_tokens=None, event_sink=events.append)
         )
 
+    assert events[-2] == {"event": "assistant", "text": "working"}
     assert events[-1] == {"event": "turn_end", "error": "boom from langgraph"}
 
 

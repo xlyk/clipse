@@ -632,18 +632,22 @@ def make_run_docs(
     """
 
     async def _node(state: CoderState) -> dict[str, Any]:
-        event_sink = (
-            transcript.bind(
-                lane="coder_docs",
-                run_id=state["run_id"],
-                thread_id=state["thread_id"],
-                assistant_id=profile.assistant_id,
-                model=profile.model,
-            )
-            if transcript is not None
-            else None
-        )
+        # The bind sits INSIDE the docs-never-block try: it reads state keys
+        # that are optional at the TypedDict level (total=False), and a
+        # KeyError here must degrade to a skipped docs step like any other
+        # docs-turn failure, never block the PR.
         try:
+            event_sink = (
+                transcript.bind(
+                    lane="coder_docs",
+                    run_id=state["run_id"],
+                    thread_id=state["thread_id"],
+                    assistant_id=profile.assistant_id,
+                    model=profile.model,
+                )
+                if transcript is not None
+                else None
+            )
             agent_graph, _backend = agent_factory(profile, checkpointer, state["cwd"])
             turn_result = await turn_driver(
                 agent_graph,

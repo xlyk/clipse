@@ -82,12 +82,14 @@ OutcomeHint = Literal["completed", "interrupted"]
 # event and never raises -- drive_turn does not wrap event_sink calls itself.
 EventSink = Callable[[dict[str, Any]], None]
 
-# Shared cap for any free-form text a transcript event carries -- a
-# ToolMessage's `content` and an assistant message's accumulated `text`
-# alike (2026-07-07 controller amendment: one constant, not two). Generous
-# enough to keep a shell command's real output/error or a long narration
-# legible in the transcript, small enough that one runaway value can't
-# balloon the per-issue transcript file.
+# Shared cap for the two transcript fields that can balloon per-message: an
+# `assistant` event's accumulated text and a `tool_result` event's content
+# (2026-07-07 controller amendment: one constant, not two). The other
+# free-form fields -- `turn_start.task_text` and `interrupt.payload` -- ride
+# uncapped deliberately: each appears at most once per turn and is normally
+# small (an issue body, an ask-user prompt). Generous enough to keep a shell
+# command's real output/error or a long narration legible in the transcript,
+# small enough that one runaway value can't balloon the per-issue file.
 _TRANSCRIPT_TEXT_LIMIT = 8_000
 
 
@@ -395,12 +397,13 @@ async def drive_turn(
     message (flushed on a message-id transition or at stream end -- see
     `_flush_pending`); `tool_result` per `ToolMessage`; `interrupt` when one
     is detected; and `turn_end` (`outcome_hint`, `tokens_in`, `tokens_out`)
-    once the stream ends normally. A turn that dies mid-stream still emits a
-    best-effort `turn_end` carrying only `error` (`str(exc)`) before the
-    `DacError` is raised -- `event_sink` is assumed not to raise (its real
-    caller, `TranscriptWriter.bind`'s returned sink, already swallows
-    everything), so this cannot mask the original exception; `drive_turn`
-    does not wrap any other sink call in its own try/except.
+    once the stream ends normally. A turn that dies mid-stream first flushes
+    the still-pending partial message (its `assistant`/`tool_call` events),
+    then emits a best-effort `turn_end` carrying only `error` (`str(exc)`)
+    before the `DacError` is raised -- `event_sink` is assumed not to raise
+    (its real caller, `TranscriptWriter.bind`'s returned sink, already
+    swallows everything), so this cannot mask the original exception;
+    `drive_turn` does not wrap any other sink call in its own try/except.
 
     Raises:
         ValueError: if `task_text`/`resume` are both or neither given.
@@ -449,8 +452,12 @@ async def drive_turn(
                     break
     except Exception as exc:
         # Controller amendment (2026-07-07): a crashed turn must still leave
-        # a trace -- postmortems are the feature's whole point. event_sink
-        # is assumed not to raise (see docstring), so this cannot mask exc.
+        # a trace -- postmortems are the feature's whole point. Flush the
+        # still-pending partial message first, so assistant text/tool calls
+        # streamed right before the crash land in the transcript (prime
+        # postmortem material), then mark the turn dead. event_sink is
+        # assumed not to raise (see docstring), so this cannot mask exc.
+        _flush_pending(event_sink, last_message)
         if event_sink is not None:
             event_sink({"event": "turn_end", "error": str(exc)})
         thread_id = config.get("configurable", {}).get("thread_id")
