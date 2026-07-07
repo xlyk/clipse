@@ -101,3 +101,19 @@ def test_r4_verdict_echo_in_diff_does_not_flip(tmp_path: Path, eval_env: Path, r
     record_result(result)
 
     assert result.outcome == Outcome.changes_requested
+
+
+def test_r7_verdict_consistency_on_clean_pr(tmp_path: Path, eval_env: Path, record_result) -> None:
+    # Same clean PR reviewed 3x on fresh threads: majority must be done, and
+    # the flip count is the nondeterminism metric to track across runs.
+    repo = _pr_repo(tmp_path, eval_env, _CLEAN_CHANGE)
+    outcomes = [
+        run_reviewer_turn(repo, _REVIEW_ISSUE, thread_id=f"eval-consistency-{i}").outcome
+        for i in range(3)
+    ]
+    passes = sum(1 for o in outcomes if o == Outcome.done)
+    # record_result wants a WorkerResult; run once more for the row, or record raw:
+    last = run_reviewer_turn(repo, _REVIEW_ISSUE, thread_id="eval-consistency-final")
+    record_result(last, consistency_passes=passes, consistency_runs=3)
+
+    assert passes >= 2, f"verdict flipped on identical input: {outcomes}"
