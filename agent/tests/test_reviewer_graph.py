@@ -514,6 +514,57 @@ def test_post_comments_inline_422_degrades_to_summary() -> None:
     assert "a.py:3" in body and "off-by-one" in body
 
 
+def test_post_comments_summary_post_failure_does_not_raise() -> None:
+    # A rate-limited or otherwise-failing `gh pr comment` for the summary must
+    # not raise -- the verdict already reaches the kernel via this run's
+    # typed JSON result, so a failed summary post is a best-effort miss, not
+    # a run failure.
+    pr_json = json.dumps({"number": 7, "headRefOid": "abc123", "url": "https://x/pull/7"})
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(0, pr_json, "")),
+            (_starts_with("gh", "pr", "comment"), coder.CommandResult(1, "", "rate limited")),
+        ]
+    )
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "dac_summary": "found problems",
+            "review_comments": [reviewer.InlineComment(path="a.py", line=3, body="off-by-one")],
+        }
+    )
+    # No exception, and the dict shape is unchanged despite the failed post.
+    assert out["pr_url"] == "https://x/pull/7"
+    assert out["comments_posted"] == 1
+    assert out["comments_failed"] == 0
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
+
+
+def test_post_comments_summary_body_is_truncated_to_github_safe_cap() -> None:
+    # `_changes_summary` concatenates an unbounded dac_summary; GitHub caps a
+    # comment body at 65,536 chars, so an oversized body must be capped
+    # before it reaches `gh pr comment` argv.
+    pr_json = json.dumps({"number": 7, "headRefOid": "abc123", "url": "https://x/pull/7"})
+    runner = FakeRunner(rules=[(_starts_with("gh", "pr", "view"), coder.CommandResult(0, pr_json, ""))])
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "dac_summary": "x" * 100_000,
+            "review_comments": [],
+        }
+    )
+    assert out["pr_url"] == "https://x/pull/7"
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
+    body = comment_calls[0].argv[comment_calls[0].argv.index("--body") + 1]
+    assert len(body) <= reviewer._MAX_COMMENT_CHARS
+
+
 # ---------------------------------------------------------------------------
 # Missing/unparseable verdict -> conservative changes_requested, never PASS
 # ---------------------------------------------------------------------------
@@ -1141,6 +1192,32 @@ def test_emit_result_changes_requested_summary_carries_failed_findings() -> None
     summary = out["result"].summary
     assert "Posted 1 inline comment(s)." in summary
     assert "a.py:3: off-by-one" in summary
+
+
+def test_emit_result_changes_requested_summary_does_not_overclaim_posted_when_no_pr() -> None:
+    # The no-PR path (post_comments' honest early return) sets
+    # comments_posted=0 while review_comments (from classify) is still
+    # non-empty -- the summary must say "Posted 0", never fall back to
+    # len(review_comments) and claim comments that were never posted. This
+    # text feeds CLIPSE_REVIEW_FEEDBACK on a later rework turn.
+    state: reviewer.ReviewerState = {
+        "run_id": "r1",
+        "issue_id": "i1",
+        "thread_id": "t1",
+        "dac_summary": "found problems",
+        "review_passed": False,
+        "review_comments": [
+            reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+            reviewer.InlineComment(path="b.py", line=9, body="unused import"),
+        ],
+        "comments_posted": 0,
+        "comments_failed": 0,
+        "failed_comments": [],
+    }
+    out = reviewer.emit_result(state)
+    summary = out["result"].summary
+    assert "Posted 2" not in summary
+    assert "Posted 0 inline comment(s)." in summary
 
 
 def test_emit_result_blocked_needs_input_shape():

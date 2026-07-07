@@ -366,6 +366,13 @@ def route_after_dac(state: ReviewerState) -> str:
 _VERDICT_PASS = "PASS"
 
 _VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(PASS|CHANGES_REQUESTED)\b", re.IGNORECASE | re.MULTILINE)
+# Severity comes FIRST when present (`- blocking: path:line: body` / `- nit:
+# path:line: body`, per profiles/reviewer.py's system prompt). A misordered
+# bullet (e.g. `- path:line: nit: body`) doesn't match the optional severity
+# group here, so it parses as a severity-default "blocking" finding instead
+# (see `_parse_inline_comments`) -- conservative, since it can veto a PASS,
+# but intended: a model that mangles the protocol's word order must never
+# accidentally downgrade a real finding to a nit.
 _INLINE_COMMENT_RE = re.compile(r"^-\s*(?:(blocking|nit):\s*)?([^\s:]+):(\d+):\s*(.+)$", re.IGNORECASE)
 
 
@@ -384,14 +391,14 @@ def _find_verdict(text: str) -> re.Match[str] | None:
     return matches[-1] if matches else None
 
 
-def _parse_inline_comments(dac_summary: str, start: int) -> list[InlineComment]:
+def _parse_inline_comments(source: str, start: int) -> list[InlineComment]:
     """Parse `- path:line: body` bullet lines appearing at or after `start`
     (the verdict match's end) into structured `InlineComment`s. Only text
     after the verdict is scanned, so a bullet line elsewhere in the model's
     own reasoning can never be mistaken for a review finding.
     """
     comments: list[InlineComment] = []
-    for line in dac_summary[start:].splitlines():
+    for line in source[start:].splitlines():
         match = _INLINE_COMMENT_RE.match(line.strip())
         if match:
             severity_raw, path, line_no, body = match.groups()
@@ -458,6 +465,12 @@ def route_after_classify(state: ReviewerState) -> str:
 # ---------------------------------------------------------------------------
 # post_comments
 # ---------------------------------------------------------------------------
+
+# GitHub caps a comment body at 65,536 chars; `_changes_summary` concatenates
+# an unbounded `dac_summary` plus every failed finding's body, so an oversized
+# summary must be capped before it ever reaches `gh pr comment` (which would
+# otherwise 422 on the entire summary post, losing it).
+_MAX_COMMENT_CHARS = 60_000
 
 
 def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], dict[str, Any]]:
@@ -535,10 +548,18 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
             else:
                 failed.append(comment)
 
+        body = _changes_summary(state, failed)
+        if len(body) > _MAX_COMMENT_CHARS:
+            body = body[:_MAX_COMMENT_CHARS]
+        # check=False: GitHub's own body cap, a rate limit, or any other
+        # transient gh failure here must not raise -- the verdict already
+        # reaches the kernel via this run's typed JSON result (emit_result),
+        # so a failed summary post is a best-effort miss, not a run failure.
         _run(
             run_command,
-            ["gh", "pr", "comment", branch, "--body", _changes_summary(state, failed)],
+            ["gh", "pr", "comment", branch, "--body", body],
             cwd,
+            check=False,
         )
 
         return {
@@ -578,7 +599,16 @@ def _changes_summary(state: ReviewerState, failed: Sequence[InlineComment] = ())
     comments = state.get("review_comments") or []
     parts = [dac_summary] if dac_summary else []
     if comments:
-        parts.append(f"Posted {len(comments) - len(failed)} inline comment(s).")
+        # Prefer the actual posted count once `post_comments` has run (e.g.
+        # the no-PR path sets `comments_posted=0` even though `comments` is
+        # non-empty). Fall back to the len(comments) - len(failed) arithmetic
+        # for a pre-existing checkpointed state that never had the key, or
+        # for the call inside `make_post_comments` itself, made before that
+        # dict is merged back into state.
+        posted = state.get("comments_posted")
+        if posted is None:
+            posted = len(comments) - len(failed)
+        parts.append(f"Posted {posted} inline comment(s).")
     if failed:
         listed = "\n".join(f"- {c.path}:{c.line}: {c.body}" for c in failed)
         parts.append(
