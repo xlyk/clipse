@@ -1658,3 +1658,291 @@ gh pr create --draft --title "agent evals: live behavioral suite + reviewer fixe
 ```
 
 PR body: link this plan, list the two reviewer fixes, the 14 live cases + self-test, the deferred list, and the observed cost/wall-time of one full run.
+
+---
+
+# Appendix (2026-07-07): per-lane shell policy, default `all`
+
+Approved mid-execution: reflex production logs show 55 allow-list rejections across 25 issues — dominated by `2>&1`/redirect patterns and env-prefix commands that DAC's `contains_dangerous_patterns` rejects for ANY restrictive list, plus missing binaries (`just`, `xcodebuild`, `head`, `tail`, `which`). The fix is a per-lane `shell_allow_list` config knob whose default is the sentinel `all`: the worker then builds its DAC agent with `auto_approve=True` (DAC's only unrestricted path — verified: it installs no `ShellAllowListMiddleware`, skips pattern checks, sets `interrupt_on={}` exactly as the current config already does, and leaves `AskUserMiddleware`/`enable_ask_user=True` — the `blocked(needs_input)` source — fully intact). An explicitly configured list keeps today's restrictive behavior (`auto_approve=False, interrupt_shell_only=True`, list enforced). The two modes are mutually exclusive by construction, so the "auto_approve=True silently drops the list" foot-gun cannot occur.
+
+Threat-model note (record in AGENTS.md): with default `all`, a prompt-injected issue can run arbitrary shell in the worker env — the C11 injection eval becomes the standing monitor. Accepted for the single-tenant posture; the old list already included `python3`/`go`/`make`, so it never prevented determined exfiltration anyway.
+
+Execution order: Task 14 → Task 16 → Task 17 → Task 15 (final gates last; `make eval` then validates the new posture live).
+
+### Task 16: Go kernel — `shell_allow_list` config + threading
+
+**Files:**
+- Modify: `internal/config/config.go` (new `ShellPolicy`/`Shell` types, `Config.Shell`, defaults, validation)
+- Modify: `configs/clipse.example.yaml` (document the block)
+- Modify: `internal/spawn/spawn.go` (WorkerSpec fields), `internal/spawn/local.go` (argv)
+- Modify: `dispatcher/spawn.go` (`shellFor`, spec wiring)
+- Test: `internal/config/config_test.go`, `internal/spawn/local_test.go` (or the existing workerArgs test file), `dispatcher/spawn_test.go` (or wherever modelsFor/modelParamsFor are tested — follow the existing test placement)
+
+**Interfaces:**
+- Produces: `config.ShellPolicy{All bool; Commands []string}` with custom YAML unmarshal (scalar `all` OR string sequence); `config.Shell{Coder, CoderDocs, Reviewer ShellPolicy}`; `Config.Shell Shell` under yaml key `shell_allow_list`; absent keys default to `All: true`. `WorkerSpec.ShellAllowList`/`WorkerSpec.DocsShellAllowList` (string: `""` means unrestricted/omit-flag, else a JSON array like `["git","gh"]`); argv flags `--shell-allow-list=`/`--docs-shell-allow-list=` appended only when non-empty (Task 17's worker treats an absent flag as `all`).
+
+- [ ] **Step 1: Write the failing config tests**
+
+Add to `internal/config/config_test.go`, following the file's existing table-driven style:
+
+```go
+func TestShellPolicy_Defaults_AllWhenAbsent(t *testing.T) {
+	cfg := loadValidConfigWithoutShellBlock(t) // reuse the file's existing minimal-valid-yaml helper pattern
+	for name, p := range map[string]config.ShellPolicy{
+		"coder": cfg.Shell.Coder, "coder_docs": cfg.Shell.CoderDocs, "reviewer": cfg.Shell.Reviewer,
+	} {
+		if !p.All || len(p.Commands) != 0 {
+			t.Fatalf("%s: expected default All policy, got %+v", name, p)
+		}
+	}
+}
+
+func TestShellPolicy_ParsesScalarAllAndList(t *testing.T) {
+	// yaml under test:
+	// shell_allow_list:
+	//   coder: all
+	//   reviewer: [git, gh, ls]
+	// coder_docs omitted -> defaults to all
+	// assert coder.All, reviewer.Commands == []string{"git","gh","ls"}, coder_docs.All
+}
+
+func TestShellPolicy_RejectsEmptyListAndAllInList(t *testing.T) {
+	// coder: []            -> Load error mentioning "shell_allow_list"
+	// coder: [all, git]    -> Load error suggesting the scalar `all` form
+}
+```
+
+(Write the two sketched tests out fully with real yaml fixtures, mirroring how the models/model_params tests build their yaml documents.)
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `go test ./internal/config -run TestShellPolicy -v`
+Expected: FAIL (types don't exist).
+
+- [ ] **Step 3: Implement config side**
+
+In `internal/config/config.go`:
+
+```go
+// ShellPolicy is a lane's shell posture for its DAC agent: the sentinel
+// `all` (All=true — the worker builds the agent with auto_approve=True,
+// no allow-list middleware, no dangerous-pattern checks), or an explicit
+// restrictive command list (the worker keeps auto_approve=False,
+// interrupt_shell_only=True and enforces the list). Decision 2026-07-07:
+// the DEFAULT is All — reflex live-fire showed the restrictive mode's
+// hardcoded pattern checks (redirects like 2>&1, env-prefix commands,
+// heredocs) rejected ~55 legitimate commands across 25 issues, including
+// every `just test`, so coders shipped unverified code. The kernel stays
+// LLM-free: it validates shape only and threads the policy through opaque.
+type ShellPolicy struct {
+	All      bool
+	Commands []string
+}
+
+func (p *ShellPolicy) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		if value.Value != "all" {
+			return fmt.Errorf("shell_allow_list: scalar value must be \"all\", got %q", value.Value)
+		}
+		*p = ShellPolicy{All: true}
+		return nil
+	}
+	var cmds []string
+	if err := value.Decode(&cmds); err != nil {
+		return fmt.Errorf("shell_allow_list: expected \"all\" or a list of command names: %w", err)
+	}
+	*p = ShellPolicy{Commands: cmds}
+	return nil
+}
+
+// Shell mirrors Models' per-profile keying (coder / coder_docs / reviewer).
+type Shell struct {
+	Coder     ShellPolicy `yaml:"coder"`
+	CoderDocs ShellPolicy `yaml:"coder_docs"`
+	Reviewer  ShellPolicy `yaml:"reviewer"`
+}
+```
+
+Add `Shell Shell \`yaml:"shell_allow_list"\`` to `Config` (doc comment pointing at ShellPolicy's). Wire defaulting where Models defaults are applied (the raw/pointer trick is unnecessary: a zero ShellPolicy is `{All:false, Commands:nil}`, which is invalid, so defaulting is "if !p.All && len(p.Commands)==0 → All=true" applied per lane in Load). Validation (with the file's existing validate style): for each lane policy, `All && len(Commands)>0` is impossible by construction; `!All && len(Commands)==0` was just defaulted away; reject any list containing `"all"` (`shell_allow_list.%s: use the scalar form `all`, not a list element`); reject empty-string elements.
+
+- [ ] **Step 4: Config tests green**
+
+Run: `go test ./internal/config -v`
+Expected: PASS (new + existing).
+
+- [ ] **Step 5: Thread through spawn (failing tests first)**
+
+Tests, following the exact placement/style of the ModelParams threading tests:
+- `dispatcher`: `shellFor(lane)` table test — coder gets `(coderJSON, coderDocsJSON)`, reviewer `(reviewerJSON, "")`, other `("","")`; an All policy encodes as `""`, a list as compact JSON (`["git","gh"]`).
+- `internal/spawn`: workerArgs includes `--shell-allow-list=["git","gh"]` when `spec.ShellAllowList` non-empty, omits when empty; same for `--docs-shell-allow-list`.
+
+Implementation:
+- `internal/spawn/spawn.go`: add to WorkerSpec, next to ModelParams/DocsModelParams:
+
+```go
+	// ShellAllowList is a JSON array of allowed command names for the
+	// lane's DAC shell ("" means unrestricted — the worker defaults to the
+	// `all` policy and the flag is omitted; see config.ShellPolicy).
+	ShellAllowList string
+	// DocsShellAllowList is the docs sub-step's policy, coder lane only.
+	DocsShellAllowList string
+```
+
+- `internal/spawn/local.go`, in workerArgs beside the model-params flags:
+
+```go
+	if spec.ShellAllowList != "" {
+		args = append(args, "--shell-allow-list="+spec.ShellAllowList)
+	}
+	if spec.DocsShellAllowList != "" {
+		args = append(args, "--docs-shell-allow-list="+spec.DocsShellAllowList)
+	}
+```
+
+- `dispatcher/spawn.go`: add `shellFor` mirroring `modelParamsFor` (encode `ShellPolicy` → `""` when `.All`, else `json.Marshal(p.Commands)` with the same log-and-fall-back-on-error stance — but note the fallback here is `""` = unrestricted, so log at Error, not Warn, and say so in the comment); wire into the WorkerSpec literal.
+
+- [ ] **Step 6: Full Go suite + example yaml**
+
+Run: `go test ./... && make lint`
+Expected: PASS.
+
+Append to `configs/clipse.example.yaml`, matching its comment style:
+
+```yaml
+# Per-profile shell posture for the DAC agents (coder / coder_docs /
+# reviewer — same keying as models:). Each key is either the sentinel
+# `all` (DEFAULT when omitted: the agent runs with an unrestricted shell,
+# DAC auto_approve) or an explicit list of allowed command names, which
+# restores the restrictive mode (allow-list enforced, plus DAC's own
+# dangerous-pattern rejection of redirects/env-prefixes/heredocs — note
+# that mode rejects habitual idioms like `2>&1` regardless of the list).
+# With `all`, a prompt-injected issue body can run arbitrary shell in the
+# worker env — see AGENTS.md's threat-model note; the C11 injection eval
+# is the standing monitor.
+# shell_allow_list:
+#   coder: all
+#   coder_docs: all
+#   reviewer: [git, gh, ls, cat, head, tail, grep, rg, find, which, wc, diff, cd, echo, test]
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add internal/config dispatcher/spawn.go internal/spawn configs/clipse.example.yaml
+git commit -m "feat(config): per-lane shell_allow_list policy, default all, threaded to worker argv"
+```
+
+(Also add the specific *_test.go files touched.)
+
+### Task 17: Python worker — honor the shell policy, default `all`
+
+**Files:**
+- Modify: `agent/src/clipse_agent/worker.py` (flags + parse + factory args)
+- Modify: `agent/src/clipse_agent/profiles/coder.py`, `agent/src/clipse_agent/profiles/reviewer.py` (profile field semantics + factory param + prompt line)
+- Modify: `agent/src/clipse_agent/dac.py` (`build_coder_agent` two-mode routing + SAFETY docstring rewrite)
+- Modify: `AGENTS.md` (model-config section + threat-model note)
+- Test: `agent/tests/test_worker.py`, `agent/tests/test_profiles.py`, `agent/tests/test_dac.py`, `agent/tests/test_coder_docs_profile.py`, `agent/tests/test_reviewer_profile.py` (update defaults/safety assertions)
+
+**Interfaces:**
+- Consumes: `--shell-allow-list` / `--docs-shell-allow-list` argv flags carrying a JSON array; absent flag = `all`.
+- Produces: `CoderProfile.shell_allow_list: tuple[str, ...] | None` and `ReviewerProfile.shell_allow_list: tuple[str, ...] | None` where **`None` means unrestricted** (new default from the factories); `get_coder_profile`/`get_coder_docs_profile`/`get_reviewer_profile` gain `shell_allow_list: Sequence[str] | None = None` (None → unrestricted); `dac.build_coder_agent` builds `auto_approve=True` (no list) when `profile.shell_allow_list is None`, else exactly today's restrictive combination. `_SHELL_ALLOW_LIST`/`_DOCS_SHELL_ALLOW_LIST` tuples stay exported as the reference restrictive lists.
+
+- [ ] **Step 1: Failing tests**
+
+TDD across the seams (write these before touching implementation; adapt names to each file's conventions):
+
+```python
+# test_dac.py — the new routing invariant, replacing/updating any test that
+# asserts auto_approve=False unconditionally:
+def test_build_coder_agent_unrestricted_profile_uses_auto_approve() -> None:
+    # profile with shell_allow_list=None
+    # capture create_cli_agent kwargs via monkeypatch
+    # assert kwargs["auto_approve"] is True
+    # assert kwargs["interrupt_shell_only"] is False
+    # assert kwargs.get("shell_allow_list") in (None, [])
+    # assert kwargs["enable_ask_user"] is True   # needs_input path intact
+
+def test_build_coder_agent_restrictive_profile_keeps_safety_combo() -> None:
+    # profile with shell_allow_list=("git", "gh")
+    # assert auto_approve is False, interrupt_shell_only is True,
+    #        shell_allow_list == ["git", "gh"], enable_ask_user is True
+
+# test_worker.py — flag parsing threads through:
+def test_shell_allow_list_flag_reaches_coder_profile() -> None:
+    # invoke _dispatch with --shell-allow-list '["git","gh"]' and a
+    # monkeypatched build_coder_graph capturing extra_kwargs;
+    # assert profile.shell_allow_list == ("git", "gh")
+    # and docs_profile.shell_allow_list is None (docs flag absent -> all)
+
+# test_profiles.py — new default:
+def test_get_coder_profile_defaults_to_unrestricted_shell() -> None:
+    # get_coder_profile().shell_allow_list is None
+```
+
+Update every existing test that asserts the old defaults (`profile.shell_allow_list == _SHELL_ALLOW_LIST` etc.) or the unconditional `auto_approve=False` — the restrictive-mode tests keep those assertions but construct their profile with an explicit list.
+
+- [ ] **Step 2: Verify failures**
+
+Run: `cd agent && uv run pytest tests/test_dac.py tests/test_worker.py tests/test_profiles.py -v`
+Expected: new tests FAIL.
+
+- [ ] **Step 3: Implement**
+
+`worker.py`: add flags + parser:
+
+```python
+    parser.add_argument("--shell-allow-list", default="")
+    parser.add_argument("--docs-shell-allow-list", default="")
+
+def _parse_shell(raw: str) -> list[str] | None:
+    """None means the `all` policy (unrestricted shell) — the kernel omits
+    the flag entirely for an all-policy lane (internal/spawn.workerArgs)."""
+    return json.loads(raw) if raw else None
+```
+
+Thread into `_dispatch`'s factory calls: `get_coder_profile(..., shell_allow_list=_parse_shell(args.shell_allow_list))`, `get_coder_docs_profile(..., shell_allow_list=_parse_shell(args.docs_shell_allow_list))`, `get_reviewer_profile(..., shell_allow_list=_parse_shell(args.shell_allow_list))`.
+
+`profiles/coder.py` (reviewer.py mirrors):
+- `CoderProfile.shell_allow_list: tuple[str, ...] | None` — update the dataclass doc: `None` means unrestricted (DAC auto_approve; decision 2026-07-07), a tuple means the restrictive allow-list mode.
+- Factories gain `shell_allow_list: Sequence[str] | None = None`; body: `shell_allow_list=tuple(shell_allow_list) if shell_allow_list is not None else None`.
+- System prompts: replace the line `- Only run commands from your shell allow-list.` (and the docs prompt's equivalent trailing clause) with `- If a shell command is rejected, do not retry it in a loop — try another approach or report blocked.` — true in both modes, keeps the CLI-9 guard language.
+
+`dac.py` `build_coder_agent`: replace the fixed SAFETY kwargs with the two-mode routing:
+
+```python
+        unrestricted = profile.shell_allow_list is None
+        return create_cli_agent(
+            model,
+            profile.assistant_id,
+            system_prompt=profile.system_prompt,
+            interactive=False,
+            auto_approve=unrestricted,
+            interrupt_shell_only=not unrestricted,
+            shell_allow_list=(list(profile.shell_allow_list) if not unrestricted else None),
+            enable_ask_user=True,
+            enable_shell=True,
+            checkpointer=checkpointer,
+            cwd=cwd,
+        )
+```
+
+Rewrite the module docstring's SAFETY block: two sanctioned modes — restrictive (list ⇒ `auto_approve=False, interrupt_shell_only=True`, the original invariant) and unrestricted (`None` ⇒ `auto_approve=True`, decision 2026-07-07, threat-model note in AGENTS.md); the forbidden combination remains `auto_approve=True` WITH a configured list (silently drops it — impossible by construction here). Note that both modes set `interrupt_on={}` inside DAC and `enable_ask_user=True` keeps the `blocked(needs_input)` interrupt path alive (verified against `deepagents_code.agent` 0.1.22, lines ~1336/1612).
+
+`AGENTS.md`: in the model-config bullet area add a `shell_allow_list` bullet (per-lane, `all` default, what each mode means); extend the openai_codex token-reach risk note: with the default `all` policy the coder shell is unrestricted, so issue-body injection can execute arbitrary commands — C11 is the standing eval monitor.
+
+- [ ] **Step 4: Suites green**
+
+Run: `cd agent && uv run pytest && uvx ruff check . && cd .. && make test`
+Expected: ALL PASS.
+
+- [ ] **Step 5: Live eval validation of the new posture**
+
+Run: `source ~/.secrets && cd agent && uv run pytest evals/test_coder_blocked_evals.py evals/test_coder_evals.py -k "c1 or c3 or c8 or c11" -v`
+Expected: PASS — specifically C3 proves `blocked(needs_input)` still fires under `auto_approve=True`, C11 re-checks the injection canary with a fully open shell, C8's budget still holds. Record tokens; note in the report if C11's behavior changed.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add agent/src/clipse_agent/worker.py agent/src/clipse_agent/profiles agent/src/clipse_agent/dac.py agent/tests AGENTS.md
+git commit -m "feat(worker): honor per-lane shell policy, default unrestricted (auto_approve)"
+```
