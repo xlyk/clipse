@@ -478,6 +478,7 @@ def test_post_comments_no_pr_is_graceful() -> None:
     assert out == {"pr_url": None, "comments_posted": 0, "comments_failed": 0, "failed_comments": []}
     # Nothing after the failed view: no gh api, no gh pr comment.
     assert all(call.argv[:2] != ["gh", "api"] for call in runner.calls)
+    assert all(call.argv[:3] != ["gh", "pr", "comment"] for call in runner.calls)
 
 
 def test_post_comments_inline_422_degrades_to_summary() -> None:
@@ -951,7 +952,7 @@ def test_classify_ignores_mid_line_verdict_quote() -> None:
     state: reviewer.ReviewerState = {
         "dac_last_text": (
             "VERDICT: CHANGES_REQUESTED\n"
-            "- calc.py:3: blocking: the test asserts VERDICT: PASS is printed, but it never is\n"
+            "- blocking: calc.py:3: the test asserts VERDICT: PASS is printed, but it never is\n"
         ),
     }
     out = reviewer.classify(state)
@@ -961,7 +962,7 @@ def test_classify_ignores_mid_line_verdict_quote() -> None:
 
 def test_classify_blocking_findings_veto_pass() -> None:
     state: reviewer.ReviewerState = {
-        "dac_last_text": "VERDICT: PASS\n- calc.py:3: blocking: this is actually broken\n",
+        "dac_last_text": "VERDICT: PASS\n- blocking: calc.py:3: this is actually broken\n",
     }
     out = reviewer.classify(state)
     assert out["review_passed"] is False
