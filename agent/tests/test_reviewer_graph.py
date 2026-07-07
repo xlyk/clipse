@@ -481,6 +481,19 @@ def test_post_comments_no_pr_is_graceful() -> None:
     assert all(call.argv[:3] != ["gh", "pr", "comment"] for call in runner.calls)
 
 
+def test_post_comments_pr_view_transient_failure_raises() -> None:
+    # A gh failure that is NOT the no-PR case must raise -> blocked/transient
+    # -> kernel retry, instead of silently dropping every finding.
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(1, "", "connect: network is unreachable")),
+        ]
+    )
+    node = reviewer.make_post_comments(runner)
+    with pytest.raises(reviewer.ReviewerGraphError, match="gh pr view"):
+        node({"branch": "clipse/EVAL-1", "cwd": "/tmp", "review_comments": []})
+
+
 def test_post_comments_inline_422_degrades_to_summary() -> None:
     pr_json = json.dumps({"number": 7, "headRefOid": "abc123", "url": "https://x/pull/7"})
     runner = FakeRunner(

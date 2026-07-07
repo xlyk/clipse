@@ -493,10 +493,15 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
     state. Inline review COMMENTS and a plain PR comment are both allowed on
     your own PR, so the findings still land visibly on the PR.
 
-    Both `gh pr view` and each per-comment `gh api` call run with `check=False`
-    -- see the inline comments below for why: a raise here would send the run
-    to blocked/transient and the kernel would retry the same deterministic
-    failure until `recover_cap` parks the card.
+    Both `gh pr view` and each per-comment `gh api` call run with `check=False`.
+    The `gh pr view` grace is narrow: only its known no-PR stderr signal (the
+    coder's honest `pr_url=""` no-op path) is swallowed into a clean
+    no-op result; any other failure (auth, network, rate limit) raises
+    `ReviewerGraphError` so the run lands in blocked/transient and the
+    kernel's bounded retry gets a shot, instead of every finding silently
+    vanishing while the run reports success. The per-comment `gh api` calls
+    and the summary `gh pr comment` post remain unconditionally best-effort
+    (see the inline comments below for why).
     """
 
     def _node(state: ReviewerState) -> dict[str, Any]:
@@ -511,7 +516,16 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
         # still reaches the kernel via this run's typed JSON result.
         view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd, check=False)
         if view.returncode != 0:
-            return {"pr_url": None, "comments_posted": 0, "comments_failed": 0, "failed_comments": []}
+            # Narrow grace: only the known no-PR signal (the coder's honest
+            # pr_url="" no-op path -- gh prints "no pull requests found").
+            # Any OTHER failure (auth, network, rate limit) raises so the
+            # kernel's transient retry machinery gets a shot, instead of the
+            # findings silently vanishing while the run reports success.
+            if "no pull requests found" in view.stderr.lower():
+                return {"pr_url": None, "comments_posted": 0, "comments_failed": 0, "failed_comments": []}
+            raise ReviewerGraphError(
+                f"post_comments: gh pr view {branch} failed (exit {view.returncode}): {view.stderr.strip()}"
+            )
         pr_info = json.loads(view.stdout)
         pr_number = pr_info["number"]
         commit_sha = pr_info["headRefOid"]
