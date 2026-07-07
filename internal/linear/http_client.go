@@ -174,11 +174,12 @@ func marshalGraphQLRequest(query string, variables map[string]any) ([]byte, erro
 // the LINEAR_API_KEY environment variable, scoped to a single configured
 // team.
 type HTTPClient struct {
-	apiKey     string
-	baseURL    string
-	teamKey    string
-	teamID     string
-	httpClient *http.Client
+	apiKey      string
+	baseURL     string
+	teamKey     string
+	teamID      string
+	labelPrefix string
+	httpClient  *http.Client
 
 	// mu guards stateIDs, the lazily-resolved and cached name(lowercase)->id
 	// map for teamID (see state_resolver.go). The dispatch loop is
@@ -191,31 +192,33 @@ type HTTPClient struct {
 // NewHTTPClient builds an HTTPClient using the API key from LINEAR_API_KEY,
 // pointed at Linear's real GraphQL endpoint and scoped to the Linear team
 // identified by teamKey (candidate-issues filter) and teamID (workflow-state
-// resolution for SetState).
+// resolution for SetState). labelPrefix is config.Config.LaneLabelPrefix,
+// threaded through for Linear label parsing (see status.go's laneFromLabels).
 // Returns an error if the environment variable is unset or empty.
-func NewHTTPClient(teamKey, teamID string) (*HTTPClient, error) {
-	return newHTTPClient(apiURL, teamKey, teamID)
+func NewHTTPClient(teamKey, teamID, labelPrefix string) (*HTTPClient, error) {
+	return newHTTPClient(apiURL, teamKey, teamID, labelPrefix)
 }
 
 // NewHTTPClientWithBaseURL builds an HTTPClient like NewHTTPClient, but
 // against baseURL instead of Linear's real API. Intended for tests that
 // point the client at a local httptest.Server; production code should use
 // NewHTTPClient.
-func NewHTTPClientWithBaseURL(baseURL, teamKey, teamID string) (*HTTPClient, error) {
-	return newHTTPClient(baseURL, teamKey, teamID)
+func NewHTTPClientWithBaseURL(baseURL, teamKey, teamID, labelPrefix string) (*HTTPClient, error) {
+	return newHTTPClient(baseURL, teamKey, teamID, labelPrefix)
 }
 
-func newHTTPClient(baseURL, teamKey, teamID string) (*HTTPClient, error) {
+func newHTTPClient(baseURL, teamKey, teamID, labelPrefix string) (*HTTPClient, error) {
 	apiKey := os.Getenv(apiKeyEnvVar)
 	if apiKey == "" {
 		return nil, fmt.Errorf("building linear http client: %s is not set", apiKeyEnvVar)
 	}
 	return &HTTPClient{
-		apiKey:     apiKey,
-		baseURL:    baseURL,
-		teamKey:    teamKey,
-		teamID:     teamID,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiKey:      apiKey,
+		baseURL:     baseURL,
+		teamKey:     teamKey,
+		teamID:      teamID,
+		labelPrefix: labelPrefix,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
@@ -232,7 +235,7 @@ func (c *HTTPClient) CandidateIssues(ctx context.Context) ([]Issue, error) {
 		return nil, fmt.Errorf("candidate issues: %w", err)
 	}
 
-	issues, err := NormalizeCandidateIssues(respBody)
+	issues, err := NormalizeCandidateIssues(respBody, c.labelPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("candidate issues: %w", err)
 	}

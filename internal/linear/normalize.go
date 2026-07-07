@@ -53,9 +53,10 @@ type issueNode struct {
 
 // NormalizeCandidateIssues parses a candidate-issues GraphQL response body
 // and maps it to Clipse's normalized Issue slice: lane labels are stripped
-// to their bare lane, workflow-state names are mapped to our Column enum,
-// and "blocks"/"blocked-by" relations are folded into a single Deps list.
-func NormalizeCandidateIssues(body []byte) ([]Issue, error) {
+// to their bare lane (via labelPrefix, e.g. "agent:"), workflow-state names
+// are mapped to our Column enum, and "blocks"/"blocked-by" relations are
+// folded into a single Deps list.
+func NormalizeCandidateIssues(body []byte, labelPrefix string) ([]Issue, error) {
 	var resp candidateIssuesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("normalizing candidate issues: %w", err)
@@ -64,7 +65,7 @@ func NormalizeCandidateIssues(body []byte) ([]Issue, error) {
 	nodes := resp.Data.Issues.Nodes
 	issues := make([]Issue, 0, len(nodes))
 	for _, n := range nodes {
-		issue, err := normalizeIssueNode(n)
+		issue, err := normalizeIssueNode(n, labelPrefix)
 		if err != nil {
 			return nil, fmt.Errorf("normalizing issue %s: %w", n.Identifier, err)
 		}
@@ -74,7 +75,7 @@ func NormalizeCandidateIssues(body []byte) ([]Issue, error) {
 }
 
 // normalizeIssueNode maps a single raw issue node to a normalized Issue.
-func normalizeIssueNode(n issueNode) (Issue, error) {
+func normalizeIssueNode(n issueNode, labelPrefix string) (Issue, error) {
 	labelNames := make([]string, 0, len(n.Labels.Nodes))
 	for _, l := range n.Labels.Nodes {
 		labelNames = append(labelNames, l.Name)
@@ -102,7 +103,7 @@ func normalizeIssueNode(n issueNode) (Issue, error) {
 		Title:       n.Title,
 		Description: n.Description,
 		Status:      statusFromWorkflowName(n.State.Name, n.State.Type),
-		Lane:        laneFromLabels(labelNames),
+		Lane:        laneFromLabels(labelNames, labelPrefix),
 		Deps:        deps,
 		Priority:    n.Priority,
 		BranchName:  n.BranchName,

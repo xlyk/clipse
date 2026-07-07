@@ -153,7 +153,7 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 	// NewHTTPClient scopes candidate-issue polling and workflow-state
 	// resolution (SetState's column -> Linear state-id mapping) to the
 	// configured team; see internal/linear/state_resolver.go.
-	lc, err := linear.NewHTTPClient(cfg.TeamKey, cfg.TeamID)
+	lc, err := linear.NewHTTPClient(cfg.TeamKey, cfg.TeamID, cfg.LaneLabelPrefix)
 	if err != nil {
 		return fmt.Errorf("building linear client: %w", err)
 	}

@@ -2,13 +2,6 @@ package linear
 
 import "strings"
 
-// laneLabelPrefix is the Linear label prefix that marks a lane label, e.g.
-// "agent:coder". This mirrors config.defaultLaneLabelPrefix; it is
-// duplicated here (rather than imported) to keep this package dependency-free
-// of internal/config. If the prefix ever becomes configurable per-repo, this
-// value should move to a Normalize parameter instead of a constant.
-const laneLabelPrefix = "agent:"
-
 // statusByWorkflowName is the single documented mapping from a Linear
 // workflow-state NAME (case-insensitive) to our board Column enum
 // (internal/contract.Column). Keep this map in sync with
@@ -88,13 +81,17 @@ func canonicalWorkflowName(column string) (string, bool) {
 	return name, ok
 }
 
-// laneFromLabels scans Linear label names for an "agent:<lane>" label and
-// returns the bare lane with the prefix stripped. Returns "" if no such
+// laneFromLabels scans Linear label names for a "<labelPrefix><lane>" label
+// (e.g. "agent:coder") and returns the bare lane with the prefix stripped.
+// labelPrefix comes from config.Config.LaneLabelPrefix, threaded through from
+// HTTPClient's construction (cli/dispatch.go) -- this package stays
+// dependency-free of internal/config (no import), so it takes the resolved
+// string rather than re-deriving config's own default. Returns "" if no such
 // label is present; callers must treat that as "no lane assigned" rather
 // than an error.
-func laneFromLabels(labelNames []string) string {
+func laneFromLabels(labelNames []string, labelPrefix string) string {
 	for _, name := range labelNames {
-		if rest, ok := strings.CutPrefix(name, laneLabelPrefix); ok && rest != "" {
+		if rest, ok := strings.CutPrefix(name, labelPrefix); ok && rest != "" {
 			return rest
 		}
 	}
