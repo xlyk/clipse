@@ -18,6 +18,14 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
 - `make lint` — `go vet`, a `gofmt` check, and `ruff` on `agent/`.
 - `make codegen` — regenerate the Go + Pydantic contract from `schema/` (idempotent; CI fails on drift).
 - `make run` — `go run ./cmd/clipse`.
+- `make eval` — live-model behavioral evals for the coder/coder_docs/reviewer
+  agents (`agent/evals/`, pytest, real git + fake `gh` shim; needs
+  `ANTHROPIC_API_KEY`, costs tokens, never runs in `make test`/CI). Each case
+  pins a clipse-specific behavior or a production incident; DAC engine
+  mechanics are upstream's job (`langchain-ai/deepagents` `libs/evals` — run
+  that suite when bumping the DAC pin). Model override:
+  `CLIPSE_EVAL_MODEL=openai_codex:gpt-5-codex make eval`. See
+  `agent/evals/README.md`.
 
 Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard). Kernel tests need **no** network or LLM.
 
