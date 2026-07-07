@@ -12,6 +12,7 @@ from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 import conftest as evals_conftest
 import report
 from harness import advance_base, commit_on_branch, git_out, make_fixture_repo, run_convergence_loop, seed_pr
+from judge import _parse_verdict
 
 
 def test_fixture_repo_roundtrip(tmp_path: Path) -> None:
@@ -146,3 +147,18 @@ def test_convergence_loop_stops_when_coder_blocks(tmp_path: Path) -> None:
     )
     assert out.rounds_to_done is None
     assert len(out.rounds) == 1 and out.rounds[0].reviewer is None
+
+
+def test_judge_parser_accepts_strict_contract() -> None:
+    assert _parse_verdict('{"pass": true, "reason": "ok"}') is True
+    assert _parse_verdict('{"pass": false, "reason": "no"}') is False
+
+
+def test_judge_parser_tolerates_surrounding_prose_and_fences() -> None:
+    assert _parse_verdict('Sure!\n```json\n{"pass": true, "reason": "r"}\n```') is True
+
+
+def test_judge_parser_rejects_garbage() -> None:
+    assert _parse_verdict("PASS") is None
+    assert _parse_verdict('{"pass": "yes"}') is None
+    assert _parse_verdict("") is None

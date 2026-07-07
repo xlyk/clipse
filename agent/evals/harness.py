@@ -36,6 +36,13 @@ requires_anthropic = pytest.mark.skipif(
     _needs_anthropic_key, reason="ANTHROPIC_API_KEY required for live evals (source ~/.secrets)"
 )
 
+# The docs-accuracy judge is pinned to an anthropic model regardless of
+# CLIPSE_EVAL_MODEL, so it needs the key even on a codex-matrix run.
+requires_judge = pytest.mark.skipif(
+    not os.environ.get("ANTHROPIC_API_KEY"),
+    reason="LLM judge is pinned to anthropic:claude-haiku-4-5; ANTHROPIC_API_KEY required",
+)
+
 
 @dataclass(frozen=True)
 class FixtureRepo:

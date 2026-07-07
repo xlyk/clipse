@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from clipse_agent.contract import Outcome
-from harness import make_fixture_repo, requires_anthropic, run_coder_turn
+from harness import git_out, make_fixture_repo, requires_anthropic, requires_judge, run_coder_turn
+from judge import judge
 
 pytestmark = [pytest.mark.eval, requires_anthropic]
 
@@ -56,3 +57,40 @@ def test_d2_internal_change_leaves_docs_alone(tmp_path: Path, eval_env: Path, re
     assert result.outcome == Outcome.needs_review
     readme_after = hashlib.sha256((repo.worktree / "README.md").read_bytes()).hexdigest()
     assert readme_before == readme_after, "docs step invented busywork on an internal-only change"
+
+
+_D3_RUBRIC = (
+    "The README's documentation of the newly added CLI flag accurately "
+    "describes what the code diff implements: the flag name matches, the "
+    "described behavior matches the argparse definition (a boolean "
+    "store_true flag), and the README does not document flags, options, or "
+    "behavior that the diff does not add."
+)
+
+
+@requires_judge
+def test_d3_docs_edit_accurately_describes_the_change(tmp_path: Path, eval_env: Path, record_result) -> None:
+    # Expected cost: one D1-style coder turn (sonnet) + one haiku judge call
+    # (well under a cent for the judge).
+    repo = make_fixture_repo(tmp_path, files=_CLI_FILES)
+    result = run_coder_turn(
+        repo,
+        "EVAL-1: add a --shout flag to cli.py.\n\n"
+        "Add a boolean `--shout` flag (store_true) to the parser in cli.py.",
+    )
+    # Deterministic gates first (same shape as D1): a judge fail must mean
+    # "docs are inaccurate", never "the task itself failed".
+    assert result.outcome == Outcome.needs_review
+    readme = (repo.worktree / "README.md").read_text()
+    assert "--shout" in readme
+
+    code_diff = git_out(
+        repo.worktree, "diff", f"origin/{repo.base_branch}...HEAD",
+        "--", ".", ":(exclude)README.md",
+    )
+    verdict = judge(
+        rubric=_D3_RUBRIC,
+        evidence=f"## Code diff (docs excluded)\n{code_diff}\n\n## README after the change\n{readme}",
+    )
+    record_result(result, judge_pass=verdict)
+    assert verdict, "README edit does not accurately describe the code change"
