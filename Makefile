@@ -6,7 +6,7 @@ BINARY   = ./bin/clipse
 GO_JSONSCHEMA_VERSION      = v0.23.1
 DATAMODEL_CODEGEN_VERSION  = 0.66.3
 
-.PHONY: build test test-go test-py lint run codegen
+.PHONY: build test test-go test-py lint run codegen eval
 
 ## build: compile the clipse binary into ./bin/clipse
 build:
@@ -65,3 +65,7 @@ codegen:
 ## run: run clipse via go run (no build step needed)
 run:
 	go run ./cmd/clipse
+
+## eval: run live-model agent evals (needs ANTHROPIC_API_KEY; costs tokens)
+eval:
+	cd agent && uv run pytest evals -v
