@@ -76,7 +76,23 @@ func (d *Dispatcher) applyResult(ctx context.Context, rr runResult) error {
 		// GetIssue failure has no other realistic cause than a transient
 		// store hiccup (nothing in production deletes issue rows), so this
 		// self-heals within a tick or two.
-		d.results <- rr
+		//
+		// The send is non-blocking: this is the Tick goroutine, d.results'
+		// ONLY reader, so a plain blocking send here would deadlock the whole
+		// dispatcher forever if the buffer were ever full (nothing else could
+		// drain it to make room). resultsBufferSize's cfg.Caps.Global+1 floor
+		// (dispatcher.go) should make that unreachable, but if it happens
+		// anyway, the fallback is neither to block nor to drop rr on the
+		// floor: inf is simply left in d.inflight (already true -- it was
+		// never deleted on this path), so reconcile's Heartbeat loop keeps
+		// its claim alive and the run stays visible for a later retry,
+		// instead of vanishing silently.
+		select {
+		case d.results <- rr:
+		default:
+			d.logger.Error("results channel full, could not requeue result; leaving run inflight for a later retry",
+				"run_id", rr.runID, "issue_id", rr.issueID, "buffer_cap", cap(d.results))
+		}
 		return fmt.Errorf("loading issue %s for run %s: %w", rr.issueID, rr.runID, err)
 	}
 
