@@ -385,3 +385,73 @@ func TestTick_PollReassertsDispatcherOwnedStateWhenClaimed(t *testing.T) {
 		t.Errorf("SetStateCalls = %+v, want a setstate -> running reassertion", lc.SetStateCalls)
 	}
 }
+
+// TestTick_PollNeverAdoptsRunningWithoutClaim asserts the fix for adopting an
+// unclaimed "running" status from Linear: a human dragging a card to Running
+// (or a restart-requeue race observing a stale label) must not be adopted --
+// board_status='running' is entered ONLY via the CAS claim (store.ClaimReady/
+// ClaimColumn). Adopting it here would write claim_lock=NULL, board_status=
+// 'running': unclaimable by ClaimReady's CAS (which requires board_status=
+// 'ready') and unreleasable by ReleaseStaleClaims (which only looks at
+// claim_expires, permanently NULL on this row).
+func TestTick_PollNeverAdoptsRunningWithoutClaim(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// issue-1 sits at 'ready' with no active claim.
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	// Linear reports "running" for this issue with no backing claim.
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			{ID: "issue-1", Identifier: "CLP-1", Status: "running", Lane: "coder", Priority: 1, BranchName: "issue-1-branch", UpdatedAt: 200},
+		},
+	}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Fatalf("BoardStatus = %q, want unchanged ready (an unclaimed running status must never be adopted)", got.BoardStatus)
+	}
+	if got.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want still unclaimed")
+	}
+
+	// Instead of adopting, the dispatcher corrects Linear's stale view: a
+	// setstate mirror pushing the store's real status (ready) back.
+	var sawReadyReassert bool
+	for _, c := range lc.SetStateCalls {
+		if c.IssueID == "issue-1" && c.TargetColumn == "ready" {
+			sawReadyReassert = true
+		}
+	}
+	if !sawReadyReassert {
+		t.Errorf("SetStateCalls = %+v, want a setstate -> ready reassertion correcting Linear's stray running", lc.SetStateCalls)
+	}
+
+	// The issue remains genuinely claimable on a later tick with real caps.
+	cfg := testConfig()
+	d2 := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+	if err := d2.Tick(ctx); err != nil {
+		t.Fatalf("second Tick: unexpected error: %v", err)
+	}
+	got2, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue after second tick: unexpected error: %v", err)
+	}
+	if got2.BoardStatus != "running" {
+		t.Errorf("BoardStatus after second tick = %q, want running (claimed for real this time)", got2.BoardStatus)
+	}
+	if !got2.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = false after second tick, want a real claim backing running")
+	}
+}

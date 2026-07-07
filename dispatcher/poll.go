@@ -90,7 +90,20 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 		return nil
 	}
 
-	if !issue.ClaimLock.Valid {
+	// board_status="running" is entered ONLY via the CAS claim
+	// (store.ClaimReady/ClaimColumn) -- see AGENTS.md's kernel invariant.
+	// Reaching here at all already means issue.BoardStatus != linearStatus,
+	// so an observed linearStatus=="running" can NEVER be backed by a real
+	// claim on THIS issue's own row: either a human dragged the card to
+	// Running by hand, or Linear's own mirror of a prior (now-released)
+	// claim hasn't caught up yet (a restart-requeue race). Adopting it would
+	// write board_status='running' with claim_lock left NULL -- a row
+	// ClaimReady's CAS can never claim again (it requires board_status=
+	// 'ready') and ReleaseStaleClaims can never release (it only looks at
+	// claim_expires, permanently NULL here). Treat it exactly like the
+	// dispatcher-owns-this-claim case below: re-assert the store's real
+	// status instead of trusting Linear's.
+	if !issue.ClaimLock.Valid && linearStatus != string(contract.ColumnRunning) {
 		return d.adoptLinearMove(ctx, issueID, issue.BoardStatus, linearStatus, now)
 	}
 	return d.reassertOwnedState(ctx, issueID, issue.BoardStatus, now)
