@@ -185,6 +185,7 @@ class ReviewerState(TypedDict, total=False):
     # --- run_DAC ---
     dac_outcome_hint: str  # "completed" | "interrupted" (dac.OutcomeHint)
     dac_summary: str
+    dac_last_text: str  # only the FINAL message's text (the verdict/finding source)
     tokens_in: int
     tokens_out: int
     interrupt_payload: list[Any] | None
@@ -334,6 +335,7 @@ def make_run_dac(
         return {
             "dac_outcome_hint": turn_result.outcome_hint,
             "dac_summary": turn_result.final_text,
+            "dac_last_text": turn_result.last_text,
             "tokens_in": turn_result.tokens_in,
             "tokens_out": turn_result.tokens_out,
             "interrupt_payload": turn_result.interrupt_payload,
@@ -361,19 +363,22 @@ def route_after_dac(state: ReviewerState) -> str:
 
 _VERDICT_PASS = "PASS"
 
-_VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|CHANGES_REQUESTED)\b", re.IGNORECASE)
+_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(PASS|CHANGES_REQUESTED)\b", re.IGNORECASE | re.MULTILINE)
 _INLINE_COMMENT_RE = re.compile(r"^-\s*(?:(blocking|nit):\s*)?([^\s:]+):(\d+):\s*(.+)$", re.IGNORECASE)
 
 
-def _find_verdict(dac_summary: str) -> re.Match[str] | None:
-    """Return the *last* `VERDICT: ...` match in `dac_summary`, or None.
+def _find_verdict(text: str) -> re.Match[str] | None:
+    """Return the *last* `VERDICT: ...` match in `text`, or None.
 
-    The last match wins so that the system prompt's own protocol text (which
+    Anchored to line starts (`^` + `re.MULTILINE`) so a finding body quoting
+    "VERDICT: PASS" mid-line -- e.g. describing what a test asserts -- can
+    never be mistaken for the model's actual decision. The last matching
+    *line* still wins so that the system prompt's own protocol text (which
     literally contains the string "VERDICT:") being echoed or quoted earlier
     in the message is never mistaken for the model's actual decision -- that
     is always whatever it states last.
     """
-    matches = list(_VERDICT_RE.finditer(dac_summary))
+    matches = list(_VERDICT_RE.finditer(text))
     return matches[-1] if matches else None
 
 
@@ -398,6 +403,12 @@ def _parse_inline_comments(dac_summary: str, start: int) -> list[InlineComment]:
 def classify(state: ReviewerState) -> dict[str, Any]:
     """Decide PASS vs CHANGES_REQUESTED from this turn's DAC output.
 
+    Reads only the turn's *final* message (`dac_last_text`), falling back to
+    `dac_summary` (the whole turn's narration) for a pre-existing checkpointed
+    state or a test that only ever set `dac_summary` -- everything the model
+    said earlier in the turn, including any protocol text it echoed or a
+    finding body quoting "VERDICT: PASS", is never in scope for the verdict.
+
     Conservative by design: a review clears a PR only on an explicit
     `VERDICT: PASS` line OR a CHANGES_REQUESTED whose every finding is a
     `nit` -- three of the Reflex build's six rework cycles were pbxproj
@@ -408,20 +419,21 @@ def classify(state: ReviewerState) -> dict[str, Any]:
     input, never sufficient alone"), but the one thing it must never do is
     wrongly signal "safe to merge".
     """
-    dac_summary = state.get("dac_summary") or ""
-    verdict_match = _find_verdict(dac_summary)
+    source = state.get("dac_last_text") or state.get("dac_summary") or ""
+    verdict_match = _find_verdict(source)
 
     comments: list[InlineComment] = []
     if verdict_match is not None:
-        comments = _parse_inline_comments(dac_summary, verdict_match.end())
+        comments = _parse_inline_comments(source, verdict_match.end())
     blocking = [c for c in comments if c.severity == "blocking"]
-    # A review clears the PR on an explicit PASS, or on a CHANGES_REQUESTED
-    # whose parsed findings are ALL nits. A CHANGES_REQUESTED with no
-    # machine-parseable findings still blocks (conservative): the reviewer
-    # asked for changes in prose we couldn't parse -- never silently upgrade
-    # that to a pass.
-    passed = verdict_match is not None and (
-        verdict_match.group(1).upper() == _VERDICT_PASS or (bool(comments) and not blocking)
+    # A review clears the PR on an explicit PASS with no blocking findings, or
+    # on a CHANGES_REQUESTED whose parsed findings are ALL nits. Any blocking
+    # finding vetoes a PASS: a verdict line and its own findings disagreeing
+    # must resolve conservatively.
+    passed = (
+        verdict_match is not None
+        and not blocking
+        and (verdict_match.group(1).upper() == _VERDICT_PASS or bool(comments))
     )
 
     return {"review_passed": passed, "review_comments": comments}

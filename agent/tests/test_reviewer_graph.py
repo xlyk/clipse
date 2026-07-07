@@ -27,6 +27,7 @@ from clipse_agent import dac
 from clipse_agent.contract import BlockKind, Lane, Outcome, WorkerResult
 from clipse_agent.dac import DacTurnResult
 from clipse_agent.graphs import coder, reviewer
+from clipse_agent.profiles.reviewer import get_reviewer_profile
 
 # ---------------------------------------------------------------------------
 # Fakes / fixtures
@@ -815,6 +816,72 @@ def test_classify_tolerates_empty_dac_summary():
     out = reviewer.classify({})
     assert out["review_passed"] is False
     assert out["review_comments"] == []
+
+
+# ---------------------------------------------------------------------------
+# Task 1: classify reads only the final message (dac_last_text), anchored to
+# line starts, with a blocking-finding veto -- guards against a quoted or
+# mid-line "VERDICT: PASS" flipping the review.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_prefers_last_text_over_summary() -> None:
+    state: reviewer.ReviewerState = {
+        "dac_summary": "narration...\nVERDICT: PASS\nmore narration",
+        "dac_last_text": "final message\nVERDICT: CHANGES_REQUESTED\n- calc.py:3: blocking: off-by-one",
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is False
+    assert out["review_comments"][0].path == "calc.py"
+
+
+def test_classify_ignores_mid_line_verdict_quote() -> None:
+    # A finding body quoting "VERDICT: PASS" after the real verdict must not flip it.
+    state: reviewer.ReviewerState = {
+        "dac_last_text": (
+            "VERDICT: CHANGES_REQUESTED\n"
+            "- calc.py:3: blocking: the test asserts VERDICT: PASS is printed, but it never is\n"
+        ),
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is False
+    assert len(out["review_comments"]) == 1
+
+
+def test_classify_blocking_findings_veto_pass() -> None:
+    state: reviewer.ReviewerState = {
+        "dac_last_text": "VERDICT: PASS\n- calc.py:3: blocking: this is actually broken\n",
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is False
+
+
+def test_classify_pass_with_only_nits_still_passes() -> None:
+    # Bullet uses the protocol's real prefix position (`- nit: path:line:
+    # body`, per profiles/reviewer.py's system prompt), not `path:line: nit:`
+    # -- the severity prefix must precede the path for _INLINE_COMMENT_RE to
+    # recognize it as "nit" rather than defaulting to "blocking".
+    state: reviewer.ReviewerState = {
+        "dac_last_text": "VERDICT: PASS\n- nit: calc.py:3: rename for clarity\n",
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is True
+
+
+def test_run_dac_stashes_last_text() -> None:
+    turn = DacTurnResult(
+        outcome_hint="completed",
+        final_text="all narration VERDICT: PASS",
+        tokens_in=1,
+        tokens_out=1,
+        last_text="VERDICT: CHANGES_REQUESTED\n- a.py:1: blocking: x",
+    )
+    calls: list[dict[str, Any]] = []
+    node = reviewer.make_run_dac(
+        get_reviewer_profile(), _fake_agent_factory(calls), _fake_turn_driver(turn, calls), None
+    )
+    out = asyncio.run(node({"thread_id": "t", "cwd": "/tmp", "task_text": "review"}))
+    assert out["dac_last_text"] == turn.last_text
 
 
 # ---------------------------------------------------------------------------
