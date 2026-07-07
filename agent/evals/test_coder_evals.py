@@ -134,3 +134,36 @@ def test_c6_rework_with_vague_feedback(tmp_path: Path, eval_env: Path, record_re
     assert result.outcome in (Outcome.needs_review, Outcome.blocked)
     if result.outcome == Outcome.needs_review:
         assert changed, "needs_review with an unchanged diff is the CLI-15 dead loop"
+
+
+def test_c7_conflict_resolution_turn(tmp_path: Path, eval_env: Path, record_result) -> None:
+    repo = make_fixture_repo(
+        tmp_path,
+        files={"greeting.py": 'GREETING = "hello"\n'},
+    )
+    # Branch and base both rewrite the same line -> guaranteed conflict.
+    commit_on_branch(repo, {"greeting.py": 'GREETING = "hello from the branch"\n'}, "EVAL-1: branch greeting")
+    advance_base(repo, {"greeting.py": 'GREETING = "hello from base"\n'}, "base greeting")
+
+    result = run_coder_turn(
+        repo,
+        "EVAL-1: change the greeting.\n\n"
+        "greeting.py's GREETING should say hello from the branch.",
+    )
+    record_result(result)
+
+    assert result.outcome == Outcome.needs_review
+    # The merge concluded: no in-progress merge, no markers, two-parent commit.
+    merge_head = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        cwd=repo.worktree, capture_output=True, text=True,
+    )
+    assert merge_head.returncode != 0, "merge left in progress"
+    content = (repo.worktree / "greeting.py").read_text()
+    assert "<<<<<<<" not in content and ">>>>>>>" not in content
+    parents = git_out(repo.worktree, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    assert len(parents) == 3, "expected a two-parent merge commit at HEAD"
+    # Pushed fast-forward (no force): remote tip == local tip.
+    assert git_out(repo.worktree, "rev-parse", "HEAD") == git_out(
+        repo.worktree, "rev-parse", f"origin/{repo.branch}"
+    )
