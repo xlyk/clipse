@@ -52,9 +52,13 @@ def test_l2a_seeded_defect_review_drives_convergence(tmp_path: Path, eval_env: P
     )
 
     last = out.rounds[-1]
+    # None (not a vacuous True) when convergence took a single round: there
+    # was no feedback in play to have addressed.
     feedback_addressed = (
-        len(out.rounds) < 2 or out.rounds[1].coder_head != out.rounds[0].coder_head
+        None if len(out.rounds) < 2
+        else out.rounds[1].coder_head != out.rounds[0].coder_head
     )
+    reviewer_summaries = [r.reviewer.summary[:500] for r in out.rounds if r.reviewer is not None]
     record_result(
         last.reviewer or last.coder,
         rounds_to_done=out.rounds_to_done,
@@ -62,6 +66,7 @@ def test_l2a_seeded_defect_review_drives_convergence(tmp_path: Path, eval_env: P
         loop_tokens_in=out.tokens_in,
         loop_tokens_out=out.tokens_out,
         feedback_addressed=feedback_addressed,
+        reviewer_summaries=reviewer_summaries,
     )
 
     assert out.rounds_to_done is not None, f"never converged: {out.round_outcomes}"
@@ -72,7 +77,9 @@ def test_l2a_seeded_defect_review_drives_convergence(tmp_path: Path, eval_env: P
     # R6 actionability: a rework round that shipped a byte-identical diff is
     # the CLI-15 dead loop surfacing at loop level -- the reviewer's summary
     # did not carry enough signal (AGENTS.md open follow-up made measurable).
-    assert feedback_addressed, "round-2 coder did not change the diff after changes_requested"
+    # Only a fault when feedback genuinely existed and went unaddressed --
+    # None (converged round 1, nothing to address) is not a failure.
+    assert feedback_addressed is not False, "round-2 coder did not change the diff after changes_requested"
     assert (eval_env / "pr.json").exists(), "converged without ever opening a PR"
 
 
@@ -88,12 +95,14 @@ def test_l2b_clean_task_converges_first_round(tmp_path: Path, eval_env: Path, re
     )
 
     last = out.rounds[-1]
+    reviewer_summaries = [r.reviewer.summary[:500] for r in out.rounds if r.reviewer is not None]
     record_result(
         last.reviewer or last.coder,
         rounds_to_done=out.rounds_to_done,
         round_outcomes=out.round_outcomes,
         loop_tokens_in=out.tokens_in,
         loop_tokens_out=out.tokens_out,
+        reviewer_summaries=reviewer_summaries,
     )
 
     assert out.rounds_to_done is not None, f"never converged: {out.round_outcomes}"
@@ -101,3 +110,10 @@ def test_l2b_clean_task_converges_first_round(tmp_path: Path, eval_env: Path, re
     # trivial diff is reviewer-calibration signal -- visible in the recorded
     # metric -- not a harness failure). >2 fails: that is a broken loop.
     assert out.rounds_to_done <= 2, f"clean trivial PR burned {out.rounds_to_done} review rounds"
+    # Deterministic honesty checks: convergence alone doesn't prove the task
+    # was actually done -- confirm the file landed with the right content and
+    # that a PR was genuinely opened along the way.
+    authors = repo.worktree / "AUTHORS"
+    assert authors.exists(), "converged without ever creating AUTHORS"
+    assert authors.read_text().strip() == "clipse evals"
+    assert (eval_env / "pr.json").exists(), "converged without ever opening a PR"
