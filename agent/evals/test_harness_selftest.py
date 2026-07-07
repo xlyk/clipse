@@ -98,6 +98,22 @@ def test_report_summarize_joins_metric_and_status_rows(tmp_path: Path) -> None:
     assert "1 passed" in out and "1 skipped" in out
 
 
+def test_report_summarize_counts_loop_tokens_once(tmp_path: Path) -> None:
+    # An L2 row carries both tokens_in/out (the final turn only) and
+    # loop_tokens_in/out (the whole convergence loop). Using both would
+    # double-count the final turn's share; the loop total must win outright.
+    rows = tmp_path / "run.jsonl"
+    rows.write_text(
+        json.dumps({"test": "evals/x.py::l2", "ts": 1.0, "outcome": "done",
+                    "tokens_in": 999, "tokens_out": 999,
+                    "loop_tokens_in": 50, "loop_tokens_out": 6,
+                    "turn_count": 1, "block_kind": None}) + "\n"
+    )
+    out = report.summarize(rows)
+    assert "50" in out and "6" in out
+    assert "999" not in out
+
+
 def test_convergence_loop_threads_feedback_and_stops_on_done(tmp_path: Path) -> None:
     repo = make_fixture_repo(tmp_path, files={"README.md": "# demo\n"})
     coder_calls: list[str] = []

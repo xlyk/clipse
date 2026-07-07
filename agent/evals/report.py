@@ -29,8 +29,13 @@ def summarize(path: Path) -> str:
             entry["duration_s"] = row.get("duration_s", 0.0)
         if "outcome" in row:
             entry["outcomes"].append(row["outcome"])
-            entry["tokens_in"] += row.get("tokens_in", 0)
-            entry["tokens_out"] += row.get("tokens_out", 0)
+            # L2 convergence rows carry loop_tokens_in/out -- the FULL
+            # multi-round loop's tokens -- alongside tokens_in/out, which hold
+            # only the final turn's tokens. Prefer the loop total so it is
+            # counted once, not added on top of the (already-included) final
+            # turn's tokens.
+            entry["tokens_in"] += row.get("loop_tokens_in", row.get("tokens_in", 0))
+            entry["tokens_out"] += row.get("loop_tokens_out", row.get("tokens_out", 0))
 
     lines = [f"eval run: {path.resolve().name}", ""]
     lines.append(f"{'CASE':<70} {'STATUS':<8} {'WALL(s)':>8} {'TOK IN':>10} {'TOK OUT':>8}  OUTCOMES")
