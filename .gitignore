@@ -39,3 +39,5 @@ build/
 
 # os
 .DS_Store
+
+agent/evals/results/
