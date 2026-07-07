@@ -767,6 +767,14 @@ verify() {
     done
   done < "$MANIFEST"
 
+  # R5 (optional, report-only): reviewer inline-comment placement validity.
+  # Never affects the smoke verdict; requires gh auth against $TARGET_REPO.
+  if command -v python3 >/dev/null 2>&1; then
+    info "verify: inline-comment placement (report-only)"
+    python3 "$(dirname "${BASH_SOURCE[0]}")/check-placement.py" --repo "$TARGET_REPO" \
+      || warn "placement check failed (non-fatal)"
+  fi
+
   if [[ "$fails" -eq 0 ]]; then
     info "verify: all assertions passed"
     return 0
