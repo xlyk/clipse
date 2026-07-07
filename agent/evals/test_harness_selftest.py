@@ -7,11 +7,11 @@ import os
 import subprocess
 from pathlib import Path
 
-from clipse_agent.contract import Lane, Outcome, Tokens, WorkerResult
+from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 
 import conftest as evals_conftest
 import report
-from harness import advance_base, commit_on_branch, git_out, make_fixture_repo, seed_pr
+from harness import advance_base, commit_on_branch, git_out, make_fixture_repo, run_convergence_loop, seed_pr
 
 
 def test_fixture_repo_roundtrip(tmp_path: Path) -> None:
@@ -60,11 +60,14 @@ def test_seed_pr_matches_branch_head(tmp_path: Path, eval_env: Path) -> None:
     assert pr["headRefOid"] == git_out(repo.worktree, "rev-parse", "HEAD")
 
 
-def _wr(outcome: Outcome = Outcome.done, *, tokens_in: int = 10, tokens_out: int = 2) -> WorkerResult:
+def _wr(
+    outcome: Outcome = Outcome.done, *, tokens_in: int = 10, tokens_out: int = 2, summary: str = "s"
+) -> WorkerResult:
     return WorkerResult(
         run_id="r1", issue_id="EVAL-1", lane=Lane.coder, outcome=outcome,
-        summary="s", artifacts=[], thread_id="t", turn_count=1,
+        summary=summary, artifacts=[], thread_id="t", turn_count=1,
         tokens=Tokens(**{"in": tokens_in, "out": tokens_out}),
+        block_kind=BlockKind.needs_input if outcome is Outcome.blocked else None,
     )
 
 
@@ -92,3 +95,54 @@ def test_report_summarize_joins_metric_and_status_rows(tmp_path: Path) -> None:
     assert "t1" in out and "passed" in out and "42" in out and "100" in out
     assert "skipped" in out
     assert "1 passed" in out and "1 skipped" in out
+
+
+def test_convergence_loop_threads_feedback_and_stops_on_done(tmp_path: Path) -> None:
+    repo = make_fixture_repo(tmp_path, files={"README.md": "# demo\n"})
+    coder_calls: list[str] = []
+
+    def fake_coder(r, issue_text, *, review_feedback="", thread_id="", checkpoint_db=None, **_):
+        coder_calls.append(review_feedback)
+        return _wr(Outcome.needs_review)
+
+    # _wr defaults summary="s" -- the loop must thread that exact string into
+    # the round-2 coder call (what LatestReworkFeedback would carry).
+    reviewer_results = iter([
+        _wr(Outcome.changes_requested), _wr(Outcome.done),
+    ])
+
+    def fake_reviewer(r, issue_text, *, thread_id="", checkpoint_db=None, **_):
+        return next(reviewer_results)
+
+    out = run_convergence_loop(
+        repo, "task", coder_turn=fake_coder, reviewer_turn=fake_reviewer,
+        thread_id="t", checkpoint_db=None,
+    )
+    assert out.rounds_to_done == 2
+    assert len(out.rounds) == 2
+    assert coder_calls[0] == ""            # round 1: fresh task, no feedback
+    assert coder_calls[1] == "s"           # round 2: the reviewer's summary verbatim
+    assert out.tokens_in == 4 * 10 and out.tokens_out == 4 * 2
+
+
+def test_convergence_loop_bounds_at_max_rounds(tmp_path: Path) -> None:
+    repo = make_fixture_repo(tmp_path, files={"README.md": "# demo\n"})
+    out = run_convergence_loop(
+        repo, "task",
+        coder_turn=lambda *a, **k: _wr(Outcome.needs_review),
+        reviewer_turn=lambda *a, **k: _wr(Outcome.changes_requested),
+        max_rounds=3, checkpoint_db=None,
+    )
+    assert out.rounds_to_done is None and len(out.rounds) == 3
+
+
+def test_convergence_loop_stops_when_coder_blocks(tmp_path: Path) -> None:
+    repo = make_fixture_repo(tmp_path, files={"README.md": "# demo\n"})
+    out = run_convergence_loop(
+        repo, "task",
+        coder_turn=lambda *a, **k: _wr(Outcome.blocked),
+        reviewer_turn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("reviewer must not run")),
+        checkpoint_db=None,
+    )
+    assert out.rounds_to_done is None
+    assert len(out.rounds) == 1 and out.rounds[0].reviewer is None
