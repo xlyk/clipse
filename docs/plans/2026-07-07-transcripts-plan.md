@@ -15,7 +15,7 @@
 - `make test` (`test-go` + `test-py`) is the gate and must stay green after every task; `make lint` (`go vet` + `gofmt` + `ruff`) must stay clean.
 - A transcript write failure must NEVER fail, block, or even perturb a run — `TranscriptWriter.emit` catches everything and logs to stderr. This is the one correctness invariant this whole feature is not allowed to violate.
 - Go kernel stays LLM-free and stays exactly analogous to the existing `CheckpointDB`/`checkpointDBPath` wiring — no new vocabulary, no new decision points, just a second derived path next to it.
-- Work on branch `feat/agent-transcripts`. Commits: Conventional Commits, casual/lowercase, no trailing period, one concern each. Never `git add -A`/`git add .` at the repo root (per AGENTS.md, an untracked `.superpowers/` SDD ledger must never be committed).
+- Work on branch `feat/transcripts`. Commits: Conventional Commits, casual/lowercase, no trailing period, one concern each. Never `git add -A`/`git add .` at the repo root (per AGENTS.md, an untracked `.superpowers/` SDD ledger must never be committed).
 - Signatures quoted below were copied from (or directly verified against) the real source as it stands at `main@f801d46` — `agent/src/clipse_agent/dac.py`, `graphs/coder.py`, `graphs/reviewer.py`, `worker.py`, `internal/spawn/{spawn,local}.go`, `dispatcher/spawn.go` — not guessed.
 
 ## File Structure
@@ -56,7 +56,7 @@ AGENTS.md                        # modify — one bullet
 - [ ] **Step 1: Create the working branch**
 
 ```bash
-git checkout -b feat/agent-transcripts
+git checkout -b feat/transcripts
 ```
 
 ---

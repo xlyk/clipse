@@ -78,7 +78,10 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
   types: `turn_start`/`turn_end` (lane, run_id, thread_id, assistant_id,
   model, plus task_text/outcome+tokens respectively), `assistant` (text),
   `tool_call` (name, args), `tool_result` (name, status, content truncated to
-  8k chars), `interrupt` (payload repr). A write failure is logged to stderr
+  8k chars), `interrupt` (payload repr). A turn that crashes mid-stream still
+  emits `{"event": "turn_end", "error": "<exc>"}` after flushing the partial
+  message; the 8k truncation caps both `tool_result` content and `assistant`
+  text. A write failure is logged to stderr
   and swallowed -- the transcript is a debug aid, never load-bearing for a
   run's outcome. Threaded end to end exactly like the checkpoint DB path:
   `dispatcher.transcriptPath` (derived from `cfg.BoardDir`) ->
