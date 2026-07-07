@@ -241,3 +241,80 @@ func TestTick_ContinueRespawnFailureDoesNotLeakInflight(t *testing.T) {
 		t.Errorf("issue-2 BoardStatus = %q, want review", issue2.BoardStatus)
 	}
 }
+
+// TestTick_GetIssueFailureDuringReconcile_DoesNotLoseResult asserts the fix
+// for the destructive-result-consumption bug: a GetIssue failure inside
+// applyResult must not drop the worker's result on the floor. Dispatcher.store
+// is a concrete *store.Store (no interface seam to mock a targeted failure),
+// so this simulates a real, store-level GetIssue failure the only way
+// available: deleting the row out from under the live run via a raw SQL
+// DELETE against the same file (store.DB() is an established test escape
+// hatch -- see dispatcher/recover_test.go's UPDATE-based adversarial-state
+// setup). There is no production code path that deletes an issue row; this
+// stands in for the realistic cause, a transient store hiccup.
+func TestTick_GetIssueFailureDuringReconcile_DoesNotLoseResult(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	spawner := newFakeSpawner()
+	spawner.Results["issue-1"] = spawn.Result{
+		Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeNeedsReview, Summary: "PR opened"},
+	}
+	ws := newStubWorkspacer(t.TempDir())
+	lc := &linear.MockClient{}
+	// Reviewer capacity off: once tick 3 lands issue-1 in review, the same
+	// tick's later selectAndClaim phase would otherwise immediately re-claim
+	// it for a legitimate reviewer run (cross-lane claiming dispatches by
+	// column, not lane_label -- see AGENTS.md), which would mask the
+	// ClaimLock assertion below behind an unrelated, correct claim.
+	cfg := testConfig()
+	cfg.Caps.PerLane.Reviewer = 0
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+
+	// Tick 1: claim + spawn issue-1 (now inflight, running).
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("tick 1: unexpected error: %v", err)
+	}
+
+	// Snapshot the full row so it can be restored byte-for-byte, then delete
+	// it out from under the live run.
+	before, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue (snapshot): unexpected error: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM issues WHERE id = ?`, "issue-1"); err != nil {
+		t.Fatalf("simulating store failure (DELETE): unexpected error: %v", err)
+	}
+
+	// Tick 2 drains the spawned run's needs_review result; applyResult's
+	// GetIssue fails against the deleted row, so this tick genuinely errors
+	// -- expected, and unrelated to the bug under test.
+	if err := d.Tick(ctx); err == nil {
+		t.Fatalf("tick 2: want an error surfaced from the simulated GetIssue failure")
+	}
+
+	// The simulated hiccup clears (a real one would too, eventually):
+	// restore the row exactly as it was, claim and all.
+	if err := s.UpsertIssue(ctx, *before); err != nil {
+		t.Fatalf("restoring issue-1: unexpected error: %v", err)
+	}
+
+	// Tick 3: the needs_review result must not have been silently dropped on
+	// tick 2's failure -- it must still be applied now that the store is
+	// healthy again.
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("tick 3: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue after tick 3: unexpected error: %v", err)
+	}
+	if got.BoardStatus != string(contract.ColumnReview) {
+		t.Errorf("BoardStatus = %q, want review (the needs_review result must survive a transient GetIssue failure, not be lost)", got.BoardStatus)
+	}
+	if got.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared (run-1 closed out normally)")
+	}
+}

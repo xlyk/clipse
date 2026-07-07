@@ -65,6 +65,18 @@ func (d *Dispatcher) applyResult(ctx context.Context, rr runResult) error {
 
 	issue, err := d.store.GetIssue(ctx, rr.issueID)
 	if err != nil {
+		// Put rr back on the channel rather than drop it: rr's Wait-goroutine
+		// has already exited (a one-shot send), so if this error propagates
+		// without holding onto rr somehow, that run's actual outcome is lost
+		// forever -- inf stays in d.inflight, Heartbeat keeps renewing its
+		// still-valid store claim every tick, and the lane-cap slot it
+		// occupies never frees. d.results has exactly one reader (this Tick
+		// goroutine), so sending back into it here is race-free; the next
+		// tick's drainResults retries applyResult for rr from the top. A
+		// GetIssue failure has no other realistic cause than a transient
+		// store hiccup (nothing in production deletes issue rows), so this
+		// self-heals within a tick or two.
+		d.results <- rr
 		return fmt.Errorf("loading issue %s for run %s: %w", rr.issueID, rr.runID, err)
 	}
 
