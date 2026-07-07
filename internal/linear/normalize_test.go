@@ -139,3 +139,40 @@ func TestNormalizeCandidateIssues_MalformedJSON(t *testing.T) {
 		t.Fatal("NormalizeCandidateIssues: expected error for malformed JSON, got nil")
 	}
 }
+
+func TestNormalizeCandidateIssues_CancelledStateTypeOverridesName(t *testing.T) {
+	// The state's NAME is deliberately something a name-based lookup would
+	// never recognize ("Won't Fix") -- proving the mapping is driven by the
+	// fixed, unrenameable state TYPE, not the team-configurable display name.
+	const raw = `{
+		"data": {
+			"issues": {
+				"nodes": [
+					{
+						"id": "cancelled-1",
+						"identifier": "CLP-16",
+						"title": "Abandoned thing",
+						"description": "",
+						"priority": 3,
+						"branchName": "clp-16-abandoned",
+						"updatedAt": "2026-07-01T16:00:00.000Z",
+						"state": { "name": "Won't Fix", "type": "canceled" },
+						"labels": { "nodes": [] },
+						"inverseRelations": { "nodes": [] }
+					}
+				]
+			}
+		}
+	}`
+
+	issues, err := linear.NormalizeCandidateIssues([]byte(raw))
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: unexpected error: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("len(issues) = %d, want 1", len(issues))
+	}
+	if issues[0].Status != "cancelled" {
+		t.Errorf("Status = %q, want %q (type-driven, not name-driven)", issues[0].Status, "cancelled")
+	}
+}

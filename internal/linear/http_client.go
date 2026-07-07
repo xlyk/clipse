@@ -21,9 +21,9 @@ const apiKeyEnvVar = "LINEAR_API_KEY"
 
 // CandidateIssuesQuery fetches active-state issues on the configured team
 // along with the fields NormalizeCandidateIssues needs: title, description,
-// workflow state name, agent:<lane> labels, inverse blocking relations (the
-// issues that block this one — see below), priority, branch name, and
-// updatedAt.
+// workflow state name AND type, agent:<lane> labels, inverse blocking
+// relations (the issues that block this one — see below), priority, branch
+// name, and updatedAt.
 //
 // It fetches inverseRelations, NOT relations: a dependency of an issue is an
 // issue that blocks it, and Linear records a blocking relationship once, on
@@ -37,15 +37,24 @@ const apiKeyEnvVar = "LINEAR_API_KEY"
 // CLIPSE_ISSUE_TEXT) -- without them here, that env var is always empty
 // regardless of anything downstream.
 //
-// Excluding the terminal state types (Linear has no "active" type; the real
-// types are backlog/unstarted/started/completed/canceled/triage, plus
-// duplicate) keeps completed/cancelled/duplicate work out of the candidate
-// set; the dispatcher decides dispatchability from Status/Deps, not from this
-// query. Filtering to team.key scopes the candidate set to the single team
+// Excluding "completed" and "duplicate" (Linear has no "active" type; the
+// real types are backlog/unstarted/started/completed/canceled/triage) keeps
+// that work out of the candidate set; the dispatcher decides dispatchability
+// from Status/Deps, not from this query. "canceled" is DELIBERATELY left in
+// scope, unlike the other two: a completed issue's board_status is set by the
+// dispatcher's OWN action (the git-operator lane merges it, then the
+// dispatcher writes board_status="done" itself, before Linear's state even
+// changes) and a duplicate was never a candidate to begin with, but
+// cancellation is a human-only Linear event the dispatcher has no other way
+// to learn about — excluding it here left a Linear-cancelled blocker's stale
+// store row frozen at its pre-cancellation status forever, permanently
+// stalling any dependent still waiting on it in Todo (see
+// dispatcher/promote.go's dependency-gating, and status.go's cancelled-type
+// mapping). Filtering to team.key scopes the candidate set to the single team
 // clipse is configured against (config.Config.TeamKey), so a workspace with
 // other teams' issues never surfaces them as candidates.
 const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
-  issues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } }, team: { key: { eq: $teamKey } } }) {
+  issues(filter: { state: { type: { nin: ["completed", "duplicate"] } }, team: { key: { eq: $teamKey } } }) {
     nodes {
       id
       identifier
@@ -56,6 +65,7 @@ const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
       updatedAt
       state {
         name
+        type
       }
       labels {
         nodes {

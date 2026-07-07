@@ -106,6 +106,29 @@ func TestBuildCommentRequest_ExactPayload(t *testing.T) {
 	assertJSONEqual(t, body, want)
 }
 
+func TestCandidateIssuesQuery_KeepsCancelledIssuesInScope(t *testing.T) {
+	// "canceled" must stay OUT of the state-type exclusion filter: it is the
+	// dispatcher's only signal that a Linear-cancelled issue exists at all.
+	// Unlike "completed" (the dispatcher learns about a merge from its OWN
+	// action, before Linear's state even changes) and "duplicate" (never a
+	// candidate to begin with), cancellation is a human-only Linear event.
+	// Excluding it left a cancelled blocker's stale store row frozen forever,
+	// permanently stalling any dependent still waiting on it in Todo.
+	if strings.Contains(linear.CandidateIssuesQuery, `"canceled"`) {
+		t.Errorf("candidate query excludes canceled issues, want them included so cancellation is observable")
+	}
+	for _, excluded := range []string{"completed", "duplicate"} {
+		if !strings.Contains(linear.CandidateIssuesQuery, `"`+excluded+`"`) {
+			t.Errorf("candidate query must still exclude %q", excluded)
+		}
+	}
+	// state.type must be fetched so normalize can detect a cancelled state
+	// regardless of its (per-team-configurable) display name.
+	if !strings.Contains(linear.CandidateIssuesQuery, "type") {
+		t.Errorf("candidate query must fetch state.type for cancellation detection")
+	}
+}
+
 func mustMarshal(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

@@ -32,9 +32,27 @@ var statusByWorkflowName = map[string]string{
 	"blocked":     "blocked",
 }
 
-// statusFromWorkflowName maps a Linear workflow-state name to our Column
-// enum value, matching case-insensitively. Unrecognized names map to "todo".
-func statusFromWorkflowName(name string) string {
+// statusFromWorkflowName maps a Linear workflow-state name (and its fixed
+// state TYPE) to our board status. stateType is checked first and takes
+// priority: Linear's six state types (backlog/unstarted/started/completed/
+// canceled/triage) are a closed, unrenameable vocabulary, unlike a state's
+// display NAME, which a team can call anything ("Won't Fix", "Abandoned",
+// ...). Name-matching alone (as every other column here still does) would be
+// fragile specifically for cancellation: an unrecognized name falls back to
+// "todo" (see below), which would make a cancelled blocker look ACTIVE
+// instead of terminal -- the opposite of what dispatcher/promote.go's
+// dependency gating needs. "cancelled" (double-l) is deliberately not a
+// contract.Column value; issues.board_status is unconstrained TEXT (see
+// internal/store/migrations.go), and dispatcher/promote.go +
+// dispatcher/recover.go already special-case this exact string as terminal.
+//
+// Names not present in statusByWorkflowName fall back to "todo" so an
+// unrecognized/renamed Linear state doesn't crash normalization; it just
+// won't be picked up as ready/running/etc until the mapping is fixed.
+func statusFromWorkflowName(name, stateType string) string {
+	if stateType == "canceled" {
+		return "cancelled"
+	}
 	if col, ok := statusByWorkflowName[strings.ToLower(name)]; ok {
 		return col
 	}

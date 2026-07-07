@@ -52,6 +52,9 @@ func (d *Dispatcher) recoverOrphanRun(ctx context.Context, run store.Run) error 
 		return fmt.Errorf("loading issue %s: %w", run.IssueID, err)
 	}
 
+	// "cancelled" (like "done") is a genuinely terminal issue whose leftover
+	// run row is restart debris, not a real orphan -- see promote.go's
+	// terminalStatuses for how a store row actually reaches this string.
 	if issue.BoardStatus == "done" || issue.BoardStatus == "cancelled" {
 		// The issue already finished; this run row is just restart debris.
 		// Blocking here would flap a terminal ticket back to blocked and

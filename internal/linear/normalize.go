@@ -28,6 +28,7 @@ type issueNode struct {
 	UpdatedAt   string `json:"updatedAt"`
 	State       struct {
 		Name string `json:"name"`
+		Type string `json:"type"`
 	} `json:"state"`
 	Labels struct {
 		Nodes []struct {
@@ -100,7 +101,7 @@ func normalizeIssueNode(n issueNode) (Issue, error) {
 		Identifier:  n.Identifier,
 		Title:       n.Title,
 		Description: n.Description,
-		Status:      statusFromWorkflowName(n.State.Name),
+		Status:      statusFromWorkflowName(n.State.Name, n.State.Type),
 		Lane:        laneFromLabels(labelNames),
 		Deps:        deps,
 		Priority:    n.Priority,
