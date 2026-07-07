@@ -199,6 +199,7 @@ class ReviewerState(TypedDict, total=False):
     pr_url: str | None
     comments_posted: int
     comments_failed: int
+    failed_comments: list[InlineComment]
 
     # --- emit_result ---
     result: WorkerResult
@@ -497,7 +498,7 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
         # still reaches the kernel via this run's typed JSON result.
         view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd, check=False)
         if view.returncode != 0:
-            return {"pr_url": None, "comments_posted": 0, "comments_failed": 0}
+            return {"pr_url": None, "comments_posted": 0, "comments_failed": 0, "failed_comments": []}
         pr_info = json.loads(view.stdout)
         pr_number = pr_info["number"]
         commit_sha = pr_info["headRefOid"]
@@ -540,7 +541,12 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
             cwd,
         )
 
-        return {"pr_url": pr_info.get("url"), "comments_posted": posted, "comments_failed": len(failed)}
+        return {
+            "pr_url": pr_info.get("url"),
+            "comments_posted": posted,
+            "comments_failed": len(failed),
+            "failed_comments": failed,
+        }
 
     return _node
 
@@ -641,7 +647,7 @@ def emit_result(state: ReviewerState) -> dict[str, Any]:
         result = WorkerResult(
             **common,
             outcome=Outcome.changes_requested,
-            summary=_changes_summary(state),
+            summary=_changes_summary(state, state.get("failed_comments") or ()),
             artifacts=[],
             pr_url=state.get("pr_url"),
         )

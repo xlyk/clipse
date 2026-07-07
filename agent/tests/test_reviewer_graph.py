@@ -475,7 +475,7 @@ def test_post_comments_no_pr_is_graceful() -> None:
             "review_comments": [reviewer.InlineComment(path="a.py", line=3, body="x")],
         }
     )
-    assert out == {"pr_url": None, "comments_posted": 0, "comments_failed": 0}
+    assert out == {"pr_url": None, "comments_posted": 0, "comments_failed": 0, "failed_comments": []}
     # Nothing after the failed view: no gh api, no gh pr comment.
     assert all(call.argv[:2] != ["gh", "api"] for call in runner.calls)
 
@@ -503,6 +503,10 @@ def test_post_comments_inline_422_degrades_to_summary() -> None:
     assert out["comments_posted"] == 0
     assert out["comments_failed"] == 2
     assert out["pr_url"] == "https://x/pull/7"
+    assert out["failed_comments"] == [
+        reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+        reviewer.InlineComment(path="b.py", line=9, body="unused import", severity="nit"),
+    ]
     # The summary comment still ran and carries the failed findings inline.
     summary_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
     assert len(summary_calls) == 1
@@ -1116,6 +1120,25 @@ def test_emit_result_changes_requested_shape():
     assert result.outcome == Outcome.changes_requested
     assert result.pr_url == "https://github.com/acme/widgets/pull/1"
     assert result.turn_count == 2
+
+
+def test_emit_result_changes_requested_summary_carries_failed_findings() -> None:
+    state: reviewer.ReviewerState = {
+        "run_id": "r1",
+        "issue_id": "i1",
+        "thread_id": "t1",
+        "dac_summary": "found problems",
+        "review_passed": False,
+        "review_comments": [
+            reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+            reviewer.InlineComment(path="b.py", line=9, body="unused import", severity="nit"),
+        ],
+        "failed_comments": [reviewer.InlineComment(path="a.py", line=3, body="off-by-one")],
+    }
+    out = reviewer.emit_result(state)
+    summary = out["result"].summary
+    assert "Posted 1 inline comment(s)." in summary
+    assert "a.py:3: off-by-one" in summary
 
 
 def test_emit_result_blocked_needs_input_shape():
