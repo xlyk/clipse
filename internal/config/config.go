@@ -158,6 +158,56 @@ type ModelParams struct {
 	Reviewer  map[string]any `yaml:"reviewer"`
 }
 
+// ShellPolicy is a lane's shell posture for its DAC agent: the sentinel
+// `all` (All=true — the worker builds the agent with auto_approve=True, no
+// allow-list middleware, no dangerous-pattern checks), or an explicit
+// restrictive command list (the worker keeps auto_approve=False,
+// interrupt_shell_only=True and enforces the list). Decision 2026-07-07: the
+// DEFAULT is All — reflex live-fire showed the restrictive mode's hardcoded
+// pattern checks (redirects like 2>&1, env-prefix commands, heredocs)
+// rejected ~55 legitimate commands across 25 issues, including every `just
+// test`, so coders shipped unverified code. The kernel stays LLM-free: it
+// validates shape only and threads the policy through opaque — the worker
+// (Task 17) is what interprets All/Commands into agent construction kwargs.
+type ShellPolicy struct {
+	All      bool
+	Commands []string
+}
+
+// UnmarshalYAML accepts either the scalar sentinel `all` or a sequence of
+// command names. A key entirely absent from the YAML document never invokes
+// this method at all, leaving the field at ShellPolicy's Go zero value
+// ({All:false, Commands:nil}) — Load's defaultShellPolicy is what turns that
+// absence into the All default; this method only ever runs for a key that IS
+// present, so an explicit `coder: []` decodes to a non-nil, empty Commands
+// slice (verified against gopkg.in/yaml.v3's Node.Decode semantics), distinct
+// from the nil Commands an absent key leaves behind. That distinction is
+// deliberate: see defaultShellPolicy's doc comment.
+func (p *ShellPolicy) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		if value.Value != "all" {
+			return fmt.Errorf("shell_allow_list: scalar value must be \"all\", got %q", value.Value)
+		}
+		*p = ShellPolicy{All: true}
+		return nil
+	}
+	var cmds []string
+	if err := value.Decode(&cmds); err != nil {
+		return fmt.Errorf("shell_allow_list: expected \"all\" or a list of command names: %w", err)
+	}
+	*p = ShellPolicy{Commands: cmds}
+	return nil
+}
+
+// Shell mirrors Models' per-profile keying (coder / coder_docs / reviewer).
+// CoderDocs is the Coder lane's documentation sub-step, matching
+// Models.CoderDocs — not a separate lane.
+type Shell struct {
+	Coder     ShellPolicy `yaml:"coder"`
+	CoderDocs ShellPolicy `yaml:"coder_docs"`
+	Reviewer  ShellPolicy `yaml:"reviewer"`
+}
+
 // Config is the fully parsed and validated clipse configuration.
 type Config struct {
 	Repo Repo `yaml:"repo"`
@@ -208,6 +258,11 @@ type Config struct {
 	// corresponding YAML key is present — no defaulting (see ModelParams's
 	// doc comment).
 	ModelParams ModelParams `yaml:"model_params"`
+	// Shell holds the per-lane shell allow-list policy (see ShellPolicy's doc
+	// comment) threaded down to the worker as --shell-allow-list/
+	// --docs-shell-allow-list. Each field defaults independently to the All
+	// sentinel when absent from the YAML document (defaultShellPolicy).
+	Shell Shell `yaml:"shell_allow_list"`
 	// MaxTokensPerRun is the per-round context (input-token) ceiling passed
 	// to the worker (--max-tokens): the largest single DAC round's input
 	// the worker will allow before blocking capability — not a
@@ -316,20 +371,26 @@ type rawConfig struct {
 	// ModelParams is plain (not pointer-wrapped), like Models: its own
 	// fields (rawModelParams) are maps whose nil zero-value already means
 	// "absent from YAML" — see rawModelParams's doc comment.
-	ModelParams     rawModelParams `yaml:"model_params"`
-	PollIntervalS   *int           `yaml:"poll_interval_s"`
-	Caps            rawCaps        `yaml:"caps"`
-	TurnCap         *int           `yaml:"turn_cap"`
-	MaxRuntimeS     *int           `yaml:"max_runtime_s"`
-	LaneLabelPrefix *string        `yaml:"lane_label_prefix"`
-	MaxAttempts     *int           `yaml:"max_attempts"`
-	ReworkCap       *int           `yaml:"rework_cap"`
-	RecoverCap      *int           `yaml:"recover_cap"`
-	RecoverBackoffS *int           `yaml:"recover_backoff_s"`
-	MaxTokensPerRun *int           `yaml:"max_tokens_per_run"`
-	CheckpointsDir  *string        `yaml:"checkpoints_dir"`
-	BoardDir        *string        `yaml:"board_dir"`
-	EnvAllowlist    []string       `yaml:"env_allowlist"`
+	ModelParams rawModelParams `yaml:"model_params"`
+	// Shell is plain (not pointer-wrapped), like ModelParams: ShellPolicy's
+	// own custom UnmarshalYAML already makes its zero value {All:false,
+	// Commands:nil} mean "absent from YAML" unambiguously (see
+	// ShellPolicy.UnmarshalYAML's doc comment), so no further raw/pointer
+	// mirroring is needed to detect absence before defaulting.
+	Shell           Shell    `yaml:"shell_allow_list"`
+	PollIntervalS   *int     `yaml:"poll_interval_s"`
+	Caps            rawCaps  `yaml:"caps"`
+	TurnCap         *int     `yaml:"turn_cap"`
+	MaxRuntimeS     *int     `yaml:"max_runtime_s"`
+	LaneLabelPrefix *string  `yaml:"lane_label_prefix"`
+	MaxAttempts     *int     `yaml:"max_attempts"`
+	ReworkCap       *int     `yaml:"rework_cap"`
+	RecoverCap      *int     `yaml:"recover_cap"`
+	RecoverBackoffS *int     `yaml:"recover_backoff_s"`
+	MaxTokensPerRun *int     `yaml:"max_tokens_per_run"`
+	CheckpointsDir  *string  `yaml:"checkpoints_dir"`
+	BoardDir        *string  `yaml:"board_dir"`
+	EnvAllowlist    []string `yaml:"env_allowlist"`
 }
 
 // Load reads the clipse config file at path, applies defaults for fields
@@ -374,6 +435,11 @@ func Load(path string) (*Config, error) {
 			Coder:     raw.ModelParams.Coder,
 			CoderDocs: raw.ModelParams.CoderDocs,
 			Reviewer:  raw.ModelParams.Reviewer,
+		},
+		Shell: Shell{
+			Coder:     defaultShellPolicy(raw.Shell.Coder),
+			CoderDocs: defaultShellPolicy(raw.Shell.CoderDocs),
+			Reviewer:  defaultShellPolicy(raw.Shell.Reviewer),
 		},
 		PollIntervalS:   pollIntervalS,
 		TurnCap:         intOrDefault(raw.TurnCap, defaultTurnCap),
@@ -437,6 +503,25 @@ func stringSliceOrDefault(v []string, def []string) []string {
 		return def
 	}
 	return v
+}
+
+// defaultShellPolicy returns p unchanged unless the shell_allow_list key was
+// entirely absent from the YAML document — detected as `!p.All &&
+// p.Commands == nil`, deliberately checking nil rather than len(p.Commands)
+// == 0. ShellPolicy.UnmarshalYAML only ever runs for a key that IS present,
+// so an absent key leaves the Go zero value {All:false, Commands:nil}
+// behind, while an explicit `coder: []` decodes through UnmarshalYAML's
+// sequence branch to a non-nil, empty slice. Checking len() instead of nil
+// would collapse that explicit empty list into the same All default as an
+// absent key, silently discarding a user's (almost certainly mistaken, but
+// explicit) empty allow-list instead of surfacing it as a validate error —
+// see validateShellPolicy's "must be a non-empty list" check, which only
+// fires because this function leaves a non-nil empty Commands alone.
+func defaultShellPolicy(p ShellPolicy) ShellPolicy {
+	if !p.All && p.Commands == nil {
+		return ShellPolicy{All: true}
+	}
+	return p
 }
 
 func validate(cfg *Config) error {
@@ -542,6 +627,46 @@ func validate(cfg *Config) error {
 	}
 	if err := validateModelSpec("models.reviewer", cfg.Models.Reviewer); err != nil {
 		return err
+	}
+	// shell_allow_list.* is checked alongside models.*, for the same
+	// isolation reason: a fixture targeting one shell_allow_list.* error
+	// carries a full valid repo/team_key/team_id/worker.command and no
+	// models.* override, since it predates them.
+	if err := validateShellPolicy("shell_allow_list.coder", cfg.Shell.Coder); err != nil {
+		return err
+	}
+	if err := validateShellPolicy("shell_allow_list.coder_docs", cfg.Shell.CoderDocs); err != nil {
+		return err
+	}
+	if err := validateShellPolicy("shell_allow_list.reviewer", cfg.Shell.Reviewer); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateShellPolicy checks one lane's already-defaulted ShellPolicy shape
+// only — never a command vocabulary, keeping the kernel LLM-free by design
+// (mirrors validateModelSpec's own scoping note). By the time this runs,
+// defaultShellPolicy has already turned an absent key into All=true, so
+// `!All && Commands == nil` is impossible here; what remains to reject is an
+// explicit empty list (`!All && len(Commands) == 0`, which survives
+// defaultShellPolicy precisely because its Commands is non-nil — see that
+// function's doc comment), a list containing the `all` sentinel as an
+// element (the scalar form exists for that), and any empty-string element.
+func validateShellPolicy(field string, p ShellPolicy) error {
+	if p.All {
+		return nil
+	}
+	if len(p.Commands) == 0 {
+		return fmt.Errorf("%s must be \"all\" or a non-empty list of command names", field)
+	}
+	for _, cmd := range p.Commands {
+		if cmd == "" {
+			return fmt.Errorf("%s must not contain empty entries", field)
+		}
+		if cmd == "all" {
+			return fmt.Errorf("%s: use the scalar form `all`, not a list element", field)
+		}
 	}
 	return nil
 }

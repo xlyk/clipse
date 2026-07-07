@@ -9,7 +9,7 @@ import dataclasses
 
 import pytest
 
-from clipse_agent.profiles.coder import CoderProfile, get_coder_profile
+from clipse_agent.profiles.coder import _SHELL_ALLOW_LIST, CoderProfile, get_coder_profile
 
 
 def test_get_coder_profile_returns_a_coder_profile():
@@ -118,8 +118,28 @@ def test_system_prompt_defers_git_and_pr_to_the_platform():
     assert "push your branch and open a pull request" not in prompt
 
 
+def test_get_coder_profile_defaults_to_unrestricted_shell():
+    # New default (decision 2026-07-07): an unconfigured lane runs with no
+    # shell allow-list at all -- dac.build_coder_agent maps this to DAC's
+    # auto_approve=True, matching the kernel's own `all`-policy default
+    # (internal/config's shell_allow_list).
+    assert get_coder_profile().shell_allow_list is None
+
+
+def test_get_coder_profile_shell_allow_list_override():
+    profile = get_coder_profile(shell_allow_list=["git", "gh"])
+
+    # Stored as a tuple (not the list passed in) so the frozen dataclass
+    # stays immutable end to end, mirroring the factory's own reference list.
+    assert profile.shell_allow_list == ("git", "gh")
+    assert isinstance(profile.shell_allow_list, tuple)
+
+
 def test_shell_allow_list_is_minimal_but_sufficient():
-    profile = get_coder_profile()
+    # Restrictive mode: a caller (the kernel, via worker.py) that opts into
+    # an explicit allow-list gets back exactly what it passed, still
+    # matching the reference list this module exports.
+    profile = get_coder_profile(shell_allow_list=_SHELL_ALLOW_LIST)
 
     expected = {
         "git",
@@ -148,7 +168,7 @@ def test_shell_allow_list_is_minimal_but_sufficient():
 
 
 def test_shell_allow_list_is_immutable():
-    profile = get_coder_profile()
+    profile = get_coder_profile(shell_allow_list=_SHELL_ALLOW_LIST)
 
     with pytest.raises((AttributeError, TypeError)):
         profile.shell_allow_list.append("rm")

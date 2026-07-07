@@ -11,7 +11,7 @@ import dataclasses
 
 import pytest
 
-from clipse_agent.profiles.reviewer import ReviewerProfile, get_reviewer_profile
+from clipse_agent.profiles.reviewer import _SHELL_ALLOW_LIST, ReviewerProfile, get_reviewer_profile
 
 
 def test_get_reviewer_profile_returns_a_reviewer_profile():
@@ -125,8 +125,16 @@ def test_system_prompt_forbids_reading_binary_and_image_files():
     assert any(ext in prompt for ext in (".png", ".jpg", ".jpeg"))
 
 
+def test_get_reviewer_profile_defaults_to_unrestricted_shell():
+    # New default (decision 2026-07-07): matches get_coder_profile's own
+    # default -- an unconfigured lane runs with no allow-list at all.
+    assert get_reviewer_profile().shell_allow_list is None
+
+
 def test_shell_allow_list_is_read_mostly_no_destructive_commands():
-    profile = get_reviewer_profile()
+    # Restrictive mode: a caller that opts into the read-mostly allow-list
+    # gets back exactly the reference list this module exports.
+    profile = get_reviewer_profile(shell_allow_list=_SHELL_ALLOW_LIST)
 
     expected = {"git", "gh", "cat", "ls", "grep", "rg", "find"}
     assert set(profile.shell_allow_list) == expected
@@ -139,7 +147,7 @@ def test_shell_allow_list_is_read_mostly_no_destructive_commands():
 
 
 def test_shell_allow_list_is_immutable():
-    profile = get_reviewer_profile()
+    profile = get_reviewer_profile(shell_allow_list=_SHELL_ALLOW_LIST)
 
     with pytest.raises((AttributeError, TypeError)):
         profile.shell_allow_list.append("rm")

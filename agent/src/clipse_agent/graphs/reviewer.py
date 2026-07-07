@@ -185,6 +185,7 @@ class ReviewerState(TypedDict, total=False):
     # --- run_DAC ---
     dac_outcome_hint: str  # "completed" | "interrupted" (dac.OutcomeHint)
     dac_summary: str
+    dac_last_text: str  # only the FINAL message's text (the verdict/finding source)
     tokens_in: int
     tokens_out: int
     interrupt_payload: list[Any] | None
@@ -197,6 +198,8 @@ class ReviewerState(TypedDict, total=False):
     # --- post_comments ---
     pr_url: str | None
     comments_posted: int
+    comments_failed: int
+    failed_comments: list[InlineComment]
 
     # --- emit_result ---
     result: WorkerResult
@@ -334,6 +337,7 @@ def make_run_dac(
         return {
             "dac_outcome_hint": turn_result.outcome_hint,
             "dac_summary": turn_result.final_text,
+            "dac_last_text": turn_result.last_text,
             "tokens_in": turn_result.tokens_in,
             "tokens_out": turn_result.tokens_out,
             "interrupt_payload": turn_result.interrupt_payload,
@@ -361,30 +365,40 @@ def route_after_dac(state: ReviewerState) -> str:
 
 _VERDICT_PASS = "PASS"
 
-_VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|CHANGES_REQUESTED)\b", re.IGNORECASE)
+_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(PASS|CHANGES_REQUESTED)\b", re.IGNORECASE | re.MULTILINE)
+# Severity comes FIRST when present (`- blocking: path:line: body` / `- nit:
+# path:line: body`, per profiles/reviewer.py's system prompt). A misordered
+# bullet (e.g. `- path:line: nit: body`) doesn't match the optional severity
+# group here, so it parses as a severity-default "blocking" finding instead
+# (see `_parse_inline_comments`) -- conservative, since it can veto a PASS,
+# but intended: a model that mangles the protocol's word order must never
+# accidentally downgrade a real finding to a nit.
 _INLINE_COMMENT_RE = re.compile(r"^-\s*(?:(blocking|nit):\s*)?([^\s:]+):(\d+):\s*(.+)$", re.IGNORECASE)
 
 
-def _find_verdict(dac_summary: str) -> re.Match[str] | None:
-    """Return the *last* `VERDICT: ...` match in `dac_summary`, or None.
+def _find_verdict(text: str) -> re.Match[str] | None:
+    """Return the *last* `VERDICT: ...` match in `text`, or None.
 
-    The last match wins so that the system prompt's own protocol text (which
+    Anchored to line starts (`^` + `re.MULTILINE`) so a finding body quoting
+    "VERDICT: PASS" mid-line -- e.g. describing what a test asserts -- can
+    never be mistaken for the model's actual decision. The last matching
+    *line* still wins so that the system prompt's own protocol text (which
     literally contains the string "VERDICT:") being echoed or quoted earlier
     in the message is never mistaken for the model's actual decision -- that
     is always whatever it states last.
     """
-    matches = list(_VERDICT_RE.finditer(dac_summary))
+    matches = list(_VERDICT_RE.finditer(text))
     return matches[-1] if matches else None
 
 
-def _parse_inline_comments(dac_summary: str, start: int) -> list[InlineComment]:
+def _parse_inline_comments(source: str, start: int) -> list[InlineComment]:
     """Parse `- path:line: body` bullet lines appearing at or after `start`
     (the verdict match's end) into structured `InlineComment`s. Only text
     after the verdict is scanned, so a bullet line elsewhere in the model's
     own reasoning can never be mistaken for a review finding.
     """
     comments: list[InlineComment] = []
-    for line in dac_summary[start:].splitlines():
+    for line in source[start:].splitlines():
         match = _INLINE_COMMENT_RE.match(line.strip())
         if match:
             severity_raw, path, line_no, body = match.groups()
@@ -398,6 +412,12 @@ def _parse_inline_comments(dac_summary: str, start: int) -> list[InlineComment]:
 def classify(state: ReviewerState) -> dict[str, Any]:
     """Decide PASS vs CHANGES_REQUESTED from this turn's DAC output.
 
+    Reads only the turn's *final* message (`dac_last_text`), falling back to
+    `dac_summary` (the whole turn's narration) for a pre-existing checkpointed
+    state or a test that only ever set `dac_summary` -- everything the model
+    said earlier in the turn, including any protocol text it echoed or a
+    finding body quoting "VERDICT: PASS", is never in scope for the verdict.
+
     Conservative by design: a review clears a PR only on an explicit
     `VERDICT: PASS` line OR a CHANGES_REQUESTED whose every finding is a
     `nit` -- three of the Reflex build's six rework cycles were pbxproj
@@ -408,20 +428,21 @@ def classify(state: ReviewerState) -> dict[str, Any]:
     input, never sufficient alone"), but the one thing it must never do is
     wrongly signal "safe to merge".
     """
-    dac_summary = state.get("dac_summary") or ""
-    verdict_match = _find_verdict(dac_summary)
+    source = state.get("dac_last_text") or state.get("dac_summary") or ""
+    verdict_match = _find_verdict(source)
 
     comments: list[InlineComment] = []
     if verdict_match is not None:
-        comments = _parse_inline_comments(dac_summary, verdict_match.end())
+        comments = _parse_inline_comments(source, verdict_match.end())
     blocking = [c for c in comments if c.severity == "blocking"]
-    # A review clears the PR on an explicit PASS, or on a CHANGES_REQUESTED
-    # whose parsed findings are ALL nits. A CHANGES_REQUESTED with no
-    # machine-parseable findings still blocks (conservative): the reviewer
-    # asked for changes in prose we couldn't parse -- never silently upgrade
-    # that to a pass.
-    passed = verdict_match is not None and (
-        verdict_match.group(1).upper() == _VERDICT_PASS or (bool(comments) and not blocking)
+    # A review clears the PR on an explicit PASS with no blocking findings, or
+    # on a CHANGES_REQUESTED whose parsed findings are ALL nits. Any blocking
+    # finding vetoes a PASS: a verdict line and its own findings disagreeing
+    # must resolve conservatively.
+    passed = (
+        verdict_match is not None
+        and not blocking
+        and (verdict_match.group(1).upper() == _VERDICT_PASS or bool(comments))
     )
 
     return {"review_passed": passed, "review_comments": comments}
@@ -445,6 +466,12 @@ def route_after_classify(state: ReviewerState) -> str:
 # post_comments
 # ---------------------------------------------------------------------------
 
+# GitHub caps a comment body at 65,536 chars; `_changes_summary` concatenates
+# an unbounded `dac_summary` plus every failed finding's body, so an oversized
+# summary must be capped before it ever reaches `gh pr comment` (which would
+# otherwise 422 on the entire summary post, losing it).
+_MAX_COMMENT_CHARS = 60_000
+
 
 def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], dict[str, Any]]:
     """Post this turn's review findings to the PR.
@@ -465,6 +492,11 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
     drives the merging->rework transition; nothing consumes a GitHub review
     state. Inline review COMMENTS and a plain PR comment are both allowed on
     your own PR, so the findings still land visibly on the PR.
+
+    Both `gh pr view` and each per-comment `gh api` call run with `check=False`
+    -- see the inline comments below for why: a raise here would send the run
+    to blocked/transient and the kernel would retry the same deterministic
+    failure until `recover_cap` parks the card.
     """
 
     def _node(state: ReviewerState) -> dict[str, Any]:
@@ -472,13 +504,26 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
         cwd = state["cwd"]
         comments: list[InlineComment] = state.get("review_comments") or []
 
-        view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd)
+        # check=False: a needs_review card can legitimately arrive with no PR
+        # (the coder's honest pr_url="" no-op path). Raising here would send
+        # the run to blocked/transient and the kernel would retry the same
+        # deterministic failure until recover_cap parks the card. The verdict
+        # still reaches the kernel via this run's typed JSON result.
+        view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd, check=False)
+        if view.returncode != 0:
+            return {"pr_url": None, "comments_posted": 0, "comments_failed": 0, "failed_comments": []}
         pr_info = json.loads(view.stdout)
         pr_number = pr_info["number"]
         commit_sha = pr_info["headRefOid"]
 
+        posted = 0
+        failed: list[InlineComment] = []
         for comment in comments:
-            _run(
+            # check=False per comment: GitHub 422s an inline comment whose
+            # line isn't part of the diff hunk, and models routinely cite
+            # context lines. One unplaceable comment must not park the card
+            # -- the finding falls through to the summary comment instead.
+            result = _run(
                 run_command,
                 [
                     "gh",
@@ -496,15 +541,33 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
                     "side=RIGHT",
                 ],
                 cwd,
+                check=False,
             )
+            if result.returncode == 0:
+                posted += 1
+            else:
+                failed.append(comment)
 
+        body = _changes_summary(state, failed)
+        if len(body) > _MAX_COMMENT_CHARS:
+            body = body[:_MAX_COMMENT_CHARS]
+        # check=False: GitHub's own body cap, a rate limit, or any other
+        # transient gh failure here must not raise -- the verdict already
+        # reaches the kernel via this run's typed JSON result (emit_result),
+        # so a failed summary post is a best-effort miss, not a run failure.
         _run(
             run_command,
-            ["gh", "pr", "comment", branch, "--body", _changes_summary(state)],
+            ["gh", "pr", "comment", branch, "--body", body],
             cwd,
+            check=False,
         )
 
-        return {"pr_url": pr_info.get("url"), "comments_posted": len(comments)}
+        return {
+            "pr_url": pr_info.get("url"),
+            "comments_posted": posted,
+            "comments_failed": len(failed),
+            "failed_comments": failed,
+        }
 
     return _node
 
@@ -531,12 +594,26 @@ def _pass_summary(state: ReviewerState) -> str:
     return dac_summary or "Reviewed the diff: no issues found."
 
 
-def _changes_summary(state: ReviewerState) -> str:
+def _changes_summary(state: ReviewerState, failed: Sequence[InlineComment] = ()) -> str:
     dac_summary = (state.get("dac_summary") or "").strip()
     comments = state.get("review_comments") or []
     parts = [dac_summary] if dac_summary else []
     if comments:
-        parts.append(f"Posted {len(comments)} inline comment(s).")
+        # Prefer the actual posted count once `post_comments` has run (e.g.
+        # the no-PR path sets `comments_posted=0` even though `comments` is
+        # non-empty). Fall back to the len(comments) - len(failed) arithmetic
+        # for a pre-existing checkpointed state that never had the key, or
+        # for the call inside `make_post_comments` itself, made before that
+        # dict is merged back into state.
+        posted = state.get("comments_posted")
+        if posted is None:
+            posted = len(comments) - len(failed)
+        parts.append(f"Posted {posted} inline comment(s).")
+    if failed:
+        listed = "\n".join(f"- {c.path}:{c.line}: {c.body}" for c in failed)
+        parts.append(
+            f"{len(failed)} finding(s) could not be attached to a diff line; they are:\n{listed}"
+        )
     return " ".join(parts) if parts else "Requested changes."
 
 
@@ -600,7 +677,7 @@ def emit_result(state: ReviewerState) -> dict[str, Any]:
         result = WorkerResult(
             **common,
             outcome=Outcome.changes_requested,
-            summary=_changes_summary(state),
+            summary=_changes_summary(state, state.get("failed_comments") or ()),
             artifacts=[],
             pr_url=state.get("pr_url"),
         )

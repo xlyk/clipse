@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Fake `gh` for clipse agent evals. Never talks to GitHub.
+
+State lives under $CLIPSE_EVAL_GH_DIR (one dir per test):
+  pr.json        -- the branch's PR, once created/seeded ({url, number, headRefOid})
+  api.jsonl      -- one row per `gh api` call (inline review comments)
+  comments.jsonl -- one row per `gh pr comment` call
+  calls.jsonl    -- every invocation, argv + cwd
+
+Sits first on PATH so BOTH callers resolve here: the graph nodes'
+subprocess-backed CommandRunner and the DAC agent's own shell tool.
+Set CLIPSE_EVAL_GH_API_FAIL=1 to make every `gh api` call fail like a 422.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def _state_dir() -> Path:
+    raw = os.environ.get("CLIPSE_EVAL_GH_DIR")
+    if not raw:
+        sys.stderr.write("gh shim: CLIPSE_EVAL_GH_DIR is not set\n")
+        sys.exit(2)
+    path = Path(raw)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _append(path: Path, row: dict) -> None:
+    with path.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def _head_sha() -> str:
+    proc = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    return proc.stdout.strip() or "0" * 40
+
+
+def main(argv: list[str]) -> int:
+    state = _state_dir()
+    _append(state / "calls.jsonl", {"argv": argv, "cwd": os.getcwd()})
+    pr_file = state / "pr.json"
+
+    if argv[:2] == ["pr", "view"]:
+        if pr_file.exists():
+            print(pr_file.read_text().strip())
+            return 0
+        sys.stderr.write("no pull requests found for branch\n")
+        return 1
+    if argv[:2] == ["pr", "create"]:
+        pr = {"url": "https://github.example/fake/pull/1", "number": 1, "headRefOid": _head_sha()}
+        pr_file.write_text(json.dumps(pr))
+        print(pr["url"])
+        return 0
+    if argv[:1] == ["api"]:
+        if os.environ.get("CLIPSE_EVAL_GH_API_FAIL"):
+            sys.stderr.write("HTTP 422: Validation Failed\n")
+            return 1
+        _append(state / "api.jsonl", {"argv": argv})
+        return 0
+    if argv[:2] == ["pr", "comment"]:
+        _append(state / "comments.jsonl", {"argv": argv})
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

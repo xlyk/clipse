@@ -27,6 +27,7 @@ from clipse_agent import dac
 from clipse_agent.contract import BlockKind, Lane, Outcome, WorkerResult
 from clipse_agent.dac import DacTurnResult
 from clipse_agent.graphs import coder, reviewer
+from clipse_agent.profiles.reviewer import get_reviewer_profile
 
 # ---------------------------------------------------------------------------
 # Fakes / fixtures
@@ -456,6 +457,116 @@ def test_changes_requested_posts_summary_comment_when_no_structured_comments_fou
 
 
 # ---------------------------------------------------------------------------
+# post_comments resilience: no-PR grace + best-effort inline comments
+# ---------------------------------------------------------------------------
+
+
+def test_post_comments_no_pr_is_graceful() -> None:
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(1, "", "no pull requests found")),
+        ]
+    )
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "review_comments": [reviewer.InlineComment(path="a.py", line=3, body="x")],
+        }
+    )
+    assert out == {"pr_url": None, "comments_posted": 0, "comments_failed": 0, "failed_comments": []}
+    # Nothing after the failed view: no gh api, no gh pr comment.
+    assert all(call.argv[:2] != ["gh", "api"] for call in runner.calls)
+    assert all(call.argv[:3] != ["gh", "pr", "comment"] for call in runner.calls)
+
+
+def test_post_comments_inline_422_degrades_to_summary() -> None:
+    pr_json = json.dumps({"number": 7, "headRefOid": "abc123", "url": "https://x/pull/7"})
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(0, pr_json, "")),
+            (_starts_with("gh", "api"), coder.CommandResult(1, "", "HTTP 422: Validation Failed")),
+        ]
+    )
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "dac_summary": "found problems",
+            "review_comments": [
+                reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+                reviewer.InlineComment(path="b.py", line=9, body="unused import", severity="nit"),
+            ],
+        }
+    )
+    assert out["comments_posted"] == 0
+    assert out["comments_failed"] == 2
+    assert out["pr_url"] == "https://x/pull/7"
+    assert out["failed_comments"] == [
+        reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+        reviewer.InlineComment(path="b.py", line=9, body="unused import", severity="nit"),
+    ]
+    # The summary comment still ran and carries the failed findings inline.
+    summary_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(summary_calls) == 1
+    body = summary_calls[0].argv[summary_calls[0].argv.index("--body") + 1]
+    assert "a.py:3" in body and "off-by-one" in body
+
+
+def test_post_comments_summary_post_failure_does_not_raise() -> None:
+    # A rate-limited or otherwise-failing `gh pr comment` for the summary must
+    # not raise -- the verdict already reaches the kernel via this run's
+    # typed JSON result, so a failed summary post is a best-effort miss, not
+    # a run failure.
+    pr_json = json.dumps({"number": 7, "headRefOid": "abc123", "url": "https://x/pull/7"})
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(0, pr_json, "")),
+            (_starts_with("gh", "pr", "comment"), coder.CommandResult(1, "", "rate limited")),
+        ]
+    )
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "dac_summary": "found problems",
+            "review_comments": [reviewer.InlineComment(path="a.py", line=3, body="off-by-one")],
+        }
+    )
+    # No exception, and the dict shape is unchanged despite the failed post.
+    assert out["pr_url"] == "https://x/pull/7"
+    assert out["comments_posted"] == 1
+    assert out["comments_failed"] == 0
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
+
+
+def test_post_comments_summary_body_is_truncated_to_github_safe_cap() -> None:
+    # `_changes_summary` concatenates an unbounded dac_summary; GitHub caps a
+    # comment body at 65,536 chars, so an oversized body must be capped
+    # before it reaches `gh pr comment` argv.
+    pr_json = json.dumps({"number": 7, "headRefOid": "abc123", "url": "https://x/pull/7"})
+    runner = FakeRunner(rules=[(_starts_with("gh", "pr", "view"), coder.CommandResult(0, pr_json, ""))])
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "dac_summary": "x" * 100_000,
+            "review_comments": [],
+        }
+    )
+    assert out["pr_url"] == "https://x/pull/7"
+    comment_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(comment_calls) == 1
+    body = comment_calls[0].argv[comment_calls[0].argv.index("--body") + 1]
+    assert len(body) <= reviewer._MAX_COMMENT_CHARS
+
+
+# ---------------------------------------------------------------------------
 # Missing/unparseable verdict -> conservative changes_requested, never PASS
 # ---------------------------------------------------------------------------
 
@@ -655,13 +766,15 @@ def test_build_reviewer_graph_default_wiring_uses_real_dac_module_with_safety_in
     assert result.tokens.out == 3
 
     assert captured["assistant_id"] == "clipse-reviewer"
-    # Safety invariant enforced inside dac.build_coder_agent must never be
-    # bypassed just because reviewer.py is doing the calling.
-    assert captured["kwargs"]["auto_approve"] is False
-    assert captured["kwargs"]["interrupt_shell_only"] is True
+    # Default-mode routing enforced inside dac.build_coder_agent must never
+    # be bypassed just because reviewer.py is doing the calling.
+    # get_reviewer_profile() (no override) defaults to shell_allow_list=None
+    # (decision 2026-07-07), which build_coder_agent maps to DAC's
+    # auto_approve=True/no allow-list.
+    assert captured["kwargs"]["auto_approve"] is True
+    assert captured["kwargs"]["interrupt_shell_only"] is False
     assert captured["kwargs"]["enable_ask_user"] is True
-    assert set(captured["kwargs"]["shell_allow_list"]) == {"git", "gh", "cat", "ls", "grep", "rg", "find"}
-    assert "sed" not in captured["kwargs"]["shell_allow_list"]
+    assert not captured["kwargs"]["shell_allow_list"]
 
 
 def test_run_dac_forwards_profile_and_checkpointer(tmp_path):
@@ -815,6 +928,72 @@ def test_classify_tolerates_empty_dac_summary():
     out = reviewer.classify({})
     assert out["review_passed"] is False
     assert out["review_comments"] == []
+
+
+# ---------------------------------------------------------------------------
+# Task 1: classify reads only the final message (dac_last_text), anchored to
+# line starts, with a blocking-finding veto -- guards against a quoted or
+# mid-line "VERDICT: PASS" flipping the review.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_prefers_last_text_over_summary() -> None:
+    state: reviewer.ReviewerState = {
+        "dac_summary": "narration...\nVERDICT: PASS\nmore narration",
+        "dac_last_text": "final message\nVERDICT: CHANGES_REQUESTED\n- calc.py:3: blocking: off-by-one",
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is False
+    assert out["review_comments"][0].path == "calc.py"
+
+
+def test_classify_ignores_mid_line_verdict_quote() -> None:
+    # A finding body quoting "VERDICT: PASS" after the real verdict must not flip it.
+    state: reviewer.ReviewerState = {
+        "dac_last_text": (
+            "VERDICT: CHANGES_REQUESTED\n"
+            "- blocking: calc.py:3: the test asserts VERDICT: PASS is printed, but it never is\n"
+        ),
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is False
+    assert len(out["review_comments"]) == 1
+
+
+def test_classify_blocking_findings_veto_pass() -> None:
+    state: reviewer.ReviewerState = {
+        "dac_last_text": "VERDICT: PASS\n- blocking: calc.py:3: this is actually broken\n",
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is False
+
+
+def test_classify_pass_with_only_nits_still_passes() -> None:
+    # Bullet uses the protocol's real prefix position (`- nit: path:line:
+    # body`, per profiles/reviewer.py's system prompt), not `path:line: nit:`
+    # -- the severity prefix must precede the path for _INLINE_COMMENT_RE to
+    # recognize it as "nit" rather than defaulting to "blocking".
+    state: reviewer.ReviewerState = {
+        "dac_last_text": "VERDICT: PASS\n- nit: calc.py:3: rename for clarity\n",
+    }
+    out = reviewer.classify(state)
+    assert out["review_passed"] is True
+
+
+def test_run_dac_stashes_last_text() -> None:
+    turn = DacTurnResult(
+        outcome_hint="completed",
+        final_text="all narration VERDICT: PASS",
+        tokens_in=1,
+        tokens_out=1,
+        last_text="VERDICT: CHANGES_REQUESTED\n- a.py:1: blocking: x",
+    )
+    calls: list[dict[str, Any]] = []
+    node = reviewer.make_run_dac(
+        get_reviewer_profile(), _fake_agent_factory(calls), _fake_turn_driver(turn, calls), None
+    )
+    out = asyncio.run(node({"thread_id": "t", "cwd": "/tmp", "task_text": "review"}))
+    assert out["dac_last_text"] == turn.last_text
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1174,51 @@ def test_emit_result_changes_requested_shape():
     assert result.outcome == Outcome.changes_requested
     assert result.pr_url == "https://github.com/acme/widgets/pull/1"
     assert result.turn_count == 2
+
+
+def test_emit_result_changes_requested_summary_carries_failed_findings() -> None:
+    state: reviewer.ReviewerState = {
+        "run_id": "r1",
+        "issue_id": "i1",
+        "thread_id": "t1",
+        "dac_summary": "found problems",
+        "review_passed": False,
+        "review_comments": [
+            reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+            reviewer.InlineComment(path="b.py", line=9, body="unused import", severity="nit"),
+        ],
+        "failed_comments": [reviewer.InlineComment(path="a.py", line=3, body="off-by-one")],
+    }
+    out = reviewer.emit_result(state)
+    summary = out["result"].summary
+    assert "Posted 1 inline comment(s)." in summary
+    assert "a.py:3: off-by-one" in summary
+
+
+def test_emit_result_changes_requested_summary_does_not_overclaim_posted_when_no_pr() -> None:
+    # The no-PR path (post_comments' honest early return) sets
+    # comments_posted=0 while review_comments (from classify) is still
+    # non-empty -- the summary must say "Posted 0", never fall back to
+    # len(review_comments) and claim comments that were never posted. This
+    # text feeds CLIPSE_REVIEW_FEEDBACK on a later rework turn.
+    state: reviewer.ReviewerState = {
+        "run_id": "r1",
+        "issue_id": "i1",
+        "thread_id": "t1",
+        "dac_summary": "found problems",
+        "review_passed": False,
+        "review_comments": [
+            reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+            reviewer.InlineComment(path="b.py", line=9, body="unused import"),
+        ],
+        "comments_posted": 0,
+        "comments_failed": 0,
+        "failed_comments": [],
+    }
+    out = reviewer.emit_result(state)
+    summary = out["result"].summary
+    assert "Posted 2" not in summary
+    assert "Posted 0 inline comment(s)." in summary
 
 
 def test_emit_result_blocked_needs_input_shape():

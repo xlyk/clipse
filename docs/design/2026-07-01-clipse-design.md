@@ -37,7 +37,7 @@ with per-lane LangGraph workers wrapping Deep Agents Code (DAC) as the engine.**
   leases, heartbeats, dependency promotion, stale/crash recovery, concurrency
   caps, a SQLite coordination kernel.
 - **Deep Agents Code (DAC / LangChain `deepagents_code`)** — the coding engine.
-  `create_cli_agent(assistant_id=…, interactive=False, auto_approve=False, interrupt_shell_only=True, shell_allow_list=[…], checkpointer=…)` (see the DAC spike findings under "Open questions / to verify" — `auto_approve` must stay `False` or the allow-list is silently dropped). Wrapped in a
+  `create_cli_agent(assistant_id=…, interactive=False, auto_approve=False, interrupt_shell_only=True, shell_allow_list=[…], checkpointer=…)` (see the DAC spike findings under "Open questions / to verify" — `auto_approve` must stay `False` or the allow-list is silently dropped). [Amended 2026-07-07: superseded by the per-lane `shell_allow_list` policy — the default `all` posture builds the agent with `auto_approve=True`; an explicitly configured list restores this invariant. See AGENTS.md.] Wrapped in a
   LangGraph graph for fine-grained control (checkpointed resume, interrupts,
   typed state).
 
@@ -429,7 +429,7 @@ do **not** shell out to `dcode -n`.
    The worker **must** use `auto_approve=False, interrupt_shell_only=True,
    shell_allow_list=[…]` — that path installs the middleware, which rejects
    disallowed commands inline as error `ToolMessage`s (no HITL stall). This
-   supersedes every doc mention of `auto_approve=True`.
+   supersedes every doc mention of `auto_approve=True`. [Amended 2026-07-07: superseded by the per-lane `shell_allow_list` policy — the default `all` posture builds the agent with `auto_approve=True`; an explicitly configured list restores this invariant. See AGENTS.md.]
 3. **Resume** — DAC uses upstream LangGraph `AsyncSqliteSaver` (`sessions.py:1239`);
    `create_cli_agent(checkpointer=…)` is caller-supplied (`agent.py:1196`), so the
    kernel owns the checkpoint-db path and passes `thread_id` via

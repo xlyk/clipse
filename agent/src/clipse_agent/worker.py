@@ -59,6 +59,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--docs-model", default="")
     parser.add_argument("--model-params", default="")
     parser.add_argument("--docs-model-params", default="")
+    parser.add_argument("--shell-allow-list", default="")
+    parser.add_argument("--docs-shell-allow-list", default="")
     parser.add_argument("--base-branch", default="")
     return parser
 
@@ -90,6 +92,18 @@ def _parse_params(raw: str) -> dict[str, Any] | None:
     omits the flag entirely otherwise, so `raw` defaults to `""` here) --
     mirroring `CoderProfile.model_params`/`ReviewerProfile.model_params`'s own
     "no config means None, not some empty-dict default" contract.
+    """
+    return json.loads(raw) if raw else None
+
+
+def _parse_shell(raw: str) -> list[str] | None:
+    """Decode a `--shell-allow-list`/`--docs-shell-allow-list` flag value.
+
+    `None` means the `all` policy (unrestricted shell) — the kernel omits
+    the flag entirely for an all-policy lane (`internal/spawn.workerArgs`),
+    so `raw` defaults to `""` here, same as `_parse_params`'s "no config
+    means None" contract. A present flag carries a JSON array of allowed
+    command names, which becomes the profile's restrictive tuple.
     """
     return json.loads(raw) if raw else None
 
@@ -211,9 +225,15 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
             build_coder_graph,
             lane=Lane.coder,
             extra_kwargs={
-                "profile": get_coder_profile(args.model or None, model_params=_parse_params(args.model_params)),
+                "profile": get_coder_profile(
+                    args.model or None,
+                    model_params=_parse_params(args.model_params),
+                    shell_allow_list=_parse_shell(args.shell_allow_list),
+                ),
                 "docs_profile": get_coder_docs_profile(
-                    args.docs_model or None, model_params=_parse_params(args.docs_model_params)
+                    args.docs_model or None,
+                    model_params=_parse_params(args.docs_model_params),
+                    shell_allow_list=_parse_shell(args.docs_shell_allow_list),
                 ),
             },
         )
@@ -223,7 +243,11 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
             build_reviewer_graph,
             lane=Lane.reviewer,
             extra_kwargs={
-                "profile": get_reviewer_profile(args.model or None, model_params=_parse_params(args.model_params))
+                "profile": get_reviewer_profile(
+                    args.model or None,
+                    model_params=_parse_params(args.model_params),
+                    shell_allow_list=_parse_shell(args.shell_allow_list),
+                )
             },
         )
     return _blocked_transient(

@@ -31,7 +31,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command, Interrupt
 
 from clipse_agent import dac
-from clipse_agent.profiles.coder import get_coder_profile
+from clipse_agent.profiles.coder import _SHELL_ALLOW_LIST, get_coder_profile
 
 _CONFIG: dict[str, Any] = {"configurable": {"thread_id": "thread-1"}}
 
@@ -83,7 +83,10 @@ class _FakeAgentGraph:
 # ---------------------------------------------------------------------------
 
 
-def test_build_coder_agent_uses_safe_shell_enforcement(monkeypatch):
+def test_build_coder_agent_unrestricted_profile_uses_auto_approve(monkeypatch):
+    # New default mode (decision 2026-07-07): profile.shell_allow_list is
+    # None (get_coder_profile's own default) -- build_coder_agent must route
+    # to DAC's auto_approve=True, no allow-list, no interrupt_shell_only.
     captured: dict[str, Any] = {}
 
     def fake_create_cli_agent(model, assistant_id, **kwargs):
@@ -101,6 +104,50 @@ def test_build_coder_agent_uses_safe_shell_enforcement(monkeypatch):
     monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=model_stub))
 
     profile = get_coder_profile()
+    assert profile.shell_allow_list is None
+    result = dac.build_coder_agent(profile, checkpointer=None, cwd="/tmp/work")
+
+    assert result == ("agent-graph", "backend")
+    assert captured["model"] is model_stub
+    assert captured["assistant_id"] == profile.assistant_id
+
+    kwargs = captured["kwargs"]
+    assert kwargs["auto_approve"] is True
+    assert kwargs["interrupt_shell_only"] is False
+    assert kwargs.get("shell_allow_list") in (None, [])
+    # enable_ask_user MUST be True in BOTH modes: AskUserMiddleware
+    # (ask_user.py:256) is the sole source of a LangGraph interrupt() once
+    # auto_approve forces interrupt_on={}, so it is the only way the agent
+    # surfaces a __interrupt__ that the worker maps to blocked(needs_input).
+    # False makes that path dead code.
+    assert kwargs["enable_ask_user"] is True
+    assert kwargs["enable_shell"] is True
+    assert kwargs["interactive"] is False
+    assert kwargs["system_prompt"] == profile.system_prompt
+    assert kwargs["cwd"] == "/tmp/work"
+    assert kwargs["checkpointer"] is None
+
+
+def test_build_coder_agent_restrictive_profile_keeps_safety_combo(monkeypatch):
+    # Restrictive mode (unchanged invariant): a profile carrying an explicit
+    # shell_allow_list must still get the original safe combination.
+    captured: dict[str, Any] = {}
+
+    def fake_create_cli_agent(model, assistant_id, **kwargs):
+        captured["model"] = model
+        captured["assistant_id"] = assistant_id
+        captured["kwargs"] = kwargs
+        return ("agent-graph", "backend")
+
+    monkeypatch.setattr(dac, "create_cli_agent", fake_create_cli_agent)
+    # context_window_tokens defaults on (200_000), so build_coder_agent always
+    # resolves the model via create_model now -- fake it to a model-like
+    # object (not a bare `object()`) so the profile-mutation branch has
+    # somewhere real to write.
+    model_stub = SimpleNamespace(profile=None)
+    monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=model_stub))
+
+    profile = get_coder_profile(shell_allow_list=("git", "gh"))
     result = dac.build_coder_agent(profile, checkpointer=None, cwd="/tmp/work")
 
     assert result == ("agent-graph", "backend")
@@ -119,7 +166,7 @@ def test_build_coder_agent_uses_safe_shell_enforcement(monkeypatch):
     # maps to blocked(needs_input). False makes that path dead code.
     assert kwargs["enable_ask_user"] is True
     assert kwargs["enable_shell"] is True
-    assert kwargs["shell_allow_list"] == list(profile.shell_allow_list)
+    assert kwargs["shell_allow_list"] == ["git", "gh"]
     assert kwargs["interactive"] is False
     assert kwargs["system_prompt"] == profile.system_prompt
     assert kwargs["cwd"] == "/tmp/work"
@@ -327,7 +374,9 @@ def test_build_coder_agent_sets_model_profile_max_input_tokens_from_context_wind
         lambda model, aid, **kw: captured.update(model=model, kwargs=kw) or (object(), object()),
     )
 
-    profile = get_coder_profile(context_window_tokens=150_000)
+    # Restrictive mode here so the assertion below actually exercises the
+    # SAFETY combo -- the lowering lever is independent of the shell policy.
+    profile = get_coder_profile(context_window_tokens=150_000, shell_allow_list=_SHELL_ALLOW_LIST)
     dac.build_coder_agent(profile, None, "/tmp")
 
     assert captured["model"] is model_stub

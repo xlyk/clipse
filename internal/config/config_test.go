@@ -397,6 +397,96 @@ func TestLoad_ModelParamsOmittedIsNil(t *testing.T) {
 	}
 }
 
+// TestShellPolicy_Defaults_AllWhenAbsent asserts every lane's shell policy
+// defaults to All when shell_allow_list is absent from the YAML document
+// entirely — the decision-2026-07-07 safe default (reflex's live-fire
+// showed the restrictive mode's hardcoded pattern checks rejecting ~55
+// legitimate commands across 25 issues).
+func TestShellPolicy_Defaults_AllWhenAbsent(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML)
+	for name, p := range map[string]config.ShellPolicy{
+		"coder": cfg.Shell.Coder, "coder_docs": cfg.Shell.CoderDocs, "reviewer": cfg.Shell.Reviewer,
+	} {
+		if !p.All || len(p.Commands) != 0 {
+			t.Fatalf("%s: expected default All policy, got %+v", name, p)
+		}
+	}
+}
+
+// TestShellPolicy_ParsesScalarAllAndList asserts the custom
+// ShellPolicy.UnmarshalYAML accepts both forms in the same document: the
+// scalar sentinel `all` and an explicit command-name sequence. coder_docs is
+// omitted entirely, so it must independently default to All.
+func TestShellPolicy_ParsesScalarAllAndList(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML+`
+shell_allow_list:
+  coder: all
+  reviewer: [git, gh, ls]
+`)
+	if !cfg.Shell.Coder.All {
+		t.Errorf("Shell.Coder.All = %v, want true", cfg.Shell.Coder.All)
+	}
+	if len(cfg.Shell.Coder.Commands) != 0 {
+		t.Errorf("Shell.Coder.Commands = %v, want empty", cfg.Shell.Coder.Commands)
+	}
+	if cfg.Shell.Reviewer.All {
+		t.Errorf("Shell.Reviewer.All = %v, want false", cfg.Shell.Reviewer.All)
+	}
+	wantReviewerCommands := []string{"git", "gh", "ls"}
+	if !slices.Equal(cfg.Shell.Reviewer.Commands, wantReviewerCommands) {
+		t.Errorf("Shell.Reviewer.Commands = %v, want %v", cfg.Shell.Reviewer.Commands, wantReviewerCommands)
+	}
+	if !cfg.Shell.CoderDocs.All {
+		t.Errorf("Shell.CoderDocs.All = %v, want default true (omitted from shell_allow_list)", cfg.Shell.CoderDocs.All)
+	}
+	if len(cfg.Shell.CoderDocs.Commands) != 0 {
+		t.Errorf("Shell.CoderDocs.Commands = %v, want empty", cfg.Shell.CoderDocs.Commands)
+	}
+}
+
+// TestShellPolicy_RejectsEmptyListAndAllInList asserts two distinct
+// validate-time errors: an explicit empty list (`coder: []`) is NOT silently
+// treated as All — defaultShellPolicy only defaults an absent key, not an
+// explicit-but-empty one (see its doc comment) — and a list containing the
+// `all` sentinel as an element is rejected in favor of the scalar form.
+func TestShellPolicy_RejectsEmptyListAndAllInList(t *testing.T) {
+	tests := []struct {
+		name          string
+		yaml          string
+		wantErrSubstr string
+	}{
+		{
+			name: "explicit empty list",
+			yaml: baseValidYAML + `
+shell_allow_list:
+  coder: []
+`,
+			wantErrSubstr: "shell_allow_list.coder",
+		},
+		{
+			name: "all as a list element",
+			yaml: baseValidYAML + `
+shell_allow_list:
+  coder: [all, git]
+`,
+			wantErrSubstr: "shell_allow_list.coder",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeYAML(t, tt.yaml)
+
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatalf("Load: expected error containing %q, got nil", tt.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSubstr) {
+				t.Errorf("Load: error %q does not mention %q", err.Error(), tt.wantErrSubstr)
+			}
+		})
+	}
+}
+
 func TestLoad_InvalidConfigs(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -683,6 +773,22 @@ models:
   coder: "openai_codex:"
 `,
 			wantErrSubstr: "models.coder",
+		},
+		{
+			name: "shell_allow_list scalar not all",
+			yaml: baseValidYAML + `
+shell_allow_list:
+  coder: everything
+`,
+			wantErrSubstr: "shell_allow_list",
+		},
+		{
+			name: "shell_allow_list list contains an empty entry",
+			yaml: baseValidYAML + `
+shell_allow_list:
+  reviewer: [git, ""]
+`,
+			wantErrSubstr: "shell_allow_list.reviewer",
 		},
 	}
 

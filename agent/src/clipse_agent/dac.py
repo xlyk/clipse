@@ -19,15 +19,38 @@ findings", verified against `deepagents_code` 0.1.22 source):
   chunks (`non_interactive._process_ai_message`); DAC keeps no aggregate
   itself, so this module accumulates it turn-by-turn.
 
-SAFETY (non-negotiable, see design doc "Threat model"): `create_cli_agent`
-must always be called with `auto_approve=False, interrupt_shell_only=True,
-shell_allow_list=[...]`. Setting `auto_approve=True`
-silently drops the shell allow-list — `restrictive_shell_allow_list` is
-only populated `if interrupt_shell_only and not auto_approve`
-(`agent.py:1336`), `ShellAllowListMiddleware` is only installed when that
-list is non-nil (`agent.py:1597`), and `auto_approve` forces
-`interrupt_on={}` (`agent.py:1612`). That combination must never appear in
-this file.
+SAFETY (see design doc "Threat model" and the per-lane shell-policy decision,
+2026-07-07, AGENTS.md): `create_cli_agent` is called in exactly one of two
+sanctioned modes, chosen solely by `profile.shell_allow_list`:
+
+- Restrictive (`shell_allow_list` is a tuple): `auto_approve=False,
+  interrupt_shell_only=True, shell_allow_list=[...]`. `auto_approve=True`
+  would silently drop the shell allow-list — `restrictive_shell_allow_list`
+  is only populated `if interrupt_shell_only and not auto_approve`
+  (`agent.py:1336`), `ShellAllowListMiddleware` is only installed when that
+  list is non-nil (`agent.py:1597`), and `auto_approve` forces
+  `interrupt_on={}` (`agent.py:1612`) — so that combination is impossible by
+  construction here: this file never sets `auto_approve=True` while also
+  passing a list.
+- Unrestricted (`shell_allow_list` is `None`, the default from
+  `profiles.coder.get_coder_profile`/`get_coder_docs_profile` and
+  `profiles.reviewer.get_reviewer_profile`): `auto_approve=True,
+  interrupt_shell_only=False, shell_allow_list=None`. No
+  `ShellAllowListMiddleware` is installed and DAC's own dangerous-pattern
+  checks (redirects, env-prefix commands, heredocs) never run; a
+  prompt-injected issue body can run arbitrary shell in the worker's own
+  process. Accepted for this project's single-tenant, personal-use posture
+  — see AGENTS.md's threat-model note; the C11 injection eval is the
+  standing monitor.
+
+Both modes set `interrupt_on={}` inside DAC (`agent.py:1612` — either because
+`auto_approve` is `True`, or because the shell middleware installed under
+`interrupt_shell_only` takes over shell approval instead) and both pass
+`enable_ask_user=True`, which keeps the `blocked(needs_input)` interrupt path
+alive regardless of mode (`AskUserMiddleware`, `ask_user.py:256`, is the only
+source of a LangGraph `interrupt()` once the shell middleware or
+`auto_approve` forces `interrupt_on={}`). Verified against
+`deepagents_code.agent` 0.1.22, lines ~1336/1612.
 """
 
 from __future__ import annotations
@@ -95,17 +118,22 @@ def build_coder_agent(
 ) -> tuple[Pregel[Any, Any, Any, Any], CompositeBackend]:
     """Build the Coder lane's DAC agent from its profile.
 
-    Always calls `create_cli_agent` with the safe shell-enforcement
-    combination documented in the module docstring. Never pass
-    `auto_approve=True` here — it silently disables `shell_allow_list`.
+    Routes to exactly one of the two sanctioned modes documented in the
+    module docstring, chosen solely by `profile.shell_allow_list`:
+    `None` (the default) builds an unrestricted agent (`auto_approve=True`,
+    no allow-list); a tuple builds the original restrictive agent
+    (`auto_approve=False, interrupt_shell_only=True, shell_allow_list=[...]`).
+    The forbidden combination — `auto_approve=True` alongside a configured
+    list — is impossible by construction: this function never passes both.
 
-    `enable_ask_user=True` is required, not incidental: `AskUserMiddleware`
-    (`ask_user.py:256`) is the only source of a LangGraph `interrupt()` in
-    this configuration (installing the shell middleware forces
-    `interrupt_on={}`, `agent.py:1612`), so it is the sole way the agent can
-    surface a `__interrupt__` — which the worker maps to
-    `blocked(needs_input)`. With `enable_ask_user=False` that path is dead
-    and an ambiguous issue can never block for input.
+    `enable_ask_user=True` is required, not incidental, in BOTH modes:
+    `AskUserMiddleware` (`ask_user.py:256`) is the only source of a
+    LangGraph `interrupt()` once `interrupt_on={}` is forced -- by
+    `auto_approve` in the unrestricted mode, or by installing the shell
+    middleware in the restrictive mode (`agent.py:1612`) -- so it is the
+    sole way the agent can surface a `__interrupt__`, which the worker maps
+    to `blocked(needs_input)`. With `enable_ask_user=False` that path is
+    dead and an ambiguous issue can never block for input.
 
     When `profile.context_window_tokens` is set (the default), the model is
     always resolved via `create_model` -- even for a plain-string provider
@@ -160,14 +188,18 @@ def build_coder_agent(
                 **(getattr(model, "profile", None) or {}),
                 "max_input_tokens": profile.context_window_tokens,
             }
+        # Two-mode routing (module docstring SAFETY block): shell_allow_list
+        # is None (unrestricted, the default) or a tuple (restrictive) --
+        # never anything else, so this is the only branch point.
+        unrestricted = profile.shell_allow_list is None
         return create_cli_agent(
             model,
             profile.assistant_id,
             system_prompt=profile.system_prompt,
             interactive=False,
-            auto_approve=False,
-            interrupt_shell_only=True,
-            shell_allow_list=list(profile.shell_allow_list),
+            auto_approve=unrestricted,
+            interrupt_shell_only=not unrestricted,
+            shell_allow_list=(list(profile.shell_allow_list) if not unrestricted else None),
             enable_ask_user=True,
             enable_shell=True,
             checkpointer=checkpointer,

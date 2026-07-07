@@ -86,6 +86,19 @@ type WorkerSpec struct {
 	// non-empty.
 	DocsModelParams string
 
+	// ShellAllowList is a JSON array of allowed command names for the
+	// lane's DAC shell ("" means unrestricted — the worker defaults to the
+	// `all` policy and the flag is omitted; see config.ShellPolicy).
+	// Optional: LocalSpawner appends --shell-allow-list=<value> only when
+	// this is non-empty.
+	ShellAllowList string
+
+	// DocsShellAllowList is the docs sub-step's policy, coder lane only
+	// (empty = unrestricted / omitted, same as ShellAllowList). Optional:
+	// LocalSpawner appends --docs-shell-allow-list=<value> only when this is
+	// non-empty.
+	DocsShellAllowList string
+
 	// BaseBranch is the repo base branch (config.Repo.BaseBranch) the coder
 	// syncs its worktree to each turn, e.g. `git merge origin/<base>` (empty
 	// = omitted). Set for every lane; harmless for Reviewer/git-operator

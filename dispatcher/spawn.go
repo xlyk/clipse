@@ -68,20 +68,23 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 
 	model, docsModel := d.modelsFor(lane)
 	modelParams, docsModelParams := d.modelParamsFor(lane)
+	shellAllowList, docsShellAllowList := d.shellFor(lane)
 	spec := spawn.WorkerSpec{
-		Issue:           issue.Identifier,
-		Lane:            lane,
-		RunID:           runID,
-		ThreadID:        threadID,
-		Workspace:       workspace,
-		Env:             env,
-		CheckpointDB:    d.checkpointDBPath(issue),
-		MaxTokens:       d.cfg.MaxTokensPerRun,
-		Model:           model,
-		DocsModel:       docsModel,
-		ModelParams:     modelParams,
-		DocsModelParams: docsModelParams,
-		BaseBranch:      d.cfg.Repo.BaseBranch,
+		Issue:              issue.Identifier,
+		Lane:               lane,
+		RunID:              runID,
+		ThreadID:           threadID,
+		Workspace:          workspace,
+		Env:                env,
+		CheckpointDB:       d.checkpointDBPath(issue),
+		MaxTokens:          d.cfg.MaxTokensPerRun,
+		Model:              model,
+		DocsModel:          docsModel,
+		ModelParams:        modelParams,
+		DocsModelParams:    docsModelParams,
+		ShellAllowList:     shellAllowList,
+		DocsShellAllowList: docsShellAllowList,
+		BaseBranch:         d.cfg.Repo.BaseBranch,
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -193,6 +196,53 @@ func (d *Dispatcher) modelParamsFor(lane string) (params, docsParams string) {
 		return enc(d.cfg.ModelParams.Coder), enc(d.cfg.ModelParams.CoderDocs)
 	case string(contract.LaneReviewer):
 		return enc(d.cfg.ModelParams.Reviewer), ""
+	default:
+		return "", ""
+	}
+}
+
+// shellFor resolves the per-lane shell allow-list policy (config.ShellPolicy)
+// from cfg.Shell into the JSON-encoded form WorkerSpec.ShellAllowList/
+// .DocsShellAllowList expect: "" for an All policy OR an unconfigured lane
+// (the worker's own default is unrestricted, so the flag is simply omitted —
+// see internal/spawn.workerArgs), or a compact JSON array of command names
+// for a restrictive list. Keyed off len(Commands) rather than the All flag
+// (mirroring modelParamsFor's enc, which keys off len(m) rather than a
+// presence bool): config.Load's defaultShellPolicy guarantees a real
+// deployment's cfg.Shell is always fully resolved to one of {All:true,
+// Commands:nil} or {All:false, Commands:non-empty} (see
+// validateShellPolicy), but a hand-built config.Config that bypasses Load
+// (as most dispatcher tests do) leaves an unset lane at ShellPolicy's Go zero
+// value {All:false, Commands:nil} — len-keying treats that the same as All,
+// instead of marshaling a nil slice to the literal string "null" and handing
+// the worker a flag value it can't use. It mirrors modelParamsFor's lane
+// mapping exactly (coder gets both Coder and CoderDocs, reviewer gets only
+// Reviewer, everything else gets neither), for the same reason: the docs
+// sub-step only ever runs inside the Coder graph.
+//
+// Unlike modelParamsFor's marshal-failure fallback (silently "no overrides",
+// logged at Warn — a lane that was already going to inherit the provider
+// default), a marshal failure here falls back to "" which the worker reads
+// as All/unrestricted: the OPPOSITE of an operator's configured restriction.
+// That is logged at Error, not Warn, so a restrictive shell policy silently
+// turning permissive is loud, not quiet.
+func (d *Dispatcher) shellFor(lane string) (shell, docsShell string) {
+	enc := func(commands []string) string {
+		if len(commands) == 0 {
+			return ""
+		}
+		b, err := json.Marshal(commands)
+		if err != nil {
+			d.logger.Error("marshal shell_allow_list failed, falling back to unrestricted", "lane", lane, "error", err)
+			return ""
+		}
+		return string(b)
+	}
+	switch lane {
+	case string(contract.LaneCoder):
+		return enc(d.cfg.Shell.Coder.Commands), enc(d.cfg.Shell.CoderDocs.Commands)
+	case string(contract.LaneReviewer):
+		return enc(d.cfg.Shell.Reviewer.Commands), ""
 	default:
 		return "", ""
 	}
