@@ -85,6 +85,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		ShellAllowList:     shellAllowList,
 		DocsShellAllowList: docsShellAllowList,
 		BaseBranch:         d.cfg.Repo.BaseBranch,
+		TranscriptPath:     d.transcriptPath(issue),
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -141,6 +142,26 @@ func (d *Dispatcher) checkpointDBPath(issue store.Issue) string {
 		return ""
 	}
 	return filepath.Join(d.cfg.CheckpointsDir, issue.Identifier+".db")
+}
+
+// transcriptPath returns the per-issue agent transcript JSONL path the
+// worker should append every DAC turn/tool event to, derived from
+// cfg.BoardDir and the issue's Linear identifier -- one file per issue,
+// living next to the per-issue stderr log LocalSpawner already writes to
+// <board_dir>/logs/<issue>.log (see internal/spawn/local.go's
+// stderrLogPath), so every turn/lane/rework this issue ever runs
+// accumulates into the SAME file (AGENTS.md's transcript bullet). Returns
+// "" when BoardDir is unset -- mirrors checkpointDBPath's own "no directory
+// to root a path under" fallback for hand-built Configs that bypass
+// config.Load (most dispatcher tests); LocalSpawner only appends
+// --transcript when this is non-empty (see internal/spawn.workerArgs). Real
+// production configs always have a non-empty BoardDir (config.Load defaults
+// it), so the transcript is always-on there.
+func (d *Dispatcher) transcriptPath(issue store.Issue) string {
+	if d.cfg.BoardDir == "" {
+		return ""
+	}
+	return filepath.Join(d.cfg.BoardDir, "logs", issue.Identifier+".transcript.jsonl")
 }
 
 // modelsFor resolves the "provider:model" spec(s) a spawned lane's worker

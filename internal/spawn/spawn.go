@@ -105,6 +105,16 @@ type WorkerSpec struct {
 	// workers, which never sync a worktree. Optional: LocalSpawner appends
 	// --base-branch=<value> only when this is non-empty.
 	BaseBranch string
+
+	// TranscriptPath is the absolute path to this issue's per-ticket agent
+	// transcript JSONL file -- one file per issue, accumulating across every
+	// turn/lane/rework it ever runs (see AGENTS.md's transcript bullet and
+	// dispatcher.transcriptPath). Optional: LocalSpawner appends
+	// --transcript=<value> only when this is non-empty, so a hand-built
+	// WorkerSpec with no board directory to root a path under (most kernel
+	// tests) simply omits the flag and the worker runs with transcripts
+	// disabled.
+	TranscriptPath string
 }
 
 // Spawner starts a worker process for spec and returns a handle to observe
