@@ -43,7 +43,10 @@ def _run_file() -> Path:
     if _RUN_FILE is None:
         _RESULTS_DIR.mkdir(exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        _RUN_FILE = _RESULTS_DIR / f"run-{stamp}.jsonl"
+        # PID suffix: two pytest processes started in the same second (e.g.
+        # a manual -k run alongside a cron sweep) must not collide on one
+        # run file.
+        _RUN_FILE = _RESULTS_DIR / f"run-{stamp}-{os.getpid()}.jsonl"
         _RUN_FILE.touch()
         latest = _RESULTS_DIR / "latest.jsonl"
         latest.unlink(missing_ok=True)  # also clears a leftover v1 regular file

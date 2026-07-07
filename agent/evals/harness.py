@@ -210,7 +210,7 @@ class ConvergenceResult:
         return sum(r.coder.tokens.out + (r.reviewer.tokens.out if r.reviewer else 0) for r in self.rounds)
 
     @property
-    def round_outcomes(self) -> list[list[str]]:
+    def round_outcomes(self) -> list[list[str | None]]:
         return [
             [r.coder.outcome.value, r.reviewer.outcome.value if r.reviewer else None]
             for r in self.rounds

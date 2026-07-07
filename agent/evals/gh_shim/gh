@@ -47,6 +47,11 @@ def main(argv: list[str]) -> int:
         # NOTE: the branch argument is ignored -- the shim keeps exactly ONE
         # pr.json per test dir, which is fine while every case drives a single
         # PR. Revisit if a case ever needs two concurrent branches.
+        # CAVEAT: headRefOid is stamped once at `pr create` time and never
+        # refreshed here, so a multi-round convergence loop's later `pr view`
+        # calls replay that create-time sha even after further commits --
+        # callers needing the true current head should `git rev-parse HEAD`
+        # instead of trusting this field past round 1.
         if pr_file.exists():
             print(pr_file.read_text().strip())
             return 0
