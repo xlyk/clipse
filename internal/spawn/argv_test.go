@@ -240,6 +240,49 @@ func TestWorkerArgs(t *testing.T) {
 				"--workspace=",
 			},
 		},
+		{
+			name: "shell-allow-list appended when set",
+			spec: WorkerSpec{
+				Lane:           "coder",
+				ShellAllowList: `["git","gh"]`,
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				`--shell-allow-list=["git","gh"]`,
+			},
+		},
+		{
+			name: "docs-shell-allow-list appended when set",
+			spec: WorkerSpec{
+				Lane:               "coder",
+				DocsShellAllowList: `["cat","ls"]`,
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				`--docs-shell-allow-list=["cat","ls"]`,
+			},
+		},
+		{
+			name: "shell-allow-list and docs-shell-allow-list both empty omits both flags",
+			spec: WorkerSpec{
+				Lane: "reviewer",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=reviewer",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+			},
+		},
 	}
 
 	for _, tt := range tests {

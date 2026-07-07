@@ -119,6 +119,21 @@ models:
 #   coder_docs: { reasoning_effort: low }
 #   reviewer: { thinking: { type: enabled, budget_tokens: 10000 } }
 
+# Per-profile shell posture for the DAC agents (coder / coder_docs /
+# reviewer — same keying as models:). Each key is either the sentinel
+# `all` (DEFAULT when omitted: the agent runs with an unrestricted shell,
+# DAC auto_approve) or an explicit list of allowed command names, which
+# restores the restrictive mode (allow-list enforced, plus DAC's own
+# dangerous-pattern rejection of redirects/env-prefixes/heredocs — note
+# that mode rejects habitual idioms like `2>&1` regardless of the list).
+# With `all`, a prompt-injected issue body can run arbitrary shell in the
+# worker env — see AGENTS.md's threat-model note; the C11 injection eval
+# is the standing monitor.
+# shell_allow_list:
+#   coder: all
+#   coder_docs: all
+#   reviewer: [git, gh, ls, cat, head, tail, grep, rg, find, which, wc, diff, cd, echo, test]
+
 # checkpoints_dir: directory holding one LangGraph checkpointer SQLite
 # database per issue (<checkpoints_dir>/<issue-identifier>.db), outside any
 # git worktree — passed to the worker per-issue as --checkpoint-db. Defaults
