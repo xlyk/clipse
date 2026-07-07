@@ -32,7 +32,7 @@ lint:
 	  echo "$$unformatted"; \
 	  exit 1; \
 	fi
-	cd agent && uvx ruff check .
+	cd agent && uv run ruff check .
 
 ## codegen: regenerate Go + Python types from schema/. Must be idempotent.
 codegen:

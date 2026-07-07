@@ -132,7 +132,7 @@ models:
 # shell_allow_list:
 #   coder: all
 #   coder_docs: all
-#   reviewer: [git, gh, ls, cat, head, tail, grep, rg, find, which, wc, diff, cd, echo, test]
+#   reviewer: [git, gh, ls, cat, head, tail, grep, rg, find, which, wc, diff, cd, test]
 
 # checkpoints_dir: directory holding one LangGraph checkpointer SQLite
 # database per issue (<checkpoints_dir>/<issue-identifier>.db), outside any
