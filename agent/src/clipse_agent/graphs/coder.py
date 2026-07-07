@@ -76,6 +76,7 @@ from clipse_agent import dac
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.profiles.coder import CoderProfile, get_coder_docs_profile, get_coder_profile
 from clipse_agent.tail import parse_structured_tail
+from clipse_agent.transcript import TranscriptWriter
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -471,11 +472,17 @@ def make_run_dac(
     agent_factory: AgentFactory,
     turn_driver: TurnDriver,
     checkpointer: BaseCheckpointSaver | None,
+    transcript: TranscriptWriter | None = None,
 ) -> Callable[[CoderState], Awaitable[dict[str, Any]]]:
     """Drive exactly one DAC turn: a fresh task turn normally (the normal
     issue/rework task, or a conflict-resolution task when `sync_base` left a
     merge in progress -- see `_coding_task_text`), or a `resume` of a
     previously-interrupted turn when `resume_payload` is set.
+
+    `transcript`, when given, is bound into this turn's `event_sink` fresh on
+    every call -- `run_id`/`thread_id` are only known once `state` arrives at
+    invocation time, unlike `profile`/`checkpointer`, which are already fixed
+    when this factory runs (see the module's own build_coder_graph docstring).
     """
 
     async def _node(state: CoderState) -> dict[str, Any]:
@@ -483,12 +490,29 @@ def make_run_dac(
         config = _dac_config(state["thread_id"])
         max_tokens = state.get("max_tokens")
         resume_payload = state.get("resume_payload")
+        event_sink = (
+            transcript.bind(
+                lane="coder",
+                run_id=state["run_id"],
+                thread_id=state["thread_id"],
+                assistant_id=profile.assistant_id,
+                model=profile.model,
+            )
+            if transcript is not None
+            else None
+        )
 
         if resume_payload is not None:
-            turn_result = await turn_driver(agent_graph, config, resume=resume_payload, max_tokens=max_tokens)
+            turn_result = await turn_driver(
+                agent_graph, config, resume=resume_payload, max_tokens=max_tokens, event_sink=event_sink
+            )
         else:
             turn_result = await turn_driver(
-                agent_graph, config, task_text=_coding_task_text(state), max_tokens=max_tokens
+                agent_graph,
+                config,
+                task_text=_coding_task_text(state),
+                max_tokens=max_tokens,
+                event_sink=event_sink,
             )
 
         # Parse the STATUS/TITLE/HANDOFF tail once here and stash blocked_reason
@@ -585,6 +609,7 @@ def make_run_docs(
     agent_factory: AgentFactory,
     turn_driver: TurnDriver,
     checkpointer: BaseCheckpointSaver | None,
+    transcript: TranscriptWriter | None = None,
 ) -> Callable[[CoderState], Awaitable[dict[str, Any]]]:
     """Drive one best-effort documentation DAC turn in the coder's worktree.
 
@@ -601,9 +626,23 @@ def make_run_docs(
     still blocks (route_after_dac skips this node entirely), because there the
     change itself may be incomplete or need a human. Uses its own `::docs-dac`
     thread namespace so it never resumes the coding turn's message history.
+
+    `transcript`, when given, is bound fresh per invocation with
+    `lane="coder_docs"` -- same reasoning as `make_run_dac`'s own docstring.
     """
 
     async def _node(state: CoderState) -> dict[str, Any]:
+        event_sink = (
+            transcript.bind(
+                lane="coder_docs",
+                run_id=state["run_id"],
+                thread_id=state["thread_id"],
+                assistant_id=profile.assistant_id,
+                model=profile.model,
+            )
+            if transcript is not None
+            else None
+        )
         try:
             agent_graph, _backend = agent_factory(profile, checkpointer, state["cwd"])
             turn_result = await turn_driver(
@@ -611,6 +650,7 @@ def make_run_docs(
                 _docs_dac_config(state["thread_id"]),
                 task_text=_docs_task_text(state),
                 max_tokens=_docs_max_tokens(state),
+                event_sink=event_sink,
             )
         except Exception as exc:  # noqa: BLE001 -- docs are non-critical; degrade, never block the PR
             return {"doc_summary": f"Documentation step skipped (error): {exc}", "doc_tokens_in": 0, "doc_tokens_out": 0}
@@ -1012,6 +1052,7 @@ def build_coder_graph(
     agent_factory: AgentFactory = dac.build_coder_agent,
     turn_driver: TurnDriver = dac.drive_turn,
     run_command: CommandRunner | None = None,
+    transcript: TranscriptWriter | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Build and compile the Coder lane's graph.
 
@@ -1031,6 +1072,10 @@ def build_coder_graph(
     (LangGraph loads the thread's checkpointed state before merging in the
     new input), with no need for the caller to resupply it.
 
+    `transcript` (default `None` = disabled) threads through to both DAC
+    turns the same way `checkpointer` does: a construction-time value closed
+    over by `make_run_dac`/`make_run_docs`, never carried on `CoderState`.
+
     `run_DAC` and `run_docs` are the async nodes (both await a DAC turn), so
     the returned graph must be driven with `.ainvoke`/`.astream` -- never the
     sync `.invoke`. Both turns share `agent_factory`/`turn_driver`; only the
@@ -1045,8 +1090,10 @@ def build_coder_graph(
     graph.add_node("load_context", load_context)
     graph.add_node("ensure_worktree", make_ensure_worktree(resolved_run_command))
     graph.add_node("sync_base", make_sync_base(resolved_run_command))
-    graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer))
-    graph.add_node("run_docs", make_run_docs(resolved_docs_profile, agent_factory, turn_driver, checkpointer))
+    graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer, transcript))
+    graph.add_node(
+        "run_docs", make_run_docs(resolved_docs_profile, agent_factory, turn_driver, checkpointer, transcript)
+    )
     graph.add_node("commit", make_commit(resolved_run_command))
     graph.add_node("push", make_push(resolved_run_command))
     graph.add_node("open_PR", make_open_pr(resolved_run_command))
