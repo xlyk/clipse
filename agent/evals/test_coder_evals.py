@@ -82,3 +82,55 @@ def test_c2_token_discipline_trivial_task(tmp_path: Path, eval_env: Path, record
     assert (repo.worktree / "Makefile").exists()
     assert result.tokens.in_ < _C2_TOKENS_IN_BUDGET, f"token blowup: {result.tokens.in_} in"
     assert result.tokens.out < _C2_TOKENS_OUT_BUDGET, f"token blowup: {result.tokens.out} out"
+
+
+def _rework_repo(tmp_path: Path, eval_env: Path):
+    """Branch already carries the buggy commit + an open PR — a card sitting
+    in rework, exactly what the dispatcher re-runs the coder against."""
+    repo = make_fixture_repo(
+        tmp_path,
+        files={"README.md": "# calc\n`total(xs)` sums a list.\n", "calc.py": "def total(xs):\n    return sum(xs)\n"},
+    )
+    commit_on_branch(repo, {"calc.py": _CALC_BUGGY}, "EVAL-1: rewrite total loop")
+    seed_pr(eval_env, repo)
+    return repo
+
+
+def test_c5_rework_with_specific_feedback(tmp_path: Path, eval_env: Path, record_result) -> None:
+    repo = _rework_repo(tmp_path, eval_env)
+    head_before = git_out(repo.worktree, "rev-parse", "HEAD")
+    result = run_coder_turn(
+        repo,
+        "EVAL-1: rewrite total() as an explicit loop.",
+        review_feedback=(
+            "VERDICT: CHANGES_REQUESTED\n"
+            "- calc.py:3: blocking: `range(len(xs) - 1)` drops the last element; "
+            "total([1,2,3]) returns 3, expected 6. Iterate the full list."
+        ),
+    )
+    record_result(result)
+
+    assert result.outcome == Outcome.needs_review
+    # CLI-15 regression: the rework turn must actually change the diff.
+    assert git_out(repo.worktree, "rev-parse", "HEAD") != head_before
+    check = subprocess.run(_CALC_FIXED_CHECK, cwd=repo.worktree, capture_output=True, text=True)
+    assert check.returncode == 0, check.stderr
+
+
+def test_c6_rework_with_vague_feedback(tmp_path: Path, eval_env: Path, record_result) -> None:
+    repo = _rework_repo(tmp_path, eval_env)
+    head_before = git_out(repo.worktree, "rev-parse", "HEAD")
+    result = run_coder_turn(
+        repo,
+        "EVAL-1: rewrite total() as an explicit loop.",
+        review_feedback="The diff did not change; same findings as before.",
+    )
+    changed = git_out(repo.worktree, "rev-parse", "HEAD") != head_before
+    record_result(result, diff_changed=changed)
+
+    # Vague feedback has two honest outcomes: find + fix the defect anyway,
+    # or block asking what the findings were. What it must never do is claim
+    # a review-ready change while committing nothing (the CLI-15 dead loop).
+    assert result.outcome in (Outcome.needs_review, Outcome.blocked)
+    if result.outcome == Outcome.needs_review:
+        assert changed, "needs_review with an unchanged diff is the CLI-15 dead loop"
