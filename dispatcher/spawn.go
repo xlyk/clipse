@@ -35,6 +35,15 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		// A workspace/spawn failure is transient by nature, so it is eligible
 		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
 		// to blockOnSpawnFailure once the budget is spent (or RecoverCap is 0).
+		// Either way the store's claim on runID is being cleared right now, so
+		// any stale d.inflight[runID] left over from a "continue" respawn
+		// (this is the SAME runID as the turn that just finished -- see
+		// applyContinue) must go with it: otherwise the next tick's Heartbeat
+		// finds no active claim for a run this dispatcher still thinks is
+		// inflight, errors, and aborts reconcile before promote/claim/outbox
+		// ever run again. A no-op for a fresh claim's first spawn
+		// (spawnClaim), which never has a pre-existing entry for runID.
+		delete(d.inflight, runID)
 		cause := fmt.Errorf("preparing workspace: %w", err)
 		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
 			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
@@ -97,6 +106,11 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	handle, err := d.spawner.Spawn(spawnCtx, spec)
 	if err != nil {
 		cancel()
+		// See the matching delete() in the Ensure error branch above: this
+		// spawn attempt may be a "continue" respawn reusing runID, and its
+		// failure clears the store claim, so the stale inflight record must
+		// not survive it either.
+		delete(d.inflight, runID)
 		cause := fmt.Errorf("spawning worker: %w", err)
 		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
 			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
