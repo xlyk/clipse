@@ -198,6 +198,7 @@ class ReviewerState(TypedDict, total=False):
     # --- post_comments ---
     pr_url: str | None
     comments_posted: int
+    comments_failed: int
 
     # --- emit_result ---
     result: WorkerResult
@@ -477,6 +478,11 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
     drives the merging->rework transition; nothing consumes a GitHub review
     state. Inline review COMMENTS and a plain PR comment are both allowed on
     your own PR, so the findings still land visibly on the PR.
+
+    Both `gh pr view` and each per-comment `gh api` call run with `check=False`
+    -- see the inline comments below for why: a raise here would send the run
+    to blocked/transient and the kernel would retry the same deterministic
+    failure until `recover_cap` parks the card.
     """
 
     def _node(state: ReviewerState) -> dict[str, Any]:
@@ -484,13 +490,26 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
         cwd = state["cwd"]
         comments: list[InlineComment] = state.get("review_comments") or []
 
-        view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd)
+        # check=False: a needs_review card can legitimately arrive with no PR
+        # (the coder's honest pr_url="" no-op path). Raising here would send
+        # the run to blocked/transient and the kernel would retry the same
+        # deterministic failure until recover_cap parks the card. The verdict
+        # still reaches the kernel via this run's typed JSON result.
+        view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd, check=False)
+        if view.returncode != 0:
+            return {"pr_url": None, "comments_posted": 0, "comments_failed": 0}
         pr_info = json.loads(view.stdout)
         pr_number = pr_info["number"]
         commit_sha = pr_info["headRefOid"]
 
+        posted = 0
+        failed: list[InlineComment] = []
         for comment in comments:
-            _run(
+            # check=False per comment: GitHub 422s an inline comment whose
+            # line isn't part of the diff hunk, and models routinely cite
+            # context lines. One unplaceable comment must not park the card
+            # -- the finding falls through to the summary comment instead.
+            result = _run(
                 run_command,
                 [
                     "gh",
@@ -508,15 +527,20 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
                     "side=RIGHT",
                 ],
                 cwd,
+                check=False,
             )
+            if result.returncode == 0:
+                posted += 1
+            else:
+                failed.append(comment)
 
         _run(
             run_command,
-            ["gh", "pr", "comment", branch, "--body", _changes_summary(state)],
+            ["gh", "pr", "comment", branch, "--body", _changes_summary(state, failed)],
             cwd,
         )
 
-        return {"pr_url": pr_info.get("url"), "comments_posted": len(comments)}
+        return {"pr_url": pr_info.get("url"), "comments_posted": posted, "comments_failed": len(failed)}
 
     return _node
 
@@ -543,12 +567,17 @@ def _pass_summary(state: ReviewerState) -> str:
     return dac_summary or "Reviewed the diff: no issues found."
 
 
-def _changes_summary(state: ReviewerState) -> str:
+def _changes_summary(state: ReviewerState, failed: Sequence[InlineComment] = ()) -> str:
     dac_summary = (state.get("dac_summary") or "").strip()
     comments = state.get("review_comments") or []
     parts = [dac_summary] if dac_summary else []
     if comments:
-        parts.append(f"Posted {len(comments)} inline comment(s).")
+        parts.append(f"Posted {len(comments) - len(failed)} inline comment(s).")
+    if failed:
+        listed = "\n".join(f"- {c.path}:{c.line}: {c.body}" for c in failed)
+        parts.append(
+            f"{len(failed)} finding(s) could not be attached to a diff line; they are:\n{listed}"
+        )
     return " ".join(parts) if parts else "Requested changes."
 
 

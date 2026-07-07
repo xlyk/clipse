@@ -457,6 +457,60 @@ def test_changes_requested_posts_summary_comment_when_no_structured_comments_fou
 
 
 # ---------------------------------------------------------------------------
+# post_comments resilience: no-PR grace + best-effort inline comments
+# ---------------------------------------------------------------------------
+
+
+def test_post_comments_no_pr_is_graceful() -> None:
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(1, "", "no pull requests found")),
+        ]
+    )
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "review_comments": [reviewer.InlineComment(path="a.py", line=3, body="x")],
+        }
+    )
+    assert out == {"pr_url": None, "comments_posted": 0, "comments_failed": 0}
+    # Nothing after the failed view: no gh api, no gh pr comment.
+    assert all(call.argv[:2] != ["gh", "api"] for call in runner.calls)
+
+
+def test_post_comments_inline_422_degrades_to_summary() -> None:
+    pr_json = json.dumps({"number": 7, "headRefOid": "abc123", "url": "https://x/pull/7"})
+    runner = FakeRunner(
+        rules=[
+            (_starts_with("gh", "pr", "view"), coder.CommandResult(0, pr_json, "")),
+            (_starts_with("gh", "api"), coder.CommandResult(1, "", "HTTP 422: Validation Failed")),
+        ]
+    )
+    node = reviewer.make_post_comments(runner)
+    out = node(
+        {
+            "branch": "clipse/EVAL-1",
+            "cwd": "/tmp",
+            "dac_summary": "found problems",
+            "review_comments": [
+                reviewer.InlineComment(path="a.py", line=3, body="off-by-one"),
+                reviewer.InlineComment(path="b.py", line=9, body="unused import", severity="nit"),
+            ],
+        }
+    )
+    assert out["comments_posted"] == 0
+    assert out["comments_failed"] == 2
+    assert out["pr_url"] == "https://x/pull/7"
+    # The summary comment still ran and carries the failed findings inline.
+    summary_calls = [c for c in runner.calls if c.argv[:3] == ["gh", "pr", "comment"]]
+    assert len(summary_calls) == 1
+    body = summary_calls[0].argv[summary_calls[0].argv.index("--body") + 1]
+    assert "a.py:3" in body and "off-by-one" in body
+
+
+# ---------------------------------------------------------------------------
 # Missing/unparseable verdict -> conservative changes_requested, never PASS
 # ---------------------------------------------------------------------------
 
