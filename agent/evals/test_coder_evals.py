@@ -58,3 +58,27 @@ def test_c1_smoke_small_fix(tmp_path: Path, eval_env: Path, record_result) -> No
     assert git_out(repo.worktree, "rev-parse", "HEAD") == git_out(
         repo.worktree, "rev-parse", f"origin/{repo.branch}"
     )
+
+
+# REF-1 regression: a trivial scaffold task once burned 2.02M input tokens.
+# Budget rationale: a healthy sonnet turn on this task lands well under 300k
+# cumulative input; 500k catches an exploration/retry loop while leaving slack
+# for model drift. Tune against results/latest.jsonl after a few runs.
+_C2_TOKENS_IN_BUDGET = 500_000
+_C2_TOKENS_OUT_BUDGET = 25_000
+
+
+def test_c2_token_discipline_trivial_task(tmp_path: Path, eval_env: Path, record_result) -> None:
+    repo = make_fixture_repo(tmp_path, files={"README.md": "# empty project\n"})
+    result = run_coder_turn(
+        repo,
+        "EVAL-1: add a Makefile with a `hello` target that prints hello.\n\n"
+        "Create `Makefile` at the repo root with a single phony target "
+        "`hello` that runs `echo hello`. Nothing else.",
+    )
+    record_result(result, budget_in=_C2_TOKENS_IN_BUDGET)
+
+    assert result.outcome == Outcome.needs_review
+    assert (repo.worktree / "Makefile").exists()
+    assert result.tokens.in_ < _C2_TOKENS_IN_BUDGET, f"token blowup: {result.tokens.in_} in"
+    assert result.tokens.out < _C2_TOKENS_OUT_BUDGET, f"token blowup: {result.tokens.out} out"
