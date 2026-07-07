@@ -169,3 +169,14 @@ def test_judge_parser_rejects_malformed_json() -> None:
     assert _parse_verdict("{not valid json}") is None
     # Truncated mid-object (no closing brace): the brace guard, not a crash.
     assert _parse_verdict('{"pass": true') is None
+
+
+def test_gh_shim_warns_on_unhandled_subcommand(tmp_path: Path, eval_env: Path) -> None:
+    proc = subprocess.run(
+        ["gh", "repo", "view", "--json", "name"],
+        cwd=tmp_path, capture_output=True, text=True, env=os.environ.copy(),
+    )
+    assert proc.returncode == 0  # still success: never look like a hard failure
+    assert "unhandled" in proc.stderr
+    calls = [json.loads(line) for line in (eval_env / "calls.jsonl").read_text().splitlines()]
+    assert calls[-1]["argv"][:2] == ["repo", "view"]

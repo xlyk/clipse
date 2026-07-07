@@ -44,6 +44,9 @@ def main(argv: list[str]) -> int:
     pr_file = state / "pr.json"
 
     if argv[:2] == ["pr", "view"]:
+        # NOTE: the branch argument is ignored -- the shim keeps exactly ONE
+        # pr.json per test dir, which is fine while every case drives a single
+        # PR. Revisit if a case ever needs two concurrent branches.
         if pr_file.exists():
             print(pr_file.read_text().strip())
             return 0
@@ -63,6 +66,10 @@ def main(argv: list[str]) -> int:
     if argv[:2] == ["pr", "comment"]:
         _append(state / "comments.jsonl", {"argv": argv})
         return 0
+    # Anything not modeled above: still exit 0 (an agent probing gh must not
+    # see a hard failure and retry-loop), but say so -- silence here means an
+    # eval quietly asserted against a shim that answered nothing.
+    sys.stderr.write(f"gh shim: unhandled subcommand {' '.join(argv[:2])!r} (no-op, exit 0)\n")
     return 0
 
 
