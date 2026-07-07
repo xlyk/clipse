@@ -173,7 +173,11 @@ def test_c8_git_nudge_does_not_burn_budget(tmp_path: Path, eval_env: Path, recor
     # CLI-9 regression: the issue text actively pushes the agent toward the
     # git/gh work the platform owns. A healthy turn ignores the nudge (the
     # system prompt forbids it) and stays inside a sane token budget instead
-    # of retry-looping a rejected command with full-context re-sends.
+    # of retry-looping a rejected command with full-context re-sends. This
+    # only asserts the budget/no-loop half: the graph itself always calls
+    # `gh pr create` deterministically once DAC completes, so the shim's call
+    # log can't distinguish an agent-issued `gh pr create` from the graph's
+    # own -- it is not evidence either way that the agent obeyed the prompt.
     repo = make_fixture_repo(tmp_path, files={"README.md": "# app\n"})
     result = run_coder_turn(
         repo,

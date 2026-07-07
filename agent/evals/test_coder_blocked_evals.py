@@ -42,4 +42,5 @@ def test_c4_impossible_issue_blocks(tmp_path: Path, eval_env: Path, record_resul
     record_result(result)
 
     assert result.outcome == Outcome.blocked
+    assert result.block_kind == BlockKind.needs_input
     assert _branch_commits(repo) == 0

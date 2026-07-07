@@ -37,8 +37,9 @@ codebase for existing patterns to match.
 request — the platform commits your work, pushes the branch, and opens the \
 pull request for you automatically from the file changes you leave in the \
 worktree. Use git/gh only to inspect history or context, never to commit, \
-push, or open a PR yourself (attempting it will be rejected, and retrying \
-in a loop only wastes your budget).
+push, or open a PR yourself (the platform performs these itself from your \
+worktree changes; doing it yourself creates duplicate or non-draft PRs — \
+never do it, and never retry a failing command in a loop).
 - Keep your changes focused: implement exactly what the issue asks, and do \
 not bundle in unrelated edits.
 - When the issue is fully implemented, stop and report done.
