@@ -38,8 +38,14 @@ CommandRunner and the DAC agent's own shell. Graders are deterministic:
 outcome enums, git state (commits, merge parents, conflict markers), token
 budgets, and shim logs.
 
-Per-case metrics (outcome, tokens, wall time) append to
-`results/latest.jsonl` (gitignored) via the `record_result` fixture.
+Per-case metrics (outcome, tokens, turn count) append via the
+`record_result` fixture to a per-session `results/run-<utc-ts>.jsonl`
+(gitignored); `results/latest.jsonl` is a symlink to the newest run, so
+run history survives for cross-run metrics (R7 flip counts, budget
+tuning). A pytest hook adds one status row per eval-marked case
+(passed/failed/skipped plus wall-clock duration). `make eval-report`
+summarizes the newest run; pass a `run-*.jsonl` path to
+`evals/report.py` for an older one.
 
 LangSmith: traces flow automatically when the standard `LANGSMITH_*` env
 vars are set; no code here depends on it.
