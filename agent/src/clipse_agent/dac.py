@@ -55,13 +55,14 @@ source of a LangGraph `interrupt()` once the shell middleware or
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from deepagents_code.agent import create_cli_agent
 from deepagents_code.config import create_model
 from deepagents_code.model_config import CODEX_PROVIDER
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langgraph.types import Command
 
 if TYPE_CHECKING:
@@ -74,6 +75,26 @@ if TYPE_CHECKING:
     from clipse_agent.profiles.coder import CoderProfile
 
 OutcomeHint = Literal["completed", "interrupted"]
+
+# One event dict in, nothing out. The real caller is
+# `clipse_agent.transcript.TranscriptWriter.bind(...)`'s returned sink, which
+# already merges lane/run_id/thread_id/assistant_id/model context into every
+# event and never raises -- drive_turn does not wrap event_sink calls itself.
+EventSink = Callable[[dict[str, Any]], None]
+
+# Shared cap for any free-form text a transcript event carries -- a
+# ToolMessage's `content` and an assistant message's accumulated `text`
+# alike (2026-07-07 controller amendment: one constant, not two). Generous
+# enough to keep a shell command's real output/error or a long narration
+# legible in the transcript, small enough that one runaway value can't
+# balloon the per-issue transcript file.
+_TRANSCRIPT_TEXT_LIMIT = 8_000
+
+
+def _truncate_for_transcript(text: str, limit: int = _TRANSCRIPT_TEXT_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...<truncated at {limit} chars>"
 
 
 class DacError(RuntimeError):
@@ -228,27 +249,84 @@ def _extract_interrupt_payload(data: dict[str, Any]) -> list[Any] | None:
     return [getattr(item, "value", item) for item in interrupts]
 
 
+def _flush_pending(event_sink: EventSink | None, pending: dict[str, Any]) -> None:
+    """Emit the just-finished logical AIMessage's accumulated text and tool
+    calls as transcript events (`assistant`, then one `tool_call` per call).
+
+    A logical message is "finished" once a chunk for a DIFFERENT message id
+    arrives (see `_accumulate_message_chunk`) or the stream ends -- `drive_turn`
+    calls this once more after its loop to flush whatever message was still
+    pending when the loop exited (including a token-ceiling abort mid-message).
+    A no-op when `event_sink` is None (transcripts disabled) or `pending` has
+    never seen a chunk yet (the very first call, before any message arrived).
+
+    The `assistant` event's text is truncated to `_TRANSCRIPT_TEXT_LIMIT`
+    (2026-07-07 controller amendment: the same cap `tool_result` content
+    gets) -- but only in the emitted event copy. `pending["parts"]` itself is
+    never mutated, since it also feeds `text_parts`/`DacTurnResult.last_text`,
+    which `parse_structured_tail` reads for STATUS/TITLE/HANDOFF -- those must
+    stay untruncated regardless of whether a transcript is attached.
+    """
+    if event_sink is None or "parts" not in pending:
+        return
+    text = "".join(pending.get("parts") or [])
+    if text:
+        event_sink({"event": "assistant", "text": _truncate_for_transcript(text)})
+    for call in pending.get("tool_calls") or []:
+        event_sink({"event": "tool_call", "name": call.get("name"), "args": call.get("args")})
+
+
 def _accumulate_message_chunk(
     data: tuple[Any, dict[str, Any]],
     text_parts: list[str],
     last_message: dict[str, Any],
+    event_sink: EventSink | None = None,
 ) -> tuple[int, int]:
-    """Fold one `messages`-mode chunk's usage/text into the running turn.
+    """Fold one `messages`-mode chunk's usage/text/tool-calls into the
+    running turn, and (when `event_sink` is set) emit transcript events.
 
     Mutates `text_parts` in place with any text blocks found (the whole
-    turn's text), and `last_message` (its `"id"`/`"parts"` keys) so that
-    only the FINAL AIMessage's text survives: streaming delivers one
-    logical message as several chunks sharing an id, so `parts` accumulates
-    across those, and resets whenever a chunk carrying a new message id
-    arrives. Returns the `(input_tokens, output_tokens)` this chunk
-    contributes; always `(0, 0)` for anything that is not an `AIMessage`
-    (e.g. a `ToolMessage`, which has no `usage_metadata` and whose
-    `content_blocks` are tool output, not assistant text -- and which never
-    touches `last_message`, so an interleaved tool result can't reset the
-    final message's accumulated text).
+    turn's text), and `last_message` (its `"id"`/`"parts"`/`"tool_calls"`/
+    `"chunk_sum"` keys) so that only the FINAL AIMessage's data survives:
+    streaming delivers one logical message as several chunks sharing an id,
+    so `parts` accumulates text across those, and `chunk_sum` accumulates the
+    raw chunks themselves via `AIMessageChunk.__add__` -- LangChain's own
+    documented way to reassemble a streamed tool call's fragmented `args`
+    JSON (a single chunk's own `.tool_calls` is often incomplete mid-stream;
+    only the merged sum is reliably complete). All four keys reset whenever a
+    chunk carrying a new message id arrives. `tool_calls` always holds the
+    best snapshot for the CURRENT message: `chunk_sum.tool_calls` for a
+    genuine `AIMessageChunk`, or the message's own `.tool_calls` for a
+    complete, non-chunk `AIMessage` (some `messages`-mode emissions -- e.g. a
+    subgraph's finished output folded into state -- are already complete,
+    not chunks; merging those with `+` would raise).
+
+    On a message-id transition, the JUST-FINISHED message's accumulated text
+    and tool calls are flushed as transcript events (`_flush_pending`) BEFORE
+    the reset; `drive_turn` calls `_flush_pending` once more after the stream
+    ends, for whichever message was still pending when the loop exited.
+
+    Returns the `(input_tokens, output_tokens)` this chunk contributes;
+    always `(0, 0)` for anything that is not an `AIMessage` (e.g. a
+    `ToolMessage`, which has no `usage_metadata` and whose `content_blocks`
+    are tool output, not assistant text -- and which never touches
+    `last_message`, so an interleaved tool result can't reset the final
+    message's accumulated text). When `event_sink` is set, a `ToolMessage`
+    instead emits its own `tool_result` event directly, with no accumulation
+    needed: a tool's result arrives as one complete message, never streamed
+    in fragments.
     """
     message_obj, _metadata = data
     if not isinstance(message_obj, AIMessage):
+        if event_sink is not None and isinstance(message_obj, ToolMessage):
+            event_sink(
+                {
+                    "event": "tool_result",
+                    "name": message_obj.name,
+                    "status": message_obj.status,
+                    "content": _truncate_for_transcript(str(message_obj.content)),
+                }
+            )
         return 0, 0
 
     usage = getattr(message_obj, "usage_metadata", None) or {}
@@ -257,6 +335,8 @@ def _accumulate_message_chunk(
 
     message_id = getattr(message_obj, "id", None)
     if "parts" not in last_message or message_id != last_message.get("id"):
+        _flush_pending(event_sink, last_message)
+        last_message.clear()
         last_message["id"] = message_id
         last_message["parts"] = []
 
@@ -266,6 +346,14 @@ def _accumulate_message_chunk(
             if text:
                 text_parts.append(text)
                 last_message["parts"].append(text)
+
+    if isinstance(message_obj, AIMessageChunk):
+        prior_sum = last_message.get("chunk_sum")
+        merged = message_obj if prior_sum is None else prior_sum + message_obj
+        last_message["chunk_sum"] = merged
+        last_message["tool_calls"] = merged.tool_calls
+    elif message_obj.tool_calls:
+        last_message["tool_calls"] = message_obj.tool_calls
 
     return tokens_in, tokens_out
 
@@ -277,6 +365,7 @@ async def drive_turn(
     task_text: str | None = None,
     resume: Any | None = None,
     max_tokens: int | None,
+    event_sink: EventSink | None = None,
 ) -> DacTurnResult:
     """Drive one turn of `agent_graph` to completion or interrupt.
 
@@ -300,6 +389,19 @@ async def drive_turn(
     set on the result; the caller maps that to `outcome=blocked,
     block_kind=capability`.
 
+    `event_sink`, when given, receives one dict per transcript event as the
+    turn is driven: `turn_start` (with `task_text`, `None` on a `resume`
+    call) before the stream starts; `assistant`/`tool_call` once per logical
+    message (flushed on a message-id transition or at stream end -- see
+    `_flush_pending`); `tool_result` per `ToolMessage`; `interrupt` when one
+    is detected; and `turn_end` (`outcome_hint`, `tokens_in`, `tokens_out`)
+    once the stream ends normally. A turn that dies mid-stream still emits a
+    best-effort `turn_end` carrying only `error` (`str(exc)`) before the
+    `DacError` is raised -- `event_sink` is assumed not to raise (its real
+    caller, `TranscriptWriter.bind`'s returned sink, already swallows
+    everything), so this cannot mask the original exception; `drive_turn`
+    does not wrap any other sink call in its own try/except.
+
     Raises:
         ValueError: if `task_text`/`resume` are both or neither given.
         DacError: wrapping any error raised while streaming the graph.
@@ -309,6 +411,9 @@ async def drive_turn(
             "drive_turn requires exactly one of task_text (fresh turn) or "
             "resume (continuation after an interrupt), not both or neither"
         )
+
+    if event_sink is not None:
+        event_sink({"event": "turn_start", "task_text": task_text})
 
     stream_input: dict[str, Any] | Command = (
         _fresh_turn_input(task_text) if task_text is not None else Command(resume=resume)
@@ -332,8 +437,10 @@ async def drive_turn(
                 payload = _extract_interrupt_payload(data)
                 if payload is not None:
                     interrupt_payload = payload
+                    if event_sink is not None:
+                        event_sink({"event": "interrupt", "payload": repr(payload)})
             elif mode == "messages":
-                turn_in, turn_out = _accumulate_message_chunk(data, text_parts, last_message)
+                turn_in, turn_out = _accumulate_message_chunk(data, text_parts, last_message, event_sink)
                 tokens_in += turn_in
                 tokens_out += turn_out
 
@@ -341,15 +448,32 @@ async def drive_turn(
                     token_ceiling_exceeded = True
                     break
     except Exception as exc:
+        # Controller amendment (2026-07-07): a crashed turn must still leave
+        # a trace -- postmortems are the feature's whole point. event_sink
+        # is assumed not to raise (see docstring), so this cannot mask exc.
+        if event_sink is not None:
+            event_sink({"event": "turn_end", "error": str(exc)})
         thread_id = config.get("configurable", {}).get("thread_id")
         raise DacError(
             f"DAC turn failed while streaming the agent graph "
             f"(thread_id={thread_id!r}): {exc}"
         ) from exc
 
+    _flush_pending(event_sink, last_message)
+
     outcome_hint: OutcomeHint = (
         "interrupted" if interrupt_payload is not None or token_ceiling_exceeded else "completed"
     )
+
+    if event_sink is not None:
+        event_sink(
+            {
+                "event": "turn_end",
+                "outcome_hint": outcome_hint,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+            }
+        )
 
     return DacTurnResult(
         outcome_hint=outcome_hint,

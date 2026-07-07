@@ -27,7 +27,7 @@ import pytest
 from deepagents.middleware.summarization import (
     create_summarization_middleware as _real_create_summarization_middleware,
 )
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langgraph.types import Command, Interrupt
 
 from clipse_agent import dac
@@ -741,3 +741,218 @@ def test_dac_turn_result_defaults_interrupt_payload_and_ceiling_flag():
 
     assert result.interrupt_payload is None
     assert result.token_ceiling_exceeded is False
+
+
+# ---------------------------------------------------------------------------
+# drive_turn -- event_sink (transcript tap)
+# ---------------------------------------------------------------------------
+
+
+def _ai_chunk(
+    *,
+    text: str = "",
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    message_id: str | None = None,
+    tool_call_chunks: list[dict[str, Any]] | None = None,
+) -> AIMessageChunk:
+    usage = (
+        {"input_tokens": tokens_in, "output_tokens": tokens_out, "total_tokens": tokens_in + tokens_out}
+        if tokens_in or tokens_out
+        else None
+    )
+    return AIMessageChunk(
+        id=message_id,
+        content=[{"type": "text", "text": text}] if text else "",
+        usage_metadata=usage,
+        tool_call_chunks=tool_call_chunks or [],
+    )
+
+
+def test_drive_turn_emits_turn_start_before_streaming_and_turn_end_after():
+    graph = _FakeAgentGraph(
+        [((), "messages", (_ai_message("done", tokens_in=5, tokens_out=2), {}))]
+    )
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(
+        dac.drive_turn(graph, _CONFIG, task_text="fix it", max_tokens=None, event_sink=events.append)
+    )
+
+    assert events[0] == {"event": "turn_start", "task_text": "fix it"}
+    assert events[-1] == {
+        "event": "turn_end",
+        "outcome_hint": "completed",
+        "tokens_in": 5,
+        "tokens_out": 2,
+    }
+
+
+def test_drive_turn_turn_start_carries_none_task_text_on_resume():
+    graph = _FakeAgentGraph([])
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(
+        dac.drive_turn(graph, _CONFIG, resume={"int-1": {}}, max_tokens=None, event_sink=events.append)
+    )
+
+    assert events[0] == {"event": "turn_start", "task_text": None}
+
+
+def test_drive_turn_never_calls_event_sink_when_not_given():
+    # Every other test in this file omits event_sink and must be unaffected
+    # -- this is the explicit regression guard for that default.
+    graph = _FakeAgentGraph(
+        [((), "messages", (_ai_message("done", tokens_in=1, tokens_out=1), {}))]
+    )
+
+    result = asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="go", max_tokens=None))
+
+    assert result.outcome_hint == "completed"  # ran to completion with no sink at all
+
+
+def test_drive_turn_flushes_one_assistant_event_per_logical_message():
+    graph = _FakeAgentGraph(
+        [
+            ((), "messages", (_ai_message("Reading the ", tokens_in=1, tokens_out=1, message_id="m1"), {})),
+            ((), "messages", (_ai_message("ticket now.", tokens_in=1, tokens_out=1, message_id="m1"), {})),
+            ((), "messages", (_ai_message("STATUS: done", tokens_in=1, tokens_out=1, message_id="m2"), {})),
+        ]
+    )
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="t", max_tokens=None, event_sink=events.append))
+
+    assistant_events = [e for e in events if e["event"] == "assistant"]
+    assert assistant_events == [
+        {"event": "assistant", "text": "Reading the ticket now."},
+        {"event": "assistant", "text": "STATUS: done"},
+    ]
+
+
+def test_drive_turn_emits_tool_call_with_args_merged_across_streamed_chunks():
+    # A tool call's `args` JSON streams across several chunks -- only the
+    # merged (AIMessageChunk.__add__) result has the complete, parseable
+    # args; a naive read of any single chunk's own .tool_calls would show
+    # `args: {}` (see this task's own docstring-level verification above).
+    graph = _FakeAgentGraph(
+        [
+            (
+                (),
+                "messages",
+                (_ai_chunk(message_id="m1", tool_call_chunks=[{"name": "shell", "args": '{"cmd":', "id": "call-1", "index": 0}]), {}),
+            ),
+            (
+                (),
+                "messages",
+                (_ai_chunk(message_id="m1", tool_call_chunks=[{"name": None, "args": ' "ls"}', "id": None, "index": 0}]), {}),
+            ),
+            ((), "messages", (_ai_message("next message", tokens_in=1, tokens_out=1, message_id="m2"), {})),
+        ]
+    )
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="t", max_tokens=None, event_sink=events.append))
+
+    tool_calls = [e for e in events if e["event"] == "tool_call"]
+    assert tool_calls == [{"event": "tool_call", "name": "shell", "args": {"cmd": "ls"}}]
+
+
+def test_drive_turn_emits_tool_result_for_a_tool_message():
+    graph = _FakeAgentGraph(
+        [((), "messages", (ToolMessage(content="ok", name="shell", tool_call_id="call-1", status="success"), {}))]
+    )
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="t", max_tokens=None, event_sink=events.append))
+
+    tool_results = [e for e in events if e["event"] == "tool_result"]
+    assert tool_results == [{"event": "tool_result", "name": "shell", "status": "success", "content": "ok"}]
+
+
+def test_drive_turn_truncates_oversized_tool_result_content():
+    huge = "x" * 9_000
+    graph = _FakeAgentGraph([((), "messages", (ToolMessage(content=huge, name="cat", tool_call_id="call-1"), {}))])
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="t", max_tokens=None, event_sink=events.append))
+
+    tool_result = next(e for e in events if e["event"] == "tool_result")
+    assert len(tool_result["content"]) < 9_000
+    assert tool_result["content"].startswith("x" * 100)
+
+
+def test_drive_turn_emits_interrupt_event_with_payload_repr():
+    action = {"action_requests": [{"name": "shell", "args": {"command": "rm -rf /"}}]}
+    graph = _FakeAgentGraph([((), "updates", {"__interrupt__": [_interrupt(action)]})])
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="go", max_tokens=None, event_sink=events.append))
+
+    interrupt_events = [e for e in events if e["event"] == "interrupt"]
+    assert interrupt_events == [{"event": "interrupt", "payload": repr([action])}]
+
+
+def test_drive_turn_flushes_pending_message_at_ceiling_abort():
+    # A token-ceiling abort breaks the loop mid-message (no id transition to
+    # trigger a flush) -- the post-loop flush must still catch it.
+    graph = _FakeAgentGraph(
+        [((), "messages", (_ai_message("partial narration", tokens_in=150, tokens_out=1, message_id="m1"), {}))]
+    )
+    events: list[dict[str, Any]] = []
+
+    asyncio.run(dac.drive_turn(graph, _CONFIG, task_text="go", max_tokens=100, event_sink=events.append))
+
+    assistant_events = [e for e in events if e["event"] == "assistant"]
+    assert assistant_events == [{"event": "assistant", "text": "partial narration"}]
+    assert events[-1]["event"] == "turn_end"
+    assert events[-1]["outcome_hint"] == "interrupted"
+
+
+# ---------------------------------------------------------------------------
+# drive_turn -- event_sink amendments (2026-07-07 controller amendments):
+# crashed turns still leave a turn_end trace, and the 8k truncation constant
+# is shared between tool_result content and assistant text.
+# ---------------------------------------------------------------------------
+
+
+def test_drive_turn_emits_error_turn_end_before_raising_on_mid_stream_failure():
+    # Amendment 1: a turn that dies mid-stream must not go silent in the
+    # transcript -- postmortems are the whole point of this feature. The
+    # sink is assumed never to raise, so emitting here cannot mask the
+    # original exception, which must still surface as DacError.
+    graph = _FakeAgentGraph(
+        [
+            ((), "messages", (_ai_message("working", tokens_in=1, tokens_out=1), {})),
+            RuntimeError("boom from langgraph"),
+        ]
+    )
+    events: list[dict[str, Any]] = []
+
+    with pytest.raises(dac.DacError, match="boom from langgraph"):
+        asyncio.run(
+            dac.drive_turn(graph, _CONFIG, task_text="go", max_tokens=None, event_sink=events.append)
+        )
+
+    assert events[-1] == {"event": "turn_end", "error": "boom from langgraph"}
+
+
+def test_drive_turn_truncates_oversized_assistant_text_but_not_internal_accumulation():
+    # Amendment 2: the same 8k-char limit that truncates tool_result content
+    # also caps an assistant event's text -- but only the transcript COPY.
+    # final_text/last_text feed parse_structured_tail (STATUS/TITLE/HANDOFF)
+    # and must stay untruncated, or a long narration would corrupt tail
+    # parsing purely because a transcript happened to be attached.
+    huge = "y" * 9_000
+    graph = _FakeAgentGraph([((), "messages", (_ai_message(huge, tokens_in=1, tokens_out=1), {}))])
+    events: list[dict[str, Any]] = []
+
+    result = asyncio.run(
+        dac.drive_turn(graph, _CONFIG, task_text="t", max_tokens=None, event_sink=events.append)
+    )
+
+    assistant_event = next(e for e in events if e["event"] == "assistant")
+    assert len(assistant_event["text"]) < 9_000
+    assert assistant_event["text"].startswith("y" * 100)
+    assert result.final_text == huge
+    assert result.last_text == huge
