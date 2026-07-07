@@ -10,7 +10,12 @@ import dataclasses
 
 import pytest
 
-from clipse_agent.profiles.coder import CoderProfile, get_coder_docs_profile, get_coder_profile
+from clipse_agent.profiles.coder import (
+    _DOCS_SHELL_ALLOW_LIST,
+    CoderProfile,
+    get_coder_docs_profile,
+    get_coder_profile,
+)
 
 
 def test_get_coder_docs_profile_returns_a_coder_profile():
@@ -94,8 +99,16 @@ def test_prompt_is_docs_only_and_allows_a_no_op():
     assert "no-op" in lowered
 
 
+def test_get_coder_docs_profile_defaults_to_unrestricted_shell():
+    # New default (decision 2026-07-07): matches get_coder_profile's own
+    # default -- an unconfigured lane runs with no allow-list at all.
+    assert get_coder_docs_profile().shell_allow_list is None
+
+
 def test_shell_allow_list_is_docs_scoped_and_excludes_the_source_toolchain():
-    profile = get_coder_docs_profile()
+    # Restrictive mode: a caller that opts into the docs-scoped allow-list
+    # gets back exactly the reference list this module exports.
+    profile = get_coder_docs_profile(shell_allow_list=_DOCS_SHELL_ALLOW_LIST)
     expected = {"git", "gh", "ls", "cat", "grep", "rg", "find", "mkdir"}
     assert set(profile.shell_allow_list) == expected
     # None of the coder's source-toolchain commands: the docs turn only touches docs.
@@ -106,5 +119,6 @@ def test_shell_allow_list_is_docs_scoped_and_excludes_the_source_toolchain():
 
 
 def test_shell_allow_list_is_immutable():
+    profile = get_coder_docs_profile(shell_allow_list=_DOCS_SHELL_ALLOW_LIST)
     with pytest.raises((AttributeError, TypeError)):
-        get_coder_docs_profile().shell_allow_list.append("rm")
+        profile.shell_allow_list.append("rm")

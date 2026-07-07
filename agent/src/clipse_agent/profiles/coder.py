@@ -7,15 +7,20 @@ nodes). This module is plain data: it describes how `dac.py` should build the
 lane's DAC agent (`deepagents_code.agent.create_cli_agent`) — it holds no live
 model client, no secrets, and does no I/O.
 
-Per the DAC API spike findings (docs/design/2026-07-01-clipse-design.md),
-shell enforcement of `shell_allow_list` requires the agent to be built with
-`auto_approve=False, interrupt_shell_only=True` — `auto_approve=True`
-silently disables the allow-list. That wiring lives in `dac.py`, not here;
-this profile only carries the allow-list itself.
+Per the DAC API spike findings (docs/design/2026-07-01-clipse-design.md) and
+the per-lane shell-policy decision (2026-07-07, see AGENTS.md), there are two
+sanctioned `shell_allow_list` modes. A tuple is the restrictive mode: the
+agent must be built with `auto_approve=False, interrupt_shell_only=True` —
+`auto_approve=True` silently disables the allow-list. `None` is the
+unrestricted mode — DAC `auto_approve=True`, no allow-list at all — and is
+the default from the factories below, matching the kernel's own `all`-policy
+default (`internal/config`'s `shell_allow_list`). That wiring lives in
+`dac.py`, not here; this profile only carries the policy itself.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,7 +48,8 @@ make — stop and report blocked with a clear summary of what you need. Do \
 not guess, and do not loop.
 - If your context grows large, call the `compact_conversation` tool to \
 summarize older history before continuing.
-- Only run commands from your shell allow-list.
+- If a shell command is rejected, do not retry it in a loop — try another \
+approach or report blocked.
 - End your FINAL message with this exact tail (own lines, in this order):
   STATUS: done            (or: STATUS: blocked: <what you need and why>)
   TITLE: <lowercase conventional-commit line for this change, <=60 chars>
@@ -93,13 +99,18 @@ class CoderProfile:
     Fields line up with the arguments `create_cli_agent`
     (`deepagents_code.agent`) needs to build the lane's DAC agent: an
     assistant identity, a `provider:model` spec, a system prompt, and a
-    shell allow-list. `shell_allow_list` is a tuple (not a list) so the
-    frozen dataclass is actually immutable end to end. `model_params` is a
-    plain `dict` rather than a tuple: frozen blocks *reassigning* the field,
-    not mutating the dict it points to, and unlike `shell_allow_list` this
-    value is never mutated in place — it is built once (config.ModelParams,
-    threaded through the kernel and `worker.py`'s `--model-params` JSON) and
-    only ever read.
+    shell policy. `shell_allow_list` is `None` or a tuple, never a bare
+    `list`: `None` means unrestricted — `dac.build_coder_agent` builds the
+    agent with `auto_approve=True` and no allow-list at all (decision
+    2026-07-07, the default from the factories below); a tuple means the
+    restrictive mode — `auto_approve=False, interrupt_shell_only=True`,
+    DAC's own allow-list enforcement — kept as a tuple (not a list) so the
+    frozen dataclass stays immutable end to end when it is set.
+    `model_params` is a plain `dict` rather than a tuple: frozen blocks
+    *reassigning* the field, not mutating the dict it points to, and unlike
+    `shell_allow_list` this value is never mutated in place — it is built
+    once (config.ModelParams, threaded through the kernel and `worker.py`'s
+    `--model-params` JSON) and only ever read.
 
     `context_window_tokens`, when not `None`, is the ceiling
     `dac.build_coder_agent` writes onto the built model's own
@@ -115,7 +126,7 @@ class CoderProfile:
     assistant_id: str
     model: str
     system_prompt: str
-    shell_allow_list: tuple[str, ...]
+    shell_allow_list: tuple[str, ...] | None
     model_params: dict[str, Any] | None = None
     context_window_tokens: int | None = _DEFAULT_CONTEXT_WINDOW_TOKENS
 
@@ -124,6 +135,7 @@ def get_coder_profile(
     model: str | None = None,
     model_params: dict[str, Any] | None = None,
     context_window_tokens: int | None = None,
+    shell_allow_list: Sequence[str] | None = None,
 ) -> CoderProfile:
     """Return the Coder lane's DAC profile.
 
@@ -142,12 +154,19 @@ def get_coder_profile(
     back to `_DEFAULT_CONTEXT_WINDOW_TOKENS`, so this factory can never
     produce a profile with `context_window_tokens=None` -- only a
     directly-constructed `CoderProfile` can opt all the way out.
+
+    `shell_allow_list` is the odd one out: unlike `model`/`context_window_tokens`,
+    omitted (`None`) means exactly `None` here too -- the new default,
+    unrestricted mode (decision 2026-07-07). It does NOT fall back to
+    `_SHELL_ALLOW_LIST`; a caller that wants the restrictive reference list
+    must pass it explicitly. `worker.py` resolves this from the kernel's
+    `--shell-allow-list` flag (absent -> `all` -> `None`).
     """
     return CoderProfile(
         assistant_id="clipse-coder",
         model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_SYSTEM_PROMPT,
-        shell_allow_list=_SHELL_ALLOW_LIST,
+        shell_allow_list=tuple(shell_allow_list) if shell_allow_list is not None else None,
         model_params=model_params,
         context_window_tokens=(
             context_window_tokens if context_window_tokens is not None else _DEFAULT_CONTEXT_WINDOW_TOKENS
@@ -192,8 +211,9 @@ commit and the SAME pull request. Use git only to inspect the uncommitted \
 change and context.
 - If your context grows large, call the `compact_conversation` tool to \
 summarize older history before continuing.
-- When you have written the docs (or decided none are needed), stop. Do not \
-loop. Only run commands from your shell allow-list.
+- When you have written the docs (or decided none are needed), stop. If a \
+shell command is rejected, do not retry it in a loop — try another approach \
+or report blocked.
 """
 
 # Docs-only: git/gh to inspect the uncommitted change + mkdir for a new docs
@@ -215,6 +235,7 @@ def get_coder_docs_profile(
     model: str | None = None,
     model_params: dict[str, Any] | None = None,
     context_window_tokens: int | None = None,
+    shell_allow_list: Sequence[str] | None = None,
 ) -> CoderProfile:
     """Return the DAC profile for the Coder lane's documentation sub-step.
 
@@ -230,12 +251,18 @@ def get_coder_docs_profile(
 
     `context_window_tokens` mirrors `get_coder_profile`'s idiom too: omitted
     (`None`) falls back to `_DEFAULT_CONTEXT_WINDOW_TOKENS`.
+
+    `shell_allow_list` mirrors `get_coder_profile`'s own odd-one-out idiom:
+    omitted (`None`) means exactly `None` -- unrestricted, the new default
+    (decision 2026-07-07) -- never a fall back to `_DOCS_SHELL_ALLOW_LIST`.
+    `worker.py` resolves this from the kernel's `--docs-shell-allow-list`
+    flag (absent -> `all` -> `None`).
     """
     return CoderProfile(
         assistant_id="clipse-coder-docs",
         model=model if model is not None else _DEFAULT_MODEL,
         system_prompt=_DOCS_SYSTEM_PROMPT,
-        shell_allow_list=_DOCS_SHELL_ALLOW_LIST,
+        shell_allow_list=tuple(shell_allow_list) if shell_allow_list is not None else None,
         model_params=model_params,
         context_window_tokens=(
             context_window_tokens if context_window_tokens is not None else _DEFAULT_CONTEXT_WINDOW_TOKENS

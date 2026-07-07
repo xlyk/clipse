@@ -1315,11 +1315,13 @@ def test_build_coder_graph_default_wiring_uses_real_dac_module(tmp_path, monkeyp
     # turns, so the emitted totals are their sum.
     assert result.tokens.in_ == 14
     assert result.tokens.out == 6
-    # Safety invariant enforced inside dac.build_coder_agent must never be
-    # bypassed just because coder.py is doing the calling.
-    assert captured["kwargs"]["auto_approve"] is False
-    assert captured["kwargs"]["interrupt_shell_only"] is True
-    assert captured["kwargs"]["shell_allow_list"]
+    # Default-mode routing enforced inside dac.build_coder_agent must never
+    # be bypassed just because coder.py is doing the calling. get_coder_profile()
+    # (no override) defaults to shell_allow_list=None (decision 2026-07-07),
+    # which build_coder_agent maps to DAC's auto_approve=True/no allow-list.
+    assert captured["kwargs"]["auto_approve"] is True
+    assert captured["kwargs"]["interrupt_shell_only"] is False
+    assert not captured["kwargs"]["shell_allow_list"]
 
 
 # ---------------------------------------------------------------------------

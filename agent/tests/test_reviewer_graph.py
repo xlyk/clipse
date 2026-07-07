@@ -714,13 +714,15 @@ def test_build_reviewer_graph_default_wiring_uses_real_dac_module_with_safety_in
     assert result.tokens.out == 3
 
     assert captured["assistant_id"] == "clipse-reviewer"
-    # Safety invariant enforced inside dac.build_coder_agent must never be
-    # bypassed just because reviewer.py is doing the calling.
-    assert captured["kwargs"]["auto_approve"] is False
-    assert captured["kwargs"]["interrupt_shell_only"] is True
+    # Default-mode routing enforced inside dac.build_coder_agent must never
+    # be bypassed just because reviewer.py is doing the calling.
+    # get_reviewer_profile() (no override) defaults to shell_allow_list=None
+    # (decision 2026-07-07), which build_coder_agent maps to DAC's
+    # auto_approve=True/no allow-list.
+    assert captured["kwargs"]["auto_approve"] is True
+    assert captured["kwargs"]["interrupt_shell_only"] is False
     assert captured["kwargs"]["enable_ask_user"] is True
-    assert set(captured["kwargs"]["shell_allow_list"]) == {"git", "gh", "cat", "ls", "grep", "rg", "find"}
-    assert "sed" not in captured["kwargs"]["shell_allow_list"]
+    assert not captured["kwargs"]["shell_allow_list"]
 
 
 def test_run_dac_forwards_profile_and_checkpointer(tmp_path):
