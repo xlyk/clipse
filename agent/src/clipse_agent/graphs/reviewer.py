@@ -509,11 +509,13 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
         cwd = state["cwd"]
         comments: list[InlineComment] = state.get("review_comments") or []
 
-        # check=False: a needs_review card can legitimately arrive with no PR
-        # (the coder's honest pr_url="" no-op path). Raising here would send
-        # the run to blocked/transient and the kernel would retry the same
-        # deterministic failure until recover_cap parks the card. The verdict
-        # still reaches the kernel via this run's typed JSON result.
+        # check=False so the failure split below is ours, not _run's blanket
+        # raise: a needs_review card can legitimately arrive with no PR (the
+        # coder's honest pr_url="" no-op path), and only that case returns
+        # gracefully -- the verdict still reaches the kernel via this run's
+        # typed JSON result. Any other failure raises, and a genuine transient
+        # getting the kernel's bounded retry is the desired outcome (unlike
+        # the deterministic per-comment 422s handled best-effort below).
         view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd, check=False)
         if view.returncode != 0:
             # Narrow grace: only the known no-PR signal (the coder's honest
