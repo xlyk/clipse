@@ -19,6 +19,20 @@ const apiURL = "https://api.linear.app/graphql"
 // API key from.
 const apiKeyEnvVar = "LINEAR_API_KEY"
 
+// cancelledRecencyDays bounds how long a Linear-cancelled issue stays in
+// CandidateIssuesQuery's scope after its last update. The dispatcher only
+// needs to OBSERVE a cancellation once: adoptLinearMove (dispatcher/poll.go)
+// writes board_status="cancelled" into SQLite the first time it sees one, and
+// promote.go's terminalStatuses already treats "cancelled" as terminal, so an
+// already-adopted cancelled row is never read from Linear again. Without this
+// bound, every issue a team has ever cancelled stays in the candidate result
+// forever — and this query has no pagination (Linear's GraphQL default page
+// size is first:50), so a large enough backlog of old cancellations can
+// silently push a genuinely active issue off the page. 14 days comfortably
+// covers the poll-interval-to-adoption lag (normally seconds) with generous
+// slack for a dispatcher outage.
+const cancelledRecencyDays = 14
+
 // CandidateIssuesQuery fetches active-state issues on the configured team
 // along with the fields NormalizeCandidateIssues needs: title, description,
 // workflow state name AND type, agent:<lane> labels, inverse blocking
@@ -37,24 +51,33 @@ const apiKeyEnvVar = "LINEAR_API_KEY"
 // CLIPSE_ISSUE_TEXT) -- without them here, that env var is always empty
 // regardless of anything downstream.
 //
-// Excluding "completed" and "duplicate" (Linear has no "active" type; the
-// real types are backlog/unstarted/started/completed/canceled/triage) keeps
-// that work out of the candidate set; the dispatcher decides dispatchability
-// from Status/Deps, not from this query. "canceled" is DELIBERATELY left in
-// scope, unlike the other two: a completed issue's board_status is set by the
-// dispatcher's OWN action (the git-operator lane merges it, then the
-// dispatcher writes board_status="done" itself, before Linear's state even
-// changes) and a duplicate was never a candidate to begin with, but
-// cancellation is a human-only Linear event the dispatcher has no other way
-// to learn about — excluding it here left a Linear-cancelled blocker's stale
-// store row frozen at its pre-cancellation status forever, permanently
-// stalling any dependent still waiting on it in Todo (see
-// dispatcher/promote.go's dependency-gating, and status.go's cancelled-type
-// mapping). Filtering to team.key scopes the candidate set to the single team
-// clipse is configured against (config.Config.TeamKey), so a workspace with
-// other teams' issues never surfaces them as candidates.
-const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
-  issues(filter: { state: { type: { nin: ["completed", "duplicate"] } }, team: { key: { eq: $teamKey } } }) {
+// The filter is an OR of two branches (Linear has no "active" type; the real
+// types are backlog/unstarted/started/completed/canceled/triage):
+//
+//  1. An unconditional branch excluding "completed" and "canceled", with NO
+//     recency restriction — backlog/unstarted/started/triage are never
+//     terminal, so bounding them by updatedAt would risk losing a genuinely
+//     active issue that just hasn't been touched in a while. "completed" is
+//     excluded because the dispatcher learns about a merge from its OWN
+//     action (the git-operator lane merges it, then the dispatcher writes
+//     board_status="done" itself, before Linear's state even changes) — it
+//     never needs to observe "completed" from Linear at all. ("duplicate" is
+//     NOT a real Linear state type and was dead filter text.)
+//  2. A second branch folding "canceled" back into scope, but only when
+//     updated within the last cancelledRecencyDays — cancellation is a
+//     human-only Linear event with no other signal, so it can't be excluded
+//     outright the way "completed" is (see status.go's cancelled-type
+//     mapping and dispatcher/promote.go's dependency-gating), but nor can it
+//     stay in scope forever (see cancelledRecencyDays's doc comment).
+//
+// Filtering to team.key scopes the candidate set to the single team clipse is
+// configured against (config.Config.TeamKey), so a workspace with other
+// teams' issues never surfaces them as candidates.
+var CandidateIssuesQuery = fmt.Sprintf(`query CandidateIssues($teamKey: String!) {
+  issues(filter: { team: { key: { eq: $teamKey } }, or: [
+    { state: { type: { nin: ["completed", "canceled"] } } },
+    { state: { type: { eq: "canceled" } }, updatedAt: { gt: "-P%dD" } }
+  ] }) {
     nodes {
       id
       identifier
@@ -82,7 +105,7 @@ const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
       }
     }
   }
-}`
+}`, cancelledRecencyDays)
 
 // SetStateMutation moves an issue to a given workflow state.
 const SetStateMutation = `mutation SetState($issueId: String!, $stateId: String!) {
