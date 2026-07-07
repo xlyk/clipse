@@ -162,3 +162,10 @@ def test_judge_parser_rejects_garbage() -> None:
     assert _parse_verdict("PASS") is None
     assert _parse_verdict('{"pass": "yes"}') is None
     assert _parse_verdict("") is None
+
+
+def test_judge_parser_rejects_malformed_json() -> None:
+    # Braced but undecodable: exercises the json.JSONDecodeError path.
+    assert _parse_verdict("{not valid json}") is None
+    # Truncated mid-object (no closing brace): the brace guard, not a crash.
+    assert _parse_verdict('{"pass": true') is None
