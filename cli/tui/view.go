@@ -145,13 +145,18 @@ func (m Model) dims() layoutDims {
 	d.bodyH = maxInt(h-d.headerH-d.tabsH-d.footerH, 6)
 
 	// Panels stack vertically: PIPELINE on top, the ACTIVITY feed as a
-	// full-width band below it (the feed reads better full-width under the
-	// pipeline than squeezed into a side column). Activity gets a bounded
-	// bottom band so the pipeline keeps the majority of the height.
-	d.actH = clampInt(d.bodyH*2/5, 6, 18)
-	d.pipeH = maxInt(d.bodyH-d.actH, 4)
+	// full-width band below it. The pipeline is content-sized — it takes
+	// min(its natural rendered height, bodyH − actMin) — and the activity
+	// feed absorbs every remaining row (P1). A sparse board therefore gives
+	// its spare height to the live feed instead of rendering void inside the
+	// pipeline border; a full board naturally wins the space back, so the
+	// layout is self-balancing.
+	const actMin = 6
 	d.pipeTextW = maxInt(d.cw-2, 8)
 	d.actTextW = maxInt(d.cw-2, 8)
+	natural := lipgloss.Height(m.renderBody(d.pipeTextW, 0)) + 3 // + border(2) + title(1)
+	d.pipeH = clampInt(natural, 4, maxInt(d.bodyH-actMin, 4))
+	d.actH = maxInt(d.bodyH-d.pipeH, actMin)
 	d.pipeVpH = maxInt(d.pipeH-3, 1) // border(2) + title(1)
 	d.actVpH = maxInt(d.actH-3, 1)
 	return d

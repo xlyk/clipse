@@ -20,26 +20,38 @@ func (m Model) sectionList() []section {
 	}
 }
 
-// renderBody renders the scrollable dashboard body: the four section panels
-// stacked, then a compact DONE summary. now feeds the RUNNING rows' live
-// elapsed (View passes the wall clock; layout passes 0 for a stable line
-// count, since elapsed is inline and never adds lines).
+// renderBody renders the scrollable dashboard body: the non-empty section
+// panels stacked, then a compact DONE summary. Empty sections are omitted
+// entirely — their zero-counts already live in the header chips — so a
+// sparse board never spends rows saying "none" (P1). now feeds the live
+// rows' elapsed (View passes the wall clock; layout passes 0 for a stable
+// line count, since elapsed is inline and never adds lines).
 func (m Model) renderBody(inner int, now int64) string {
 	var parts []string
 	for _, s := range m.sectionList() {
+		if len(s.rows) == 0 {
+			continue
+		}
 		parts = append(parts, m.renderSection(s, inner, now))
 	}
 	body := strings.Join(parts, "\n")
 	if done := m.renderDoneSummary(inner); done != "" {
-		body += "\n" + done
+		if body != "" {
+			body += "\n"
+		}
+		body += done
+	}
+	if body == "" {
+		return dimStyle.Render("no issues on the board yet")
 	}
 	return body
 }
 
-// renderSection renders one titled group of rows (or a dim placeholder when
-// empty), tinted with the section's accent color. It is borderless — the
-// enclosing PIPELINE panel supplies the single frame — so the four groups read
-// as one board rather than four separate boxes.
+// renderSection renders one titled group of rows, tinted with the section's
+// accent color. Callers skip empty sections (renderBody / orderedLineIndex),
+// so there is no empty-placeholder branch. It is borderless — the enclosing
+// PIPELINE panel supplies the single frame — so the groups read as one board
+// rather than separate boxes.
 func (m Model) renderSection(s section, inner int, now int64) string {
 	head := lipgloss.NewStyle().Bold(true).Foreground(s.accent).Render(s.glyph+" "+s.title) +
 		dimStyle.Render(fmt.Sprintf(" (%d)", len(s.rows)))
@@ -50,12 +62,8 @@ func (m Model) renderSection(s section, inner int, now int64) string {
 	}
 
 	lines := []string{head}
-	if len(s.rows) == 0 {
-		lines = append(lines, dimStyle.Render("   · none"))
-	} else {
-		for _, row := range s.rows {
-			lines = append(lines, m.renderRow(row, s, inner, now))
-		}
+	for _, row := range s.rows {
+		lines = append(lines, m.renderRow(row, s, inner, now))
 	}
 	lines = append(lines, "") // trailing spacer for breathing room between groups
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
@@ -175,14 +183,18 @@ func (m Model) renderDoneSummary(inner int) string {
 // than assuming one line per row, so a row that wraps at a narrow width can't
 // drift the result: preceding groups are summed via lipgloss.Height of the
 // whole (borderless) group, and rows preceding g within its group via
-// lipgloss.Height of each rendered row (the heading is a single line). Used to
-// keep the selected row visible when scrolling the pipeline viewport.
+// lipgloss.Height of each rendered row (the heading is a single line). Empty
+// sections are skipped, mirroring renderBody exactly. Used to keep the
+// selected row visible when scrolling the pipeline viewport.
 func (m Model) orderedLineIndex(g int) int {
 	inner := m.dims().pipeTextW
 
 	line := 0
 	seen := 0
 	for _, s := range m.sectionList() {
+		if len(s.rows) == 0 {
+			continue
+		}
 		if g < seen+len(s.rows) {
 			line++ // heading
 			for i := 0; i < g-seen; i++ {
