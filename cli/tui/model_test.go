@@ -2,6 +2,7 @@ package tui_test
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -58,7 +59,7 @@ func buildSnapshot() store.Snapshot {
 
 // TestUpdate_SnapshotMsg_FoldsGroupsAndTotals asserts that feeding a
 // snapshotMsg into Update deterministically recomputes the
-// running/blocked/queued groupings plus the token/count totals, with no DB
+// active/blocked/queued groupings plus the token/count totals, with no DB
 // access inside Update itself.
 func TestUpdate_SnapshotMsg_FoldsGroupsAndTotals(t *testing.T) {
 	m := tui.NewModel()
@@ -69,11 +70,11 @@ func TestUpdate_SnapshotMsg_FoldsGroupsAndTotals(t *testing.T) {
 		t.Errorf("Update(snapshotMsg) cmd = %v, want nil (folding state should not itself schedule work)", cmd)
 	}
 
-	if got, want := len(updated.Running()), 1; got != want {
-		t.Fatalf("Running() len = %d, want %d", got, want)
+	if got, want := len(updated.Active()), 1; got != want {
+		t.Fatalf("Active() len = %d, want %d", got, want)
 	}
-	if got, want := updated.Running()[0].Identifier, "CLP-1"; got != want {
-		t.Errorf("Running()[0].Identifier = %q, want %q", got, want)
+	if got, want := updated.Active()[0].Identifier, "CLP-1"; got != want {
+		t.Errorf("Active()[0].Identifier = %q, want %q", got, want)
 	}
 
 	if got, want := len(updated.Blocked()), 1; got != want {
@@ -107,17 +108,15 @@ func TestUpdate_SnapshotMsg_FoldsGroupsAndTotals(t *testing.T) {
 	}
 }
 
-// TestFold_DownstreamColumnsAppearInInFlightBucket asserts that issues
-// sitting in review/rework/merging — active downstream columns a spawned
-// worker or gitops is (or will be) working through — are visible in the TUI
-// via a dedicated in-flight bucket, rather than silently dropped the way
-// fold's original running/blocked/queued-only switch left them. A "done"
-// issue (terminal, nothing left to watch) still shows up nowhere — this must
-// be an explicit set of active columns, not a catch-all default that would
-// also sweep in "done".
-func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
+// TestFold_WorkingColumnsFoldIntoActive asserts every working column —
+// running, review, rework, merging — lands in the single ACTIVE section
+// (P2), while terminal "done" still shows up nowhere: this must stay an
+// explicit set of active columns, not a catch-all default that would also
+// sweep in "done".
+func TestFold_WorkingColumnsFoldIntoActive(t *testing.T) {
 	snap := store.Snapshot{
 		Issues: []store.IssueSnapshot{
+			{Issue: store.Issue{ID: "i-run", Identifier: "CLP-9", LaneLabel: "agent:coder", BoardStatus: "running"}},
 			{Issue: store.Issue{ID: "i-review", Identifier: "CLP-10", LaneLabel: "agent:reviewer", BoardStatus: "review"}},
 			{Issue: store.Issue{ID: "i-rework", Identifier: "CLP-11", LaneLabel: "agent:coder", BoardStatus: "rework"}},
 			{Issue: store.Issue{ID: "i-merging", Identifier: "CLP-12", LaneLabel: "agent:git_operator", BoardStatus: "merging"}},
@@ -128,31 +127,62 @@ func TestFold_DownstreamColumnsAppearInInFlightBucket(t *testing.T) {
 	m := tui.NewModel()
 	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
 
-	inFlight := updated.InFlight()
-	if got, want := len(inFlight), 3; got != want {
-		t.Fatalf("InFlight() len = %d, want %d (review/rework/merging); got %+v", got, want, inFlight)
+	active := updated.Active()
+	if got, want := len(active), 4; got != want {
+		t.Fatalf("Active() len = %d, want %d (running/review/rework/merging); got %+v", got, want, active)
 	}
-	gotIDs := make(map[string]bool, len(inFlight))
-	for _, row := range inFlight {
+	gotIDs := make(map[string]bool, len(active))
+	for _, row := range active {
 		gotIDs[row.Identifier] = true
 	}
-	for _, want := range []string{"CLP-10", "CLP-11", "CLP-12"} {
+	for _, want := range []string{"CLP-9", "CLP-10", "CLP-11", "CLP-12"} {
 		if !gotIDs[want] {
-			t.Errorf("InFlight() missing %q, got %+v", want, inFlight)
+			t.Errorf("Active() missing %q, got %+v", want, active)
 		}
 	}
 	if gotIDs["CLP-14"] {
-		t.Errorf("done issue CLP-14 leaked into InFlight(), want it to stay invisible (terminal)")
+		t.Errorf("done issue CLP-14 leaked into Active(), want it to stay invisible (terminal)")
 	}
 
-	if got := len(updated.Running()); got != 0 {
-		t.Errorf("Running() len = %d, want 0", got)
-	}
 	if got := len(updated.Blocked()); got != 0 {
 		t.Errorf("Blocked() len = %d, want 0", got)
 	}
 	if got := len(updated.Queued()); got != 0 {
 		t.Errorf("Queued() len = %d, want 0", got)
+	}
+}
+
+// TestFold_ActiveOrdersLiveFirst asserts the ACTIVE section leads with the
+// rows a worker is on right now (held claim), then the unclaimed rows
+// waiting for pickup — identifier order preserved within each half.
+func TestFold_ActiveOrdersLiveFirst(t *testing.T) {
+	claimed := sql.NullString{String: "claim-tok", Valid: true}
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			// Unclaimed running card (sorts first by identifier alone).
+			{Issue: store.Issue{ID: "i-1", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "running"}},
+			// Claimed review card — live, must lead despite the later identifier.
+			{
+				Issue:     store.Issue{ID: "i-2", Identifier: "CLP-2", LaneLabel: "coder", BoardStatus: "review", ClaimLock: claimed},
+				LatestRun: &store.Run{RunID: "r2", Lane: "reviewer", Status: "running", StartedAt: 100},
+			},
+			// Unclaimed merging card.
+			{Issue: store.Issue{ID: "i-3", Identifier: "CLP-3", LaneLabel: "coder", BoardStatus: "merging"}},
+		},
+	}
+
+	m := tui.NewModel()
+	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
+
+	active := updated.Active()
+	if got, want := len(active), 3; got != want {
+		t.Fatalf("Active() len = %d, want %d", got, want)
+	}
+	wantOrder := []string{"CLP-2", "CLP-1", "CLP-3"}
+	for i, want := range wantOrder {
+		if active[i].Identifier != want {
+			t.Errorf("Active()[%d] = %q, want %q (live rows first, identifier order within halves)", i, active[i].Identifier, want)
+		}
 	}
 }
 
@@ -192,7 +222,7 @@ func TestFold_ActiveClaimMarksRowLiveWithWorkingLane(t *testing.T) {
 	updated, _ := m.Update(tui.SnapshotMsg{Snap: snap})
 
 	byID := make(map[string]tui.Row)
-	for _, r := range append(append([]tui.Row{}, updated.Running()...), updated.InFlight()...) {
+	for _, r := range updated.Active() {
 		byID[r.Identifier] = r
 	}
 
@@ -312,8 +342,8 @@ var (
 )
 
 // TestSelectionNavigation_Clamps asserts j/k (down/up) walk the flattened
-// ordered rows — running → in flight → blocked → queued — clamping at both
-// ends rather than wrapping, and that the initial selection is the first row.
+// ordered rows — active → blocked → queued — clamping at both ends rather
+// than wrapping, and that the initial selection is the first row.
 func TestSelectionNavigation_Clamps(t *testing.T) {
 	m := tui.NewModel()
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
@@ -433,6 +463,36 @@ func TestView_RendersWithoutPanicAcrossModes(t *testing.T) {
 		if m.View() == "" {
 			t.Errorf("View() returned empty after key %v", msg)
 		}
+	}
+}
+
+// TestHeaderChips_WorkingWaitingAgreeWithActive asserts the header chips and
+// the ACTIVE section agree by construction: one claimed row → "1 working",
+// one unclaimed working-column row → "1 waiting". (Colors are stripped in a
+// non-TTY test run, so the rendered strings are plain.)
+func TestHeaderChips_WorkingWaitingAgreeWithActive(t *testing.T) {
+	claimed := sql.NullString{String: "claim-tok", Valid: true}
+	snap := store.Snapshot{
+		CountsByStatus: map[string]int{"running": 1, "review": 1},
+		Issues: []store.IssueSnapshot{
+			{
+				Issue:     store.Issue{ID: "i-1", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "running", ClaimLock: claimed},
+				LatestRun: &store.Run{RunID: "r1", Lane: "coder", Status: "running", StartedAt: 100},
+			},
+			{Issue: store.Issue{ID: "i-2", Identifier: "CLP-2", LaneLabel: "coder", BoardStatus: "review"}},
+		},
+	}
+
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(tui.SnapshotMsg{Snap: snap})
+
+	view := m.View()
+	if !strings.Contains(view, "1 working") {
+		t.Errorf("View() missing %q chip", "1 working")
+	}
+	if !strings.Contains(view, "1 waiting") {
+		t.Errorf("View() missing %q chip", "1 waiting")
 	}
 }
 

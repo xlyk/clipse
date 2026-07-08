@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"math"
 	"sort"
 
 	"github.com/xlyk/clipse/internal/store"
@@ -17,4 +18,15 @@ func sortedIssueSnapshots(issues []store.IssueSnapshot) []store.IssueSnapshot {
 		return sorted[i].Identifier < sorted[j].Identifier
 	})
 	return sorted
+}
+
+// queuedRank maps a Linear priority to its claim-order rank, mirroring
+// store.selectClaimCandidate's ORDER BY (CASE priority WHEN 0 THEN <max>
+// ELSE priority END ASC): 0 ("no priority") ranks last; 1 (urgent) through
+// 4 (low) rank ascending.
+func queuedRank(p int) int {
+	if p == 0 {
+		return math.MaxInt
+	}
+	return p
 }

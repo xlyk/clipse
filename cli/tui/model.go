@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -26,6 +28,13 @@ type SnapshotMsg struct {
 	// singleton lock at the moment the snapshot was read. Defaults to false
 	// (unknown/none) for callers — e.g. tests — that don't supply it.
 	Live bool
+	// TranscriptIdents is the set of issue identifiers that already have a
+	// transcript file on disk (<logs>/<ISSUE>.transcript.jsonl). It is
+	// computed by the refresh command — a directory listing is I/O, so it
+	// must not happen inside the pure Update — and follow mode uses it to
+	// enable `f` on rows that aren't currently claimed. Nil is fine: no
+	// transcripts known.
+	TranscriptIdents map[string]bool
 }
 
 // TickMsg is the refresh trigger sent by tea.Tick. Update responds to it by
@@ -48,6 +57,7 @@ const (
 	modeDashboard viewMode = iota
 	modeDetail
 	modeKanban
+	modeFollow
 )
 
 // Row is one issue's display-ready state: identifier/lane plus its latest
@@ -90,6 +100,25 @@ type Row struct {
 	// the row badge can name the agent that is actually working, not the one
 	// that opened the issue.
 	ActiveLane string
+
+	// ReworkCount / RecoverAttempts / BlockedUntil / Priority / Unmirrored
+	// surface the kernel's per-issue bookkeeping the TUI previously dropped
+	// (P4): how many times the card bounced back to the coder, how many
+	// transient-failure auto-retries it has burned, the unix time before
+	// which it is invisible to every claim (its retry backoff window), its
+	// Linear priority (the kernel's claim-order key), and whether a board
+	// transition is still waiting to be mirrored to Linear (a pending
+	// outbox write).
+	ReworkCount     int
+	RecoverAttempts int
+	BlockedUntil    int64
+	Priority        int
+	Unmirrored      bool
+
+	// HasTranscript is true when this issue already has a transcript file on
+	// disk, so follow mode can replay a past run even when nothing is
+	// currently claimed. Sourced from SnapshotMsg.TranscriptIdents.
+	HasTranscript bool
 }
 
 // Model is the bubbletea model for `clipse tui`. It holds only
@@ -97,13 +126,16 @@ type Row struct {
 // error) — never a live store handle — so Update stays pure and unit-testable
 // without a DB or TTY.
 type Model struct {
-	running  []Row
-	blocked  []Row
-	queued   []Row // ready + todo, in that order
-	inFlight []Row // review + rework + merging, in that order
+	// active is every issue in play right now — the working columns
+	// running/review/rework/merging folded into one section (P2): live-claim
+	// rows first (a worker is on them at this moment), then unclaimed rows
+	// waiting for their next pickup.
+	active  []Row
+	blocked []Row
+	queued  []Row // ready + todo, in that order
 
 	// ordered is every visible row flattened in section order
-	// (running→in flight→blocked→queued), the list the selection cursor walks.
+	// (active→blocked→queued), the list the selection cursor walks.
 	ordered []Row
 	// byStatus groups rows by exact board_status, the source for the kanban
 	// columns (including terminal "done", which the stacked view omits).
@@ -116,6 +148,13 @@ type Model struct {
 	// something human-readable.
 	identByID  map[string]string
 	statusByID map[string]string
+	// laneByRunID resolves a run id to its bare lane, built from every
+	// issue's full run history — the activity feed uses it to badge each
+	// event with the lane that produced it (P3).
+	laneByRunID map[string]string
+	// laneTokens sums cumulative token usage ({in, out}) per lane across
+	// every run of every issue, for the header's two-rate cost estimate.
+	laneTokens map[string][2]int
 
 	tokensIn  int
 	tokensOut int
@@ -127,6 +166,9 @@ type Model struct {
 	// totalIssues / doneCount drive the header progress bar (done / total).
 	totalIssues int
 	doneCount   int
+	// unmirroredCount is how many issues have a pending (unmirrored) Linear
+	// outbox write — surfaced as an amber header chip when > 0.
+	unmirroredCount int
 
 	// recentEvents / lastEventAt back the activity feed and the "updated Ns
 	// ago" liveness readout (age is computed in View, never in Update).
@@ -160,6 +202,20 @@ type Model struct {
 	activityVp viewport.Model
 	detailVp   viewport.Model
 
+	// Follow mode (U1): logsDir roots both tail paths (WithLogsDir),
+	// transcripts is the latest refresh's on-disk transcript set, follow is
+	// the active tail session, and followVp scrolls it. followGen counts
+	// follow-session entries: every `f` bumps it and stamps it into the
+	// session's tick chain (scheduleFollowTick), so a tick from a superseded
+	// session (f→esc→f inside one tick interval) is recognized and dropped
+	// even while a newer session is live — otherwise two concurrent chains
+	// would poll the same file against one shared offset.
+	logsDir     string
+	transcripts map[string]bool
+	follow      followState
+	followGen   int
+	followVp    viewport.Model
+
 	lastErr error
 
 	// refreshCmd is injected (see WithRefreshCmd) rather than hardcoded, so
@@ -181,13 +237,24 @@ func WithRefreshCmd(f func() tea.Msg) Option {
 	return func(m *Model) { m.refreshCmd = f }
 }
 
+// WithLogsDir points the model at the board's logs directory
+// (<board>/logs), the root both follow-mode tail paths derive from:
+// <ISSUE>.transcript.jsonl (the structured DAC transcript, written at the
+// path dispatcher.transcriptPath builds) and <ISSUE>.log (the worker's raw
+// stderr, spawn.LocalSpawner.stderrLogPath). Left unset (tests, misconfig)
+// follow mode simply finds no files: the poll reports NotExist and the view
+// shows its waiting placeholder.
+func WithLogsDir(dir string) Option {
+	return func(m *Model) { m.logsDir = dir }
+}
+
 // NewModel builds an empty Model, ready to receive its first SnapshotMsg.
 func NewModel(opts ...Option) Model {
 	m := Model{
 		mode:     modeDashboard,
 		keys:     defaultKeyMap(),
 		help:     help.New(),
-		progress: progress.New(progress.WithGradient(string(cCyan), string(cGreen)), progress.WithoutPercentage()),
+		progress: progress.New(progress.WithGradient(progressGradientColors()), progress.WithoutPercentage()),
 	}
 	for _, opt := range opts {
 		opt(&m)
@@ -195,16 +262,15 @@ func NewModel(opts ...Option) Model {
 	return m
 }
 
-// Running, Blocked, Queued, and InFlight expose the current display-ready
-// rows for each dashboard section. Queued folds "ready" and "todo" issues
-// together; InFlight folds every active downstream lane-entry column
-// (review/rework/merging) together, labeled per-row by its
-// own column (Row.Status) since — unlike the other three sections — it
-// spans more than one board_status value.
-func (m Model) Running() []Row  { return m.running }
-func (m Model) Blocked() []Row  { return m.blocked }
-func (m Model) Queued() []Row   { return m.queued }
-func (m Model) InFlight() []Row { return m.inFlight }
+// Active, Blocked, and Queued expose the current display-ready rows for each
+// dashboard section. Active folds every working column
+// (running/review/rework/merging) together — live-claim rows first, then
+// unclaimed rows awaiting pickup — labeled per-row by its own column
+// (Row.Status) since it spans more than one board_status value. Queued folds
+// "ready" and "todo" issues together.
+func (m Model) Active() []Row  { return m.active }
+func (m Model) Blocked() []Row { return m.blocked }
+func (m Model) Queued() []Row  { return m.queued }
 
 // TotalTokensIn and TotalTokensOut sum LatestRun token counts across every
 // issue in the snapshot, for the dashboard's header line.
@@ -227,6 +293,8 @@ func (m Model) ViewMode() string {
 		return "detail"
 	case modeKanban:
 		return "kanban"
+	case modeFollow:
+		return "follow"
 	default:
 		return "dashboard"
 	}
@@ -263,6 +331,7 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case SnapshotMsg:
+		m.transcripts = msg.TranscriptIdents
 		m.fold(msg.Snap)
 		m.live = msg.Live
 		m.lastErr = nil
@@ -275,6 +344,32 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	case spinnerTickMsg:
 		m.frame++
 		return m, scheduleSpinner()
+
+	case followTickMsg:
+		if m.mode != modeFollow || msg.Gen != m.followGen {
+			// Follow mode was left since this tick was scheduled — or the
+			// tick belongs to a superseded session (f→esc→f before it
+			// fired): let the stale chain die rather than running a second
+			// concurrent poll loop against the live session's offset.
+			return m, nil
+		}
+		return m, tea.Batch(pollFollowFile(m.followPath(), m.follow.offset), scheduleFollowTick(m.followGen))
+
+	case followPollMsg:
+		if m.mode != modeFollow || msg.Path != m.followPath() {
+			return m, nil // stale poll from before a toggle/exit — drop it
+		}
+		if msg.Err != nil {
+			m.follow.err = msg.Err
+			return m, nil
+		}
+		m.follow.err = nil
+		if msg.NotExist {
+			return m, nil // not written yet — keep polling, placeholder shows
+		}
+		m.follow.applyChunk(msg.Data, msg.Offset, msg.Reset)
+		m.layoutFollow()
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -306,6 +401,9 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 	switch m.mode {
 	case modeDetail:
 		m.detailVp, _ = m.detailVp.Update(msg)
+	case modeFollow:
+		m.followVp, _ = m.followVp.Update(msg)
+		m.follow.pinned = m.followVp.AtBottom()
 	case modeDashboard:
 		if m.pointerOverActivity(msg.X, msg.Y) {
 			m.activityVp, _ = m.activityVp.Update(msg)
@@ -356,8 +454,41 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case key.Matches(msg, m.keys.Follow):
+		// f opens a realtime tail of the selected issue's agent logs — only
+		// for a row a worker is on right now (live claim) or one that
+		// already has a transcript on disk (HasTranscript, computed by the
+		// refresh cmd; a file check is I/O and can't happen here).
+		if m.mode != modeDashboard && m.mode != modeKanban {
+			return m, nil
+		}
+		row, ok := m.selectedRow()
+		if !ok || (!row.Live && !row.HasTranscript) {
+			return m, nil
+		}
+		m.mode = modeFollow
+		m.follow = followState{ident: row.Identifier, source: followTranscript, pinned: true}
+		m.followGen++ // new session: any prior session's outstanding tick is now stale
+		m.layout()
+		return m, tea.Batch(pollFollowFile(m.followPath(), 0), scheduleFollowTick(m.followGen))
+
+	case key.Matches(msg, m.keys.ToggleSource):
+		// t flips the tail between the structured transcript and the raw
+		// worker stderr. The buffers and offset reset — the two files share
+		// nothing — and the next poll (issued immediately) starts from 0.
+		if m.mode != modeFollow {
+			return m, nil
+		}
+		src := followRaw
+		if m.follow.source == followRaw {
+			src = followTranscript
+		}
+		m.follow = followState{ident: m.follow.ident, source: src, pinned: true}
+		m.layout()
+		return m, pollFollowFile(m.followPath(), 0)
+
 	case key.Matches(msg, m.keys.Enter):
-		if m.mode != modeDetail && m.selected != "" {
+		if m.mode != modeDetail && m.mode != modeFollow && m.selected != "" {
 			m.mode = modeDetail
 			m.detailVp.SetYOffset(0)
 			m.layout()
@@ -365,9 +496,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Up):
-		if m.mode == modeDetail {
+		switch m.mode {
+		case modeDetail:
 			m.detailVp.ScrollUp(1)
-		} else {
+		case modeFollow:
+			m.followVp.ScrollUp(1)
+			m.follow.pinned = m.followVp.AtBottom()
+		default:
 			m.moveSelection(-1)
 			m.layout()
 			m.ensureSelectionVisible()
@@ -375,9 +510,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Down):
-		if m.mode == modeDetail {
+		switch m.mode {
+		case modeDetail:
 			m.detailVp.ScrollDown(1)
-		} else {
+		case modeFollow:
+			m.followVp.ScrollDown(1)
+			m.follow.pinned = m.followVp.AtBottom()
+		default:
 			m.moveSelection(1)
 			m.layout()
 			m.ensureSelectionVisible()
@@ -397,16 +536,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 // scrollActive scrolls whichever viewport the active mode owns by half a
 // page in dir (-1 up, +1 down). The viewports clamp to their own content, so
-// an over-scroll is a harmless no-op.
+// an over-scroll is a harmless no-op. In follow mode a manual scroll unpins
+// the tail unless it lands back on the bottom line.
 func (m *Model) scrollActive(dir int) {
 	vp := &m.bodyVp
-	if m.mode == modeDetail {
+	switch m.mode {
+	case modeDetail:
 		vp = &m.detailVp
+	case modeFollow:
+		vp = &m.followVp
 	}
 	if dir < 0 {
 		vp.HalfViewUp()
 	} else {
 		vp.HalfViewDown()
+	}
+	if m.mode == modeFollow {
+		m.follow.pinned = m.followVp.AtBottom()
 	}
 }
 
@@ -440,6 +586,28 @@ func (m Model) selectedIndex() int {
 	return 0
 }
 
+// selectedRow returns the ordered row matching the current selection.
+func (m Model) selectedRow() (Row, bool) {
+	for _, r := range m.ordered {
+		if r.Identifier == m.selected {
+			return r, true
+		}
+	}
+	return Row{}, false
+}
+
+// followPath is the on-disk file the active follow source tails. Both derive
+// from the logs dir runTUI wires in (WithLogsDir): the transcript is
+// <logs>/<ISSUE>.transcript.jsonl and the raw stderr log <logs>/<ISSUE>.log,
+// both keyed by the issue identifier — matching dispatcher.transcriptPath
+// and spawn.LocalSpawner.stderrLogPath exactly.
+func (m Model) followPath() string {
+	if m.follow.source == followRaw {
+		return filepath.Join(m.logsDir, m.follow.ident+".log")
+	}
+	return filepath.Join(m.logsDir, m.follow.ident+".transcript.jsonl")
+}
+
 // refresh returns the tea.Cmd that invokes the injected refreshCmd, if any.
 // Kept as its own tea.Cmd (rather than called inline) so it composes with
 // scheduleTick() via tea.Batch.
@@ -470,10 +638,9 @@ func scheduleSpinner() tea.Cmd {
 // snap. It is deterministic: same snapshot in, same grouping/totals out,
 // regardless of the snapshot's underlying slice/map iteration order.
 func (m *Model) fold(snap store.Snapshot) {
-	m.running = m.running[:0]
+	m.active = m.active[:0]
 	m.blocked = m.blocked[:0]
 	m.queued = m.queued[:0]
-	m.inFlight = m.inFlight[:0]
 	m.ordered = m.ordered[:0]
 
 	// Board-wide cumulative token spend comes straight from the snapshot's
@@ -484,6 +651,7 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.counts = snap.CountsByStatus
 	m.totalIssues = len(snap.Issues)
 	m.doneCount = snap.CountsByStatus["done"]
+	m.unmirroredCount = snap.UnmirroredCount
 	m.recentEvents = snap.RecentEvents
 	m.lastEventAt = snap.LastEventAt
 
@@ -491,6 +659,8 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.issuesByIdent = make(map[string]store.IssueSnapshot, len(snap.Issues))
 	m.identByID = make(map[string]string, len(snap.Issues))
 	m.statusByID = make(map[string]string, len(snap.Issues))
+	m.laneByRunID = make(map[string]string)
+	m.laneTokens = make(map[string][2]int)
 
 	for _, is := range sortedIssueSnapshots(snap.Issues) {
 		// A held claim means a worker is actively on this card now, in whatever
@@ -502,47 +672,70 @@ func (m *Model) fold(snap store.Snapshot) {
 			activeLane = is.LatestRun.Lane
 		}
 		row := Row{
-			ID:         is.ID,
-			Identifier: is.Identifier,
-			LaneLabel:  is.LaneLabel,
-			Status:     is.BoardStatus,
-			Deps:       is.Deps,
-			Run:        is.LatestRun,
-			TokensIn:   is.TokensInTotal,
-			TokensOut:  is.TokensOutTotal,
-			Live:       live,
-			ActiveLane: activeLane,
+			ID:              is.ID,
+			Identifier:      is.Identifier,
+			LaneLabel:       is.LaneLabel,
+			Status:          is.BoardStatus,
+			Deps:            is.Deps,
+			Run:             is.LatestRun,
+			TokensIn:        is.TokensInTotal,
+			TokensOut:       is.TokensOutTotal,
+			Live:            live,
+			ActiveLane:      activeLane,
+			ReworkCount:     is.ReworkCount,
+			RecoverAttempts: is.RecoverAttempts,
+			BlockedUntil:    is.BlockedUntil,
+			Priority:        is.Priority,
+			Unmirrored:      is.Unmirrored,
+			HasTranscript:   m.transcripts[is.Identifier],
 		}
 
 		m.byStatus[is.BoardStatus] = append(m.byStatus[is.BoardStatus], row)
 		m.issuesByIdent[is.Identifier] = is
 		m.identByID[is.ID] = is.Identifier
 		m.statusByID[is.ID] = is.BoardStatus
+		for _, r := range is.Runs {
+			m.laneByRunID[r.RunID] = r.Lane
+			t := m.laneTokens[r.Lane]
+			t[0] += r.TokensIn
+			t[1] += r.TokensOut
+			m.laneTokens[r.Lane] = t
+		}
 
 		switch is.BoardStatus {
-		case "running":
-			m.running = append(m.running, row)
+		case "running", "review", "rework", "merging":
+			// The working columns fold into one ACTIVE section (P2): a card
+			// here is either currently claimed (a worker in some lane is on
+			// it right now) or waiting its turn to be claimed — either way it
+			// is in play. "done" deliberately has no case here (and this is
+			// why the switch stays an explicit list rather than a catch-all
+			// default): it's terminal, with nothing left to watch.
+			m.active = append(m.active, row)
 		case "blocked":
 			m.blocked = append(m.blocked, row)
 		case "ready", "todo":
 			m.queued = append(m.queued, row)
-		case "review", "rework", "merging":
-			// Active downstream lane-entry columns: a card here is either
-			// currently claimed (a Reviewer/Git-operator run in
-			// flight) or waiting its turn to be claimed — either way it is
-			// still "in play", not invisible the way an unhandled
-			// board_status previously left it. "done" deliberately has no
-			// case here (and this is why the switch stays an explicit list
-			// rather than a catch-all default): it's terminal, with
-			// nothing left to watch.
-			m.inFlight = append(m.inFlight, row)
 		}
 	}
 
+	// Live rows lead the ACTIVE section (spinner/lane/elapsed), unclaimed
+	// rows trail dim; the stable sort preserves identifier order within each
+	// half (rows arrive identifier-sorted from sortedIssueSnapshots).
+	sort.SliceStable(m.active, func(i, j int) bool {
+		return m.active[i].Live && !m.active[j].Live
+	})
+
+	// QUEUED sorts by claim priority — the order the kernel will actually
+	// take them (store.selectClaimCandidate's ORDER BY): Linear priority 0
+	// means "none" and sorts last, 1 (urgent) … 4 (low) ascending, ties by
+	// identifier (rows arrive identifier-sorted; the stable sort keeps that).
+	sort.SliceStable(m.queued, func(i, j int) bool {
+		return queuedRank(m.queued[i].Priority) < queuedRank(m.queued[j].Priority)
+	})
+
 	// ordered is the section-order concatenation the cursor walks; it must
-	// match View's stacked render order (running, in flight, blocked, queued).
-	m.ordered = append(m.ordered, m.running...)
-	m.ordered = append(m.ordered, m.inFlight...)
+	// match View's stacked render order (active, blocked, queued).
+	m.ordered = append(m.ordered, m.active...)
 	m.ordered = append(m.ordered, m.blocked...)
 	m.ordered = append(m.ordered, m.queued...)
 

@@ -122,10 +122,12 @@ func (m Model) renderKanbanColumn(status string, colW, colH int) string {
 		Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 }
 
-// renderKanbanCard renders one issue as a compact card: identifier over a lane
-// badge, with the selected card marked and its identifier reversed. The
-// enclosing column box (Width(colW)) bounds the card width, so no manual
-// clipping is needed here.
+// renderKanbanCard renders one issue as a compact card: identifier over a
+// lane badge. A live card (held claim) animates a spinner and badges the
+// lane actually working it (ActiveLane) rather than the home label, so the
+// board tab visibly runs mid-pipeline (P6). The selected card is marked and
+// its identifier reversed. The enclosing column box (Width(colW)) bounds the
+// card width, so no manual clipping is needed here.
 func (m Model) renderKanbanCard(row Row) string {
 	selected := row.Identifier == m.selected
 
@@ -135,5 +137,14 @@ func (m Model) renderKanbanCard(row Row) string {
 		id = selIDStyle.Render(row.Identifier)
 		prefix = selMarkStyle.Render("▌") + " "
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, prefix+id, "  "+laneBadge(row.LaneLabel))
+
+	badgeLane := row.LaneLabel
+	lead := "  "
+	if row.Live {
+		if row.ActiveLane != "" {
+			badgeLane = row.ActiveLane
+		}
+		lead = lipgloss.NewStyle().Foreground(cGreen).Render(spinnerFrames[m.frame%len(spinnerFrames)]) + " "
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, prefix+id, lead+laneBadge(badgeLane))
 }

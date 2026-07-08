@@ -10,22 +10,47 @@ import (
 	"github.com/xlyk/clipse/internal/store"
 )
 
-// Palette — a GitHub-dark-ish scheme so the dashboard looks at home in a
-// modern terminal. Truecolor hex degrades gracefully on 256-color terminals.
-const (
-	cText   = lipgloss.Color("#c9d1d9")
-	cDim    = lipgloss.Color("#6e7681")
-	cBorder = lipgloss.Color("#30363d")
-	cInk    = lipgloss.Color("#0d1117") // near-black, for text on a bright badge
+// Palette — adaptive light/dark (P5). Dark is the original GitHub-dark
+// scheme (unchanged, so dark terminals render pixel-identical to v1); Light
+// is the GitHub-light analogue of each hue, picked so the same semantic
+// reads on a white background. lipgloss resolves the pair against the
+// terminal's detected background per render. Truecolor hex degrades
+// gracefully on 256-color terminals.
+var (
+	cText   = lipgloss.AdaptiveColor{Light: "#1f2328", Dark: "#c9d1d9"}
+	cDim    = lipgloss.AdaptiveColor{Light: "#57606a", Dark: "#6e7681"}
+	cBorder = lipgloss.AdaptiveColor{Light: "#d0d7de", Dark: "#30363d"}
+	// cInk is the text color painted ON a bright accent badge: near-black on
+	// the pale dark-mode accents, white on the deeper light-mode accents.
+	cInk = lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#0d1117"}
 
-	cGreen  = lipgloss.Color("#3fb950")
-	cCyan   = lipgloss.Color("#58a6ff")
-	cRed    = lipgloss.Color("#f85149")
-	cAmber  = lipgloss.Color("#d29922")
-	cPurple = lipgloss.Color("#bc8cff")
-	cTeal   = lipgloss.Color("#39c5cf")
-	cOrange = lipgloss.Color("#db6d28")
+	cGreen  = lipgloss.AdaptiveColor{Light: "#1a7f37", Dark: "#3fb950"}
+	cCyan   = lipgloss.AdaptiveColor{Light: "#0969da", Dark: "#58a6ff"}
+	cRed    = lipgloss.AdaptiveColor{Light: "#cf222e", Dark: "#f85149"}
+	cAmber  = lipgloss.AdaptiveColor{Light: "#9a6700", Dark: "#d29922"}
+	cPurple = lipgloss.AdaptiveColor{Light: "#8250df", Dark: "#bc8cff"}
+	cTeal   = lipgloss.AdaptiveColor{Light: "#1b7c83", Dark: "#39c5cf"}
+	cOrange = lipgloss.AdaptiveColor{Light: "#bc4c00", Dark: "#db6d28"}
 )
+
+// staleHeartbeatS is the heartbeat-age threshold (seconds) past which a live
+// row gets the ♥ warning. The dispatcher heartbeats every held claim once per
+// tick (cfg.PollIntervalS, default 30s — see dispatcher.reconcile), so ~2×
+// that with no heartbeat means the worker or the dispatcher is wedged.
+const staleHeartbeatS = 60
+
+// progressGradientColors resolves the header progress bar's gradient pair
+// (cyan → green) against the terminal background once, at model
+// construction. progress.WithGradient needs concrete hex strings to lerp
+// between, so the adaptive palette can't be passed through directly. In a
+// non-TTY context (tests) lipgloss reports a light background and the light
+// pair is used — harmless, since styles render unstyled there anyway.
+func progressGradientColors() (string, string) {
+	if lipgloss.HasDarkBackground() {
+		return cCyan.Dark, cGreen.Dark
+	}
+	return cCyan.Light, cGreen.Light
+}
 
 // spinnerFrames animates running rows; braille cells give a smooth spin. The
 // frame-based spinner (advanced by spinnerTickMsg) is kept over the bubbles
@@ -72,18 +97,24 @@ var (
 )
 
 // section describes one dashboard group: its title, the accent color that
-// tints its border + heading, the glyph that leads each of its rows, whether
-// its rows show a live elapsed/spinner (only RUNNING does), and whether it is
-// the QUEUED group (whose rows get a dependency "waiting on …" hint).
+// tints its border + heading, the glyph that leads each of its rows, and
+// whether it is the QUEUED group (whose rows get a dependency "waiting on …"
+// hint) or the ACTIVE group (whose unclaimed rows render dim — see dimIdle).
+// Liveness itself (elapsed/spinner) is per-row, not a section-wide flag — see
+// Row.Live.
 type section struct {
 	title  string
-	accent lipgloss.Color
+	accent lipgloss.AdaptiveColor
 	glyph  string
 	rows   []Row
 	// waiting marks the QUEUED section, whose rows render a "waiting on …"
 	// dependency hint instead of run metadata. (Liveness is per-row — see
 	// Row.Live — not a section-wide flag.)
 	waiting bool
+	// dimIdle marks the ACTIVE section, whose unclaimed rows (no live
+	// worker) render dim with a ◇ lead so the eye lands on the live rows
+	// first.
+	dimIdle bool
 }
 
 // layoutDims is the per-frame geometry derived purely from the terminal size
@@ -126,13 +157,18 @@ func (m Model) dims() layoutDims {
 	d.bodyH = maxInt(h-d.headerH-d.tabsH-d.footerH, 6)
 
 	// Panels stack vertically: PIPELINE on top, the ACTIVITY feed as a
-	// full-width band below it (the feed reads better full-width under the
-	// pipeline than squeezed into a side column). Activity gets a bounded
-	// bottom band so the pipeline keeps the majority of the height.
-	d.actH = clampInt(d.bodyH*2/5, 6, 18)
-	d.pipeH = maxInt(d.bodyH-d.actH, 4)
+	// full-width band below it. The pipeline is content-sized — it takes
+	// min(its natural rendered height, bodyH − actMin) — and the activity
+	// feed absorbs every remaining row (P1). A sparse board therefore gives
+	// its spare height to the live feed instead of rendering void inside the
+	// pipeline border; a full board naturally wins the space back, so the
+	// layout is self-balancing.
+	const actMin = 6
 	d.pipeTextW = maxInt(d.cw-2, 8)
 	d.actTextW = maxInt(d.cw-2, 8)
+	natural := lipgloss.Height(m.renderBody(d.pipeTextW, 0)) + 3 // + border(2) + title(1)
+	d.pipeH = clampInt(natural, 4, maxInt(d.bodyH-actMin, 4))
+	d.actH = maxInt(d.bodyH-d.pipeH, actMin)
 	d.pipeVpH = maxInt(d.pipeH-3, 1) // border(2) + title(1)
 	d.actVpH = maxInt(d.actH-3, 1)
 	return d
@@ -153,6 +189,8 @@ func (m Model) View() string {
 		return m.renderDetailScreen(d.cw, now)
 	case modeKanban:
 		return m.renderKanbanScreen(d.cw, now)
+	case modeFollow:
+		return m.renderFollowScreen(d.cw, now)
 	default:
 		return m.renderDashboard(now)
 	}
@@ -166,7 +204,7 @@ func (m Model) View() string {
 func (m Model) renderDashboard(now int64) string {
 	d := m.dims()
 
-	// Rebuild the pipeline content with the live now so RUNNING rows' elapsed
+	// Rebuild the pipeline content with the live now so live rows' elapsed
 	// timers tick every frame; layout() already sized/clamped the viewport off
 	// the now=0 content (elapsed is inline, so the line counts match).
 	pipeVp := m.bodyVp
@@ -183,12 +221,44 @@ func (m Model) renderDashboard(now int64) string {
 	)
 }
 
+// renderFollowScreen draws follow mode (U1): the header, then a full-height
+// panel tailing the selected issue's agent logs — the structured transcript
+// rendered semantically, or the raw worker stderr — then the pinned footer.
+// The panel title carries the issue, the driving lane (colored with the
+// lane's identity color once a turn_start has parsed), and the active
+// source; a ● marker shows while the tail is pinned to the newest line.
+func (m Model) renderFollowScreen(cw int, now int64) string {
+	d := m.dims()
+	lane := m.follow.lane()
+	accent := laneColor(lane)
+
+	src := "transcript"
+	if m.follow.source == followRaw {
+		src = "raw stderr"
+	}
+	title := "FOLLOW · " + m.follow.ident
+	if lane != "" {
+		title += " · " + lane
+	}
+	title += " · " + src
+	if m.follow.pinned {
+		title += " · ● streaming"
+	}
+
+	panelH := maxInt(d.frameH-d.headerH-d.footerH, 3)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		m.renderHeader(d.cw, now),
+		panelBox(title, accent, m.followVp.View(), d.cw, panelH),
+		m.renderFooter(d.cw),
+	)
+}
+
 // panelBox frames a titled panel: an accent-colored title over its body inside
 // the shared subtle rounded border. colW is the .Width() arg (outer = colW+2);
 // totalH is the panel's full height including the border, so body must already
 // be (totalH−3) lines tall — one title line plus (totalH−3) body lines fills
 // the (totalH−2) content box exactly.
-func panelBox(title string, accent lipgloss.Color, body string, colW, totalH int) string {
+func panelBox(title string, accent lipgloss.AdaptiveColor, body string, colW, totalH int) string {
 	head := panelTitleStyle.Foreground(accent).Render(title)
 	return panelBorderStyle.
 		Width(colW).
@@ -228,6 +298,39 @@ func (m *Model) layout() {
 	m.detailVp.Height = maxInt(d.frameH-d.headerH-d.footerH-3, 1)
 	m.detailVp.SetContent(m.detailContent(detailW))
 	m.detailVp.SetYOffset(m.detailVp.YOffset)
+
+	if m.mode == modeFollow {
+		m.layoutFollow()
+	}
+}
+
+// layoutFollow sizes and refills the follow viewport from the tail buffers.
+// pinned keeps the view glued to the newest line as content streams in; a
+// user who scrolled up stays where they are until they return to the bottom.
+func (m *Model) layoutFollow() {
+	d := m.dims()
+	w := maxInt(d.cw-2, 8)
+	m.followVp.Width = w
+	m.followVp.Height = maxInt(d.frameH-d.headerH-d.footerH-3, 1)
+
+	var lines []string
+	if m.follow.source == followTranscript {
+		lines = renderTranscriptLines(m.follow.events, w)
+	} else {
+		lines = renderRawLines(m.follow.rawLines, w)
+	}
+	if m.follow.err != nil {
+		lines = append(lines, errorStyle.Render(truncatePlain("⚠ "+oneLine(m.follow.err.Error()), w)))
+	}
+	if len(lines) == 0 {
+		lines = []string{dimStyle.Render("waiting for logs…")}
+	}
+	m.followVp.SetContent(strings.Join(lines, "\n"))
+	if m.follow.pinned {
+		m.followVp.GotoBottom()
+	} else {
+		m.followVp.SetYOffset(m.followVp.YOffset) // re-clamp against new bounds
+	}
 }
 
 // ensureSelectionVisible scrolls the body viewport just enough to keep the
@@ -265,12 +368,19 @@ func (m Model) renderHeader(cw int, now int64) string {
 	)
 
 	chips := lipgloss.JoinHorizontal(lipgloss.Center,
-		countChip("▶", "running", m.count("running"), cGreen), "   ",
-		countChip("◐", "in flight", m.inFlightCount(), cCyan), "   ",
+		countChip("⚡", "working", m.workingCount(), cGreen), "   ",
+		countChip("◇", "waiting", m.waitingCount(), cCyan), "   ",
 		countChip("•", "queued", m.count("ready")+m.count("todo"), cAmber), "   ",
 		countChip("✖", "blocked", m.count("blocked"), cRed), "   ",
 		countChip("✓", "done", m.count("done"), cPurple),
 	)
+
+	if m.unmirroredCount > 0 {
+		// The outbox is a kernel invariant; a pending backlog (Linear
+		// unreachable) should be visible where the operator looks (P4).
+		chips = lipgloss.JoinHorizontal(lipgloss.Center, chips, "   ",
+			countChip("⇅", "unmirrored", m.unmirroredCount, cAmber))
+	}
 
 	row3 := padBetween(m.renderProgress(), m.renderTokens(), textW)
 
@@ -360,7 +470,7 @@ func (m Model) workingCount() int {
 
 // renderProgress draws the completion progress bar (done/total issues) via the
 // bubbles progress widget, rendered statically with ViewAs so Update carries
-// none of its animation state, plus a rough "$ spent" estimate.
+// none of its animation state, plus a rough "est. $" cost estimate.
 func (m Model) renderProgress() string {
 	var frac float64
 	if m.totalIssues > 0 {
@@ -368,17 +478,27 @@ func (m Model) renderProgress() string {
 	}
 	bar := m.progress.ViewAs(frac)
 	label := dimStyle.Render(fmt.Sprintf("  %d/%d done", m.doneCount, m.totalIssues))
-	cost := costStyle.Render(fmt.Sprintf("   ~$%.2f spent", estimateCostUSD(m.tokensIn, m.tokensOut)))
+	cost := costStyle.Render(fmt.Sprintf("   est. $%.2f", estimateCostUSD(m.laneTokens)))
 	return lipgloss.JoinHorizontal(lipgloss.Center, bar, label, cost)
 }
 
 // renderFooter draws the pinned bottom bar: a thin full-width rule, then the
-// key hints (bubbles help, short form) on the left with a "mode · selection"
-// context flush right.
+// key hints (bubbles help, short form) on the left with a "mode · selection ·
+// status" context flush right.
 func (m Model) renderFooter(cw int) string {
+	// ViewMode() is a stable identifier other tests assert on verbatim
+	// ("kanban"); the tab bar and help hint both say "board" (P6), so the
+	// footer's user-facing mode label is remapped here rather than changing
+	// ViewMode()'s contract.
 	ctx := m.ViewMode()
+	if ctx == "kanban" {
+		ctx = "board"
+	}
 	if m.selected != "" {
 		ctx += " · " + m.selected
+		if is, ok := m.issuesByIdent[m.selected]; ok {
+			ctx += " · " + is.BoardStatus
+		}
 	}
 	line := padBetween(footerStyle.Render(m.help.View(m.keys)), dimStyle.Render(ctx), cw)
 	return lipgloss.JoinVertical(lipgloss.Left, ruleStyle.Render(strings.Repeat("─", cw)), line)
@@ -410,19 +530,28 @@ func (m Model) renderHelpScreen(now int64) string {
 // count returns the board-wide number of issues in a given board_status.
 func (m Model) count(status string) int { return m.counts[status] }
 
-// inFlightCount sums the downstream active columns for the header chip.
-func (m Model) inFlightCount() int {
-	return m.count("review") + m.count("rework") + m.count("merging")
+// waitingCount is the number of ACTIVE rows no worker currently holds —
+// cards parked in a working column (running/review/rework/merging) awaiting
+// their next claim. Together with workingCount it partitions the ACTIVE
+// section, so the header chips and the section rows agree by construction.
+func (m Model) waitingCount() int {
+	n := 0
+	for _, r := range m.active {
+		if !r.Live {
+			n++
+		}
+	}
+	return n
 }
 
 // countChip renders a "glyph N label" stat chip in the given accent color.
-func countChip(glyph, label string, n int, accent lipgloss.Color) string {
+func countChip(glyph, label string, n int, accent lipgloss.AdaptiveColor) string {
 	return lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("%s %d", glyph, n)) +
 		dimStyle.Render(" "+label)
 }
 
 // laneColor maps a bare lane to its badge color.
-func laneColor(lane string) lipgloss.Color {
+func laneColor(lane string) lipgloss.AdaptiveColor {
 	switch lane {
 	case "coder":
 		return cCyan
@@ -455,7 +584,7 @@ func laneBadge(lane string) string {
 }
 
 // statusColor maps a board column to its text color.
-func statusColor(status string) lipgloss.Color {
+func statusColor(status string) lipgloss.AdaptiveColor {
 	switch status {
 	case "running":
 		return cGreen
