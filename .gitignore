@@ -23,6 +23,9 @@
 # superpowers ledger (never commit)
 .superpowers/
 
+# readme-agents-doc local recon cache and GitHub PR intel
+.readme-agents-doc/
+
 # go
 *.test
 *.out
