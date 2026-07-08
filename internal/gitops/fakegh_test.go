@@ -48,7 +48,7 @@ pr)
 		draft)
 			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"MERGEABLE","mergeStateStatus":"DRAFT","isDraft":true}'
 			;;
-		update_branch_refused)
+		update_branch_refused | conflicting_absent_checks | conflicting_pending_checks)
 			echo '{"number":7,"url":"https://github.com/x/y/pull/7","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY"}'
 			;;
 		mergeability_unknown)
@@ -76,10 +76,10 @@ pr)
 			echo '[{"name":"build","bucket":"fail"}]'
 			exit 1
 			;;
-		absent_checks)
+		absent_checks | conflicting_absent_checks)
 			echo '[]'
 			;;
-		ci_pending)
+		ci_pending | conflicting_pending_checks)
 			echo '[{"name":"build","bucket":"pending"}]'
 			exit 8
 			;;
@@ -106,7 +106,7 @@ pr)
 		;;
 	update-branch)
 		case "$scenario" in
-		update_branch_refused)
+		update_branch_refused | conflicting_absent_checks | conflicting_pending_checks)
 			echo 'GraphQL: merge conflict between base and head' >&2
 			exit 1
 			;;
