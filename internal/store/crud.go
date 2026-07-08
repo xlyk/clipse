@@ -242,12 +242,23 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("iterating issue rows: %w", err)
 	}
 
+	// A single runsByIssue query loads every run for every issue, already
+	// ordered oldest-first per issue (ORDER BY issue_id, started_at, run_id).
+	// LatestRun is just that per-issue slice's last element, so deriving it
+	// here replaces what used to be a separate latestRun(ctx, id) query PER
+	// ISSUE -- an N+1 on top of data this function was already loading -- with
+	// zero extra queries.
+	runs, err := s.runsByIssue(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
 	for i := range snap.Issues {
-		latest, err := s.latestRun(ctx, snap.Issues[i].ID)
-		if err != nil {
-			return Snapshot{}, err
+		issueRuns := runs[snap.Issues[i].ID]
+		snap.Issues[i].Runs = issueRuns
+		if n := len(issueRuns); n > 0 {
+			latest := issueRuns[n-1]
+			snap.Issues[i].LatestRun = &latest
 		}
-		snap.Issues[i].LatestRun = latest
 	}
 
 	tokensIn, tokensOut, err := s.tokenTotalsByIssue(ctx)
@@ -271,14 +282,6 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 			snap.Issues[i].Unmirrored = true
 			snap.UnmirroredCount++
 		}
-	}
-
-	runs, err := s.runsByIssue(ctx)
-	if err != nil {
-		return Snapshot{}, err
-	}
-	for i := range snap.Issues {
-		snap.Issues[i].Runs = runs[snap.Issues[i].ID]
 	}
 
 	events, err := s.recentEvents(ctx, recentEventLimit)
@@ -514,29 +517,4 @@ func (s *Store) LatestReworkFeedback(ctx context.Context, issueID string) (strin
 		return runErr.String, nil
 	}
 	return "", nil
-}
-
-// latestRun returns the most recently started run for issueID, or nil if
-// the issue has never had a run.
-func (s *Store) latestRun(ctx context.Context, issueID string) (*Run, error) {
-	const q = `
-		SELECT run_id, issue_id, lane, worker_pid, proc_started_at, status, started_at, heartbeat_at,
-			attempt, turn_count, thread_id, result_json, error, tokens_in, tokens_out
-		FROM runs
-		WHERE issue_id = ?
-		ORDER BY started_at DESC, run_id DESC
-		LIMIT 1
-	`
-	var r Run
-	err := s.db.QueryRowContext(ctx, q, issueID).Scan(
-		&r.RunID, &r.IssueID, &r.Lane, &r.WorkerPID, &r.ProcStartedAt, &r.Status, &r.StartedAt, &r.HeartbeatAt,
-		&r.Attempt, &r.TurnCount, &r.ThreadID, &r.ResultJSON, &r.Error, &r.TokensIn, &r.TokensOut,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("reading latest run for issue %s: %w", issueID, err)
-	}
-	return &r, nil
 }

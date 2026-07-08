@@ -15,9 +15,12 @@ build:
 ## test: run all tests (Go + Python)
 test: test-go test-py
 
-## test-go: run Go tests
+## test-go: run Go tests (matches CI's `go test -race ./...` exactly, so a
+## green `make test` locally means a green CI race build too -- adds modest
+## wall time, ~10s -> ~13s on this repo; see AGENTS.md/this plan for the
+## measured numbers if that ever needs re-justifying)
 test-go:
-	go test ./...
+	go test -race ./...
 
 ## test-py: run Python tests (agent package)
 test-py:

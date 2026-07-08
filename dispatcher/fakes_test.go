@@ -47,6 +47,14 @@ type fakeSpawner struct {
 	// issue), simulating a Spawner-level failure (not a worker failure).
 	SpawnErr error
 
+	// FailOnCall, if > 0, makes exactly the Nth Spawn call (1-indexed, across
+	// every issue) fail with SpawnErr, succeeding normally before and after
+	// it -- unlike SpawnErr alone, which fails every call from the first.
+	// Lets a test force one deterministic mid-sequence Spawn failure (e.g. a
+	// "continue" outcome's respawn) while leaving an earlier turn's spawn (or
+	// a later, unrelated issue's fresh claim) unaffected.
+	FailOnCall int
+
 	spawnCount int32
 	specs      []spawn.WorkerSpec
 }
@@ -62,10 +70,10 @@ func (f *fakeSpawner) Spawn(ctx context.Context, spec spawn.WorkerSpec) (spawn.R
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	atomic.AddInt32(&f.spawnCount, 1)
+	n := int(atomic.AddInt32(&f.spawnCount, 1))
 	f.specs = append(f.specs, spec)
 
-	if f.SpawnErr != nil {
+	if f.SpawnErr != nil && (f.FailOnCall == 0 || n == f.FailOnCall) {
 		return nil, f.SpawnErr
 	}
 
@@ -79,7 +87,7 @@ func (f *fakeSpawner) Spawn(ctx context.Context, spec spawn.WorkerSpec) (spawn.R
 		res = spawn.Result{Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeDone}}
 	}
 
-	return &fakeHandle{ctx: ctx, res: res, pid: int(atomic.AddInt32(&f.spawnCount, 0)) + 1000}, nil
+	return &fakeHandle{ctx: ctx, res: res, pid: n + 1000}, nil
 }
 
 func (f *fakeSpawner) SpawnCount() int {

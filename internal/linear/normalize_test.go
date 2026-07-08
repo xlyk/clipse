@@ -15,7 +15,7 @@ func TestNormalizeCandidateIssues_FromFixture(t *testing.T) {
 		t.Fatalf("reading fixture: %v", err)
 	}
 
-	issues, err := linear.NormalizeCandidateIssues(data)
+	issues, err := linear.NormalizeCandidateIssues(data, "agent:")
 	if err != nil {
 		t.Fatalf("NormalizeCandidateIssues: unexpected error: %v", err)
 	}
@@ -134,8 +134,72 @@ func TestNormalizeCandidateIssues_FromFixture(t *testing.T) {
 }
 
 func TestNormalizeCandidateIssues_MalformedJSON(t *testing.T) {
-	_, err := linear.NormalizeCandidateIssues([]byte("not json"))
+	_, err := linear.NormalizeCandidateIssues([]byte("not json"), "agent:")
 	if err == nil {
 		t.Fatal("NormalizeCandidateIssues: expected error for malformed JSON, got nil")
+	}
+}
+
+func TestNormalizeCandidateIssues_CancelledStateTypeOverridesName(t *testing.T) {
+	// The state's NAME is deliberately something a name-based lookup would
+	// never recognize ("Won't Fix") -- proving the mapping is driven by the
+	// fixed, unrenameable state TYPE, not the team-configurable display name.
+	const raw = `{
+		"data": {
+			"issues": {
+				"nodes": [
+					{
+						"id": "cancelled-1",
+						"identifier": "CLP-16",
+						"title": "Abandoned thing",
+						"description": "",
+						"priority": 3,
+						"branchName": "clp-16-abandoned",
+						"updatedAt": "2026-07-01T16:00:00.000Z",
+						"state": { "name": "Won't Fix", "type": "canceled" },
+						"labels": { "nodes": [] },
+						"inverseRelations": { "nodes": [] }
+					}
+				]
+			}
+		}
+	}`
+
+	issues, err := linear.NormalizeCandidateIssues([]byte(raw), "agent:")
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: unexpected error: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("len(issues) = %d, want 1", len(issues))
+	}
+	if issues[0].Status != "cancelled" {
+		t.Errorf("Status = %q, want %q (type-driven, not name-driven)", issues[0].Status, "cancelled")
+	}
+}
+
+func TestNormalizeCandidateIssues_CustomLabelPrefix(t *testing.T) {
+	const raw = `{"data":{"issues":{"nodes":[{"id":"id-1","identifier":"CLI-1","title":"t","description":"","priority":0,"branchName":"b","updatedAt":"2026-07-01T00:00:00.000Z","state":{"name":"Todo"},"labels":{"nodes":[{"name":"clipse:reviewer"}]},"inverseRelations":{"nodes":[]}}]}}}`
+
+	issues, err := linear.NormalizeCandidateIssues([]byte(raw), "clipse:")
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: unexpected error: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("len(issues) = %d, want 1", len(issues))
+	}
+	if issues[0].Lane != string(contract.LaneReviewer) {
+		t.Errorf("Lane = %q, want %q (a configured prefix must be honored, not the hardcoded \"agent:\")", issues[0].Lane, contract.LaneReviewer)
+	}
+
+	// The SAME label spelling under the default "agent:" prefix must NOT
+	// parse when a different prefix is configured -- proves this isn't
+	// falling back to a hardcoded default under the hood.
+	const rawAgent = `{"data":{"issues":{"nodes":[{"id":"id-2","identifier":"CLI-2","title":"t","description":"","priority":0,"branchName":"b","updatedAt":"2026-07-01T00:00:00.000Z","state":{"name":"Todo"},"labels":{"nodes":[{"name":"agent:coder"}]},"inverseRelations":{"nodes":[]}}]}}}`
+	issuesAgent, err := linear.NormalizeCandidateIssues([]byte(rawAgent), "clipse:")
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: unexpected error: %v", err)
+	}
+	if issuesAgent[0].Lane != "" {
+		t.Errorf("Lane = %q, want empty (an \"agent:\" label must not match a configured \"clipse:\" prefix)", issuesAgent[0].Lane)
 	}
 }

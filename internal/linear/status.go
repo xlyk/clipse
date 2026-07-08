@@ -2,13 +2,6 @@ package linear
 
 import "strings"
 
-// laneLabelPrefix is the Linear label prefix that marks a lane label, e.g.
-// "agent:coder". This mirrors config.defaultLaneLabelPrefix; it is
-// duplicated here (rather than imported) to keep this package dependency-free
-// of internal/config. If the prefix ever becomes configurable per-repo, this
-// value should move to a Normalize parameter instead of a constant.
-const laneLabelPrefix = "agent:"
-
 // statusByWorkflowName is the single documented mapping from a Linear
 // workflow-state NAME (case-insensitive) to our board Column enum
 // (internal/contract.Column). Keep this map in sync with
@@ -32,9 +25,27 @@ var statusByWorkflowName = map[string]string{
 	"blocked":     "blocked",
 }
 
-// statusFromWorkflowName maps a Linear workflow-state name to our Column
-// enum value, matching case-insensitively. Unrecognized names map to "todo".
-func statusFromWorkflowName(name string) string {
+// statusFromWorkflowName maps a Linear workflow-state name (and its fixed
+// state TYPE) to our board status. stateType is checked first and takes
+// priority: Linear's six state types (backlog/unstarted/started/completed/
+// canceled/triage) are a closed, unrenameable vocabulary, unlike a state's
+// display NAME, which a team can call anything ("Won't Fix", "Abandoned",
+// ...). Name-matching alone (as every other column here still does) would be
+// fragile specifically for cancellation: an unrecognized name falls back to
+// "todo" (see below), which would make a cancelled blocker look ACTIVE
+// instead of terminal -- the opposite of what dispatcher/promote.go's
+// dependency gating needs. "cancelled" (double-l) is deliberately not a
+// contract.Column value; issues.board_status is unconstrained TEXT (see
+// internal/store/migrations.go), and dispatcher/promote.go +
+// dispatcher/recover.go already special-case this exact string as terminal.
+//
+// Names not present in statusByWorkflowName fall back to "todo" so an
+// unrecognized/renamed Linear state doesn't crash normalization; it just
+// won't be picked up as ready/running/etc until the mapping is fixed.
+func statusFromWorkflowName(name, stateType string) string {
+	if stateType == "canceled" {
+		return "cancelled"
+	}
 	if col, ok := statusByWorkflowName[strings.ToLower(name)]; ok {
 		return col
 	}
@@ -70,13 +81,17 @@ func canonicalWorkflowName(column string) (string, bool) {
 	return name, ok
 }
 
-// laneFromLabels scans Linear label names for an "agent:<lane>" label and
-// returns the bare lane with the prefix stripped. Returns "" if no such
+// laneFromLabels scans Linear label names for a "<labelPrefix><lane>" label
+// (e.g. "agent:coder") and returns the bare lane with the prefix stripped.
+// labelPrefix comes from config.Config.LaneLabelPrefix, threaded through from
+// HTTPClient's construction (cli/dispatch.go) -- this package stays
+// dependency-free of internal/config (no import), so it takes the resolved
+// string rather than re-deriving config's own default. Returns "" if no such
 // label is present; callers must treat that as "no lane assigned" rather
 // than an error.
-func laneFromLabels(labelNames []string) string {
+func laneFromLabels(labelNames []string, labelPrefix string) string {
 	for _, name := range labelNames {
-		if rest, ok := strings.CutPrefix(name, laneLabelPrefix); ok && rest != "" {
+		if rest, ok := strings.CutPrefix(name, labelPrefix); ok && rest != "" {
 			return rest
 		}
 	}

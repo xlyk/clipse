@@ -34,9 +34,10 @@ type Issue struct {
 	// spawn/workspace failure -- see dispatcher.parkOrRetry). Once it reaches
 	// cfg.RecoverCap the issue parks in Blocked for good. It resets to 0 the
 	// next time the card advances on a normal (non-block) terminal transition
-	// (TransitionReq.ResetRecoverAttempts), so a fresh, independent transient
-	// failure later gets a full retry budget. A Linear re-poll (UpsertIssue's
-	// conflict path) never touches it.
+	// (TransitionReq.ResetRecoverAttempts), or once a human requeues it out of
+	// Blocked back to ready/todo (dispatcher.adoptLinearMove), mirroring
+	// ReworkCount's own reset there. A Linear re-poll (UpsertIssue's conflict
+	// path) never touches it.
 	RecoverAttempts int
 
 	// BlockedUntil is the unix time (0 = not blocked) before which this issue
