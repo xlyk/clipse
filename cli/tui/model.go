@@ -91,6 +91,20 @@ type Row struct {
 	// the row badge can name the agent that is actually working, not the one
 	// that opened the issue.
 	ActiveLane string
+
+	// ReworkCount / RecoverAttempts / BlockedUntil / Priority / Unmirrored
+	// surface the kernel's per-issue bookkeeping the TUI previously dropped
+	// (P4): how many times the card bounced back to the coder, how many
+	// transient-failure auto-retries it has burned, the unix time before
+	// which it is invisible to every claim (its retry backoff window), its
+	// Linear priority (the kernel's claim-order key), and whether a board
+	// transition is still waiting to be mirrored to Linear (a pending
+	// outbox write).
+	ReworkCount     int
+	RecoverAttempts int
+	BlockedUntil    int64
+	Priority        int
+	Unmirrored      bool
 }
 
 // Model is the bubbletea model for `clipse tui`. It holds only
@@ -135,6 +149,9 @@ type Model struct {
 	// totalIssues / doneCount drive the header progress bar (done / total).
 	totalIssues int
 	doneCount   int
+	// unmirroredCount is how many issues have a pending (unmirrored) Linear
+	// outbox write — surfaced as an amber header chip when > 0.
+	unmirroredCount int
 
 	// recentEvents / lastEventAt back the activity feed and the "updated Ns
 	// ago" liveness readout (age is computed in View, never in Update).
@@ -490,6 +507,7 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.counts = snap.CountsByStatus
 	m.totalIssues = len(snap.Issues)
 	m.doneCount = snap.CountsByStatus["done"]
+	m.unmirroredCount = snap.UnmirroredCount
 	m.recentEvents = snap.RecentEvents
 	m.lastEventAt = snap.LastEventAt
 
@@ -509,16 +527,21 @@ func (m *Model) fold(snap store.Snapshot) {
 			activeLane = is.LatestRun.Lane
 		}
 		row := Row{
-			ID:         is.ID,
-			Identifier: is.Identifier,
-			LaneLabel:  is.LaneLabel,
-			Status:     is.BoardStatus,
-			Deps:       is.Deps,
-			Run:        is.LatestRun,
-			TokensIn:   is.TokensInTotal,
-			TokensOut:  is.TokensOutTotal,
-			Live:       live,
-			ActiveLane: activeLane,
+			ID:              is.ID,
+			Identifier:      is.Identifier,
+			LaneLabel:       is.LaneLabel,
+			Status:          is.BoardStatus,
+			Deps:            is.Deps,
+			Run:             is.LatestRun,
+			TokensIn:        is.TokensInTotal,
+			TokensOut:       is.TokensOutTotal,
+			Live:            live,
+			ActiveLane:      activeLane,
+			ReworkCount:     is.ReworkCount,
+			RecoverAttempts: is.RecoverAttempts,
+			BlockedUntil:    is.BlockedUntil,
+			Priority:        is.Priority,
+			Unmirrored:      is.Unmirrored,
 		}
 
 		m.byStatus[is.BoardStatus] = append(m.byStatus[is.BoardStatus], row)
@@ -550,6 +573,14 @@ func (m *Model) fold(snap store.Snapshot) {
 	// half (rows arrive identifier-sorted from sortedIssueSnapshots).
 	sort.SliceStable(m.active, func(i, j int) bool {
 		return m.active[i].Live && !m.active[j].Live
+	})
+
+	// QUEUED sorts by claim priority — the order the kernel will actually
+	// take them (store.selectClaimCandidate's ORDER BY): Linear priority 0
+	// means "none" and sorts last, 1 (urgent) … 4 (low) ascending, ties by
+	// identifier (rows arrive identifier-sorted; the stable sort keeps that).
+	sort.SliceStable(m.queued, func(i, j int) bool {
+		return queuedRank(m.queued[i].Priority) < queuedRank(m.queued[j].Priority)
 	})
 
 	// ordered is the section-order concatenation the cursor walks; it must

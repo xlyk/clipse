@@ -33,6 +33,12 @@ var (
 	cOrange = lipgloss.AdaptiveColor{Light: "#bc4c00", Dark: "#db6d28"}
 )
 
+// staleHeartbeatS is the heartbeat-age threshold (seconds) past which a live
+// row gets the ♥ warning. The dispatcher heartbeats every held claim once per
+// tick (cfg.PollIntervalS, default 30s — see dispatcher.reconcile), so ~2×
+// that with no heartbeat means the worker or the dispatcher is wedged.
+const staleHeartbeatS = 60
+
 // progressGradientColors resolves the header progress bar's gradient pair
 // (cyan → green) against the terminal background once, at model
 // construction. progress.WithGradient needs concrete hex strings to lerp
@@ -301,6 +307,13 @@ func (m Model) renderHeader(cw int, now int64) string {
 		countChip("✖", "blocked", m.count("blocked"), cRed), "   ",
 		countChip("✓", "done", m.count("done"), cPurple),
 	)
+
+	if m.unmirroredCount > 0 {
+		// The outbox is a kernel invariant; a pending backlog (Linear
+		// unreachable) should be visible where the operator looks (P4).
+		chips = lipgloss.JoinHorizontal(lipgloss.Center, chips, "   ",
+			countChip("⇅", "unmirrored", m.unmirroredCount, cAmber))
+	}
 
 	row3 := padBetween(m.renderProgress(), m.renderTokens(), textW)
 

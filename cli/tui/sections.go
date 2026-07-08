@@ -141,7 +141,9 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 
 // rowDetail renders the trailing metadata. For a QUEUED row with unmet
 // dependencies it shows a "waiting on …" hint instead; otherwise it shows
-// turn/attempt, cumulative tokens, and (for a live row) elapsed runtime.
+// turn count, the rework/recover chip, cumulative tokens, a retry-backoff
+// countdown, an outbox-pending badge, and — for a live row — elapsed runtime
+// plus a stale-heartbeat warning (P4).
 func (m Model) rowDetail(row Row, s section, now int64) string {
 	if s.waiting {
 		if unmet := unmetDeps(row.Deps, m.identByID, m.statusByID); len(unmet) > 0 {
@@ -162,13 +164,42 @@ func (m Model) rowDetail(row Row, s section, now int64) string {
 	if row.Run != nil {
 		parts = append(parts, dimStyle.Render(fmt.Sprintf("turn %d", row.Run.TurnCount)))
 	}
+	if row.ReworkCount > 0 || row.RecoverAttempts > 0 {
+		// ⟳ ×<rework> r<recover>: how many times this card bounced back to
+		// the coder, and how many transient-failure auto-retries it has
+		// burned. The caps live in clipse.yaml, which the TUI deliberately
+		// doesn't load, so the counts render bare.
+		chip := "⟳"
+		if row.ReworkCount > 0 {
+			chip += fmt.Sprintf(" ×%d", row.ReworkCount)
+		}
+		if row.RecoverAttempts > 0 {
+			chip += fmt.Sprintf(" r%d", row.RecoverAttempts)
+		}
+		parts = append(parts, waitingStyle.Render(chip))
+	}
 	if row.TokensIn > 0 || row.TokensOut > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cCyan).Render("↓"+humanizeTokens(row.TokensIn))+
 			dimStyle.Render(" ")+
 			lipgloss.NewStyle().Foreground(cPurple).Render("↑"+humanizeTokens(row.TokensOut)))
 	}
+	if !row.Live && row.BlockedUntil > now {
+		// The retry-backoff countdown: the kernel sets blocked_until on a
+		// re-queued card (its release column), making it invisible to every
+		// claim until the window passes — show when it becomes claimable.
+		parts = append(parts, waitingStyle.Render("retry in "+formatAge(row.BlockedUntil-now)))
+	}
+	if row.Unmirrored {
+		parts = append(parts, waitingStyle.Render("⇅ linear pending"))
+	}
 	if row.Live {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Render("⏱ "+formatElapsed(row.Run, now)))
+		if row.Run != nil && row.Run.HeartbeatAt > 0 && now-row.Run.HeartbeatAt > staleHeartbeatS {
+			// The claim is heartbeated every dispatcher tick; this much
+			// silence on a still-claimed row means a wedged worker or a
+			// stopped dispatcher.
+			parts = append(parts, waitingStyle.Render("♥ "+formatAge(now-row.Run.HeartbeatAt)))
+		}
 	}
 	if len(parts) == 0 {
 		return dimStyle.Render("—")
