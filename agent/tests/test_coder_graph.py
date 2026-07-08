@@ -1176,6 +1176,57 @@ def test_coding_task_text_names_files_and_markers_when_conflicts_present():
     assert "Build the widget factory." not in task
 
 
+def test_conflict_task_forbids_restructuring_the_other_side():
+    # Smoke run 2026-07-08: the coder resolved a README conflict by folding
+    # the sibling ticket's `## Examples` H2 into its own `## Usage` section --
+    # "preserve the intent of BOTH sides" alone permits restructuring. The
+    # task must pin structure (headings survive verbatim, side by side).
+    task = coder._conflict_resolution_task_text(["README.md"])
+    lower = task.lower()
+    assert "heading" in lower
+    assert "restructure" in lower
+    assert "side by side" in lower
+
+
+def test_docs_task_binds_scope_and_never_reintroduces_reverts():
+    # Smoke run 2026-07-08 (CLI-54): the docs sub-turn re-added a README
+    # section the coder had just reverted to satisfy a reviewer scope
+    # finding, re-breaking the review. The docs task must bind the issue's
+    # modify-only file list and forbid overriding a deliberate revert.
+    state = {
+        "issue_id": "SPAC-9",
+        "issue_text": "Do the thing. Modify ONLY these files: src/x.py",
+        "dac_summary": "Reverted README.md to its pre-issue state per review.",
+    }
+    task = coder._docs_task_text(state)
+    lower = task.lower()
+    # Assert the INSTRUCTION text, not the issue/summary passthrough: the
+    # limits must be stated even when the issue text never mentions them.
+    bare = coder._docs_task_text({"issue_id": "SPAC-9"}).lower()
+    assert "off-limits" in bare
+    assert "reintroduce" in bare
+    assert "no-op" in bare
+    assert "modify only" in lower and "revert" in lower
+
+
+def test_docs_task_includes_review_feedback_when_present():
+    # The docs turn needs the reviewer's latest asks for the same reason the
+    # rework turn does: without them it can undo what the review demanded.
+    state = {
+        "issue_id": "SPAC-9",
+        "issue_text": "Do the thing.",
+        "review_feedback": "Remove the config section from README.",
+    }
+    task = coder._docs_task_text(state)
+    assert "Remove the config section from README." in task
+
+
+def test_docs_task_omits_review_feedback_block_when_absent():
+    state = {"issue_id": "SPAC-9", "issue_text": "Do the thing."}
+    task = coder._docs_task_text(state)
+    assert "reviewer" not in task.split("Two hard limits")[0].lower()
+
+
 def test_run_dac_sends_conflict_resolution_task_to_turn_driver(tmp_path):
     turn_calls: list[dict[str, Any]] = []
     turn_result = DacTurnResult(outcome_hint="completed", final_text="resolved", tokens_in=1, tokens_out=1)

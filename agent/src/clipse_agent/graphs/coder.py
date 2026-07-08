@@ -450,8 +450,17 @@ def _conflict_resolution_task_text(conflict_files: Sequence[str]) -> str:
         "and edit the surrounding code so the result correctly preserves "
         "the intent of BOTH sides -- the incoming base-branch change AND "
         "this branch's own change -- rather than simply discarding one "
-        "side. Do not run git yourself; once every listed file is free of "
-        "conflict markers and correctly merged, stop."
+        "side. Preserve each side's STRUCTURE as well as its content: "
+        "every section, heading, function, or block a side added must "
+        "survive with its exact text and level, because the other side's "
+        "additions were written to satisfy a different issue whose "
+        "requirements may pin exact heading text or structure. Do not "
+        "merge, rename, demote, absorb, or otherwise restructure the "
+        "other side's sections into your own -- keep both sides' "
+        "additions intact side by side, editing only as much as marker "
+        "removal and file coherence require. Do not run git yourself; "
+        "once every listed file is free of conflict markers and "
+        "correctly merged, stop."
     )
 
 
@@ -569,6 +578,7 @@ def _docs_task_text(state: CoderState) -> str:
     issue_id = state.get("issue_id", "")
     issue_text = state.get("issue_text") or os.environ.get("CLIPSE_ISSUE_TEXT", "")
     code_summary = (state.get("dac_summary") or "").strip()
+    review_feedback = (state.get("review_feedback") or "").strip()
 
     parts = [
         f"The Coder lane just edited this worktree to implement {issue_id}; "
@@ -578,11 +588,24 @@ def _docs_task_text(state: CoderState) -> str:
         parts.append(f"Issue:\n{issue_text}")
     if code_summary:
         parts.append(f"What the Coder reported doing:\n{code_summary}")
+    if review_feedback:
+        # The docs turn needs the reviewer's latest asks for the same reason
+        # the rework turn does (see load_context): without them it can undo
+        # what the review demanded -- live incident: a docs turn re-added a
+        # README section the Coder had reverted for a reviewer scope finding.
+        parts.append(f"Latest reviewer feedback on this issue:\n{review_feedback}")
     parts.append(
         "Inspect the uncommitted change with `git status` and `git diff`, then update "
         "or add documentation if the change is user- or contributor-facing and the docs "
         "don't already cover it. If nothing needs documenting, make no file changes at "
-        "all -- a no-op is expected. Do not edit source code."
+        "all -- a no-op is expected. Do not edit source code.\n\n"
+        "Two hard limits on this step's judgment: (1) if the issue text pins an "
+        "explicit list of files that may be modified (e.g. 'Modify ONLY these "
+        "files: ...'), every file outside that list is off-limits to this docs "
+        "step too -- prefer a no-op over stepping outside it; (2) never "
+        "reintroduce an edit the Coder deliberately reverted or excluded (the "
+        "Coder's report or the reviewer feedback above may note such reverts) -- "
+        "overriding a deliberate revert re-breaks whatever the revert satisfied."
     )
     return "\n\n".join(parts)
 
