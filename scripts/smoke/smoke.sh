@@ -270,7 +270,7 @@ YAML
 
 # push_baseline publishes scripts/smoke/baseline/ as the target repo's
 # baseline commit and tags it. The tar copy excludes local dev droppings
-# (.venv, caches, uv.lock) so only the intended files are pushed.
+# (.venv, caches, uv.lock, egg-info) so only the intended files are pushed.
 push_baseline() {
   local tmp
   tmp="$(mktemp -d)"
@@ -501,14 +501,18 @@ _dag_chain() {
 
 # _dag_app loads the curated 10-ticket greet app DAG from scripts/smoke/dag/:
 # manifest.tsv (idx / title / files / deps / tags, tab-separated) plus one
-# TNN.md spec file per ticket (the verbatim Linear issue body).
+# TNN.md spec file per ticket (the verbatim Linear issue body). Rows must
+# appear in order 1..N with no gaps (enforced below) -- the parallel T_*
+# arrays are indexed by $idx, so a reordered or gapped manifest would
+# otherwise fail later with an opaque unbound-variable error.
 _dag_app() {
   local manifest="$DAG_DIR/manifest.tsv"
   [[ -f "$manifest" ]] || die "missing app DAG manifest: $manifest"
   N=0
   local idx title files deps tags spec
-  while IFS=$'\t' read -r idx title files deps tags; do
+  while IFS=$'\t' read -r idx title files deps tags || [[ -n "$idx" ]]; do
     [[ -n "$idx" && "$idx" != \#* ]] || continue
+    [[ "$idx" -eq $((N + 1)) ]] || die "manifest rows must be 1..N in order (row $idx after $N)"
     spec="$DAG_DIR/$(printf 'T%02d.md' "$idx")"
     [[ -f "$spec" ]] || die "missing ticket spec: $spec"
     T_TITLE[idx]="$title"
@@ -762,11 +766,11 @@ verify() {
       fails=$((fails + 1))
       continue
     fi
-    if ! jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null | grep -qx "coder"; then
+    if ! { jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null || true; } | grep -qx "coder"; then
       err "  $id: transcript has no coder turn_start"
       fails=$((fails + 1))
     fi
-    if ! jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null | grep -qx "coder_docs"; then
+    if ! { jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null || true; } | grep -qx "coder_docs"; then
       err "  $id: transcript has no coder_docs turn_start"
       fails=$((fails + 1))
     fi
