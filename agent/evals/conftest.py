@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,31 @@ from clipse_agent.contract import WorkerResult
 
 _SHIM_DIR = Path(__file__).parent / "gh_shim"
 _RESULTS_DIR = Path(__file__).parent / "results"
+
+
+def _find_repo_root(start: Path) -> Path:
+    """Walk up from `start` to the nearest ancestor containing `.git`."""
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    raise RuntimeError(f"could not locate repo root (no .git) above {start}")
+
+
+def _listdir(path: Path) -> set[str]:
+    return set(os.listdir(path))
+
+
+def _new_entries(before: set[str], path: Path) -> set[str]:
+    """Names added to `path` (non-recursive) since `before` was snapshotted,
+    minus expected churn: dotfiles (`.pytest_cache`, `.DS_Store`, ...) and
+    `__pycache__`."""
+    after = _listdir(path)
+    added = after - before
+    return {name for name in added if not name.startswith(".") and name != "__pycache__"}
+
+
+_REPO_ROOT = _find_repo_root(Path(__file__).resolve())
+_AGENT_DIR = _REPO_ROOT / "agent"
 
 # Lazily created on first append: one file per pytest session, with
 # latest.jsonl re-pointed at it. A symlink (not truncation) because run
@@ -36,6 +61,27 @@ def eval_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for var in ("CLIPSE_ISSUE_TEXT", "CLIPSE_REVIEW_FEEDBACK", "CLIPSE_DEPENDENCY_NOTES"):
         monkeypatch.delenv(var, raising=False)
     return gh_dir
+
+
+@pytest.fixture(autouse=True)
+def _stray_file_guard() -> Iterator[None]:
+    """Fail loudly if a live turn writes outside its fixture repo.
+
+    DAC's local shell/filesystem backends anchor at `cwd` but do not jail it
+    (`virtual_mode=False` is hardcoded in `create_cli_agent` and not exposed
+    -- see .superpowers/sdd/sandbox-escape-investigation.md): an absolute
+    path or a `..`-escape in any tool call executes for real wherever it
+    points, regardless of `cwd`. This has bitten us once already (a stray
+    `AUTHORS` file landed at the checkout root). Deterministic, keyless,
+    zero-cost: snapshot the checkout root and `agent/` before the test,
+    diff after.
+    """
+    before_root = _listdir(_REPO_ROOT)
+    before_agent = _listdir(_AGENT_DIR)
+    yield
+    new = _new_entries(before_root, _REPO_ROOT) | _new_entries(before_agent, _AGENT_DIR)
+    if new:
+        pytest.fail(f"stray files escaped the eval sandbox: {sorted(new)}")
 
 
 def _run_file() -> Path:
