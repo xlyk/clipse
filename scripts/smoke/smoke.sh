@@ -112,21 +112,28 @@ load_env() {
   : "${ANTHROPIC_KEY_SOURCE:=env}"
 
   : "${POLL_INTERVAL_S:=20}"
-  : "${MAX_RUNTIME_S:=900}"
+  # code turns run longer than markdown turns
+  : "${MAX_RUNTIME_S:=1800}"
   : "${MAX_TOKENS_PER_RUN:=2000000}"
   : "${TURN_CAP:=3}"
   : "${MAX_ATTEMPTS:=3}"
   : "${REWORK_CAP:=3}"
   : "${RECOVER_CAP:=5}"
 
-  : "${TIMEOUT_S:=3600}"
+  : "${TIMEOUT_S:=5400}"
   : "${WATCH_INTERVAL_S:=15}"
 
   : "${CAP_GLOBAL:=6}"
   : "${CAP_CODER:=3}"
   : "${CAP_REVIEWER:=2}"
   : "${CAP_GIT_OPERATOR:=2}"
-  : "${CAP_SCRIBE:=2}"
+
+  # optional per-lane model overrides / verbatim config append (empty =
+  # omitted from the generated config)
+  : "${MODEL_CODER:=}"
+  : "${MODEL_CODER_DOCS:=}"
+  : "${MODEL_REVIEWER:=}"
+  : "${EXTRA_CONFIG_YAML:=}"
 
   DB="$BOARD_DIR/clipse.db"
   DISPATCH_LOG="$SMOKE_HOME/dispatch.log"
@@ -206,7 +213,6 @@ caps:
     coder: $CAP_CODER
     reviewer: $CAP_REVIEWER
     git_operator: $CAP_GIT_OPERATOR
-    scribe: $CAP_SCRIBE
 
 turn_cap: $TURN_CAP
 max_runtime_s: $MAX_RUNTIME_S
@@ -236,6 +242,25 @@ env_allowlist:
   - GH_TOKEN
   - GITHUB_TOKEN
 YAML
+
+  if [[ -n "$MODEL_CODER$MODEL_CODER_DOCS$MODEL_REVIEWER" ]]; then
+    {
+      printf '\n# per-lane model overrides (from smoke.env MODEL_* vars)\n'
+      printf 'models:\n'
+      if [[ -n "$MODEL_CODER" ]];      then printf '  coder: "%s"\n' "$MODEL_CODER"; fi
+      if [[ -n "$MODEL_CODER_DOCS" ]]; then printf '  coder_docs: "%s"\n' "$MODEL_CODER_DOCS"; fi
+      if [[ -n "$MODEL_REVIEWER" ]];   then printf '  reviewer: "%s"\n' "$MODEL_REVIEWER"; fi
+    } >> "$SMOKE_YAML"
+  fi
+
+  if [[ -n "$EXTRA_CONFIG_YAML" ]]; then
+    [[ -f "$EXTRA_CONFIG_YAML" ]] || die "EXTRA_CONFIG_YAML is set but not a file: $EXTRA_CONFIG_YAML"
+    {
+      printf '\n# --- appended verbatim from EXTRA_CONFIG_YAML (%s) ---\n' "$EXTRA_CONFIG_YAML"
+      cat "$EXTRA_CONFIG_YAML"
+    } >> "$SMOKE_YAML"
+  fi
+
   info "wrote dispatcher config: $SMOKE_YAML"
 }
 
