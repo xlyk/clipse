@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  go:
+    name: go
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "go ok"
+  python:
+    name: python
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "python ok"
+  codegen-drift:
+    name: codegen-drift
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "codegen-drift ok"

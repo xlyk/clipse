@@ -1,0 +1,10 @@
+1	[smoke] Greeter core	src/greet/core.py,tests/test_core.py		
+2	[smoke] Config dataclass	src/greet/config.py,tests/test_config.py	1	
+3	[smoke] Message catalog (i18n)	src/greet/messages.py,tests/test_messages.py	1	
+4	[smoke] CLI parser	src/greet/cli.py,tests/test_cli.py	1	
+5	[smoke] Locale-aware core	src/greet/core.py,tests/test_core.py	2 3	
+6	[smoke] Output formatter	src/greet/format.py,tests/test_format.py	3	
+7	[smoke] Wire CLI end-to-end	src/greet/cli.py,tests/test_cli.py	4 5 6	
+8	[smoke] README usage section	README.md	7	conflict-pair
+9	[smoke] README examples section	README.md	7	conflict-pair
+10	[smoke] Release 0.2.0	CHANGELOG.md,pyproject.toml,src/greet/__init__.py,tests/test_baseline.py	8 9	

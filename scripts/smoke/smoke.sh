@@ -17,15 +17,18 @@
 #   reset     clean slate: delete smoke Linear issues, close PRs + delete
 #             branches, force target main back to baseline, wipe the board.
 #   build     compile a fresh ./bin/clipse.
-#   seed      create the issue DAG on Linear (honours --tickets/--fast).
+#   seed      create the issue DAG on Linear. Default: the 10-ticket greet
+#             app DAG (real Python modules + tests, incl. a deliberate
+#             README merge-conflict pair). --fast / --tickets N seed a
+#             semantic code chain instead.
 #   run       launch the dispatcher and poll the board until terminal.
 #   verify    assert every seeded ticket is done, order held, PRs merged.
 #   (none)    reset -> build -> seed -> run -> verify -> teardown.
 #
 # Flags:
-#   --tickets N   seed N tickets (default 10). N=10 is the greet DAG; other N
-#                 is a linear chain of length N.
-#   --fast        3-ticket linear chain (~10 min). Overrides --tickets.
+#   --tickets N   seed an N-step code chain (step i imports step i-1, so
+#                 dependency order is enforced by the tests themselves).
+#   --fast        3-step code chain (~10 min). Overrides --tickets.
 #   --no-run      stop after seed (do not launch the dispatcher).
 #   --keep        keep generated artifacts + board after the run for
 #                 `clipse tui` / `status` inspection.
@@ -47,14 +50,16 @@ ENV_FILE="$SCRIPT_DIR/smoke.env"
 # Populated by build_dag(): parallel 1-indexed arrays (index 0 is a "_"
 # placeholder so ticket numbers read naturally). DEPS holds space-separated
 # blocker indices; IDS is filled with the created CLI-N identifiers.
-T_TITLE=() ; T_FILE=() ; T_DESC=() ; T_DEPS=() ; IDS=()
+T_TITLE=() ; T_FILE=() ; T_DESC=() ; T_DEPS=() ; T_TAGS=() ; IDS=()
 N=0
+MODE=""
 
 # Set when the dispatcher is launched so the EXIT trap can stop it.
 DISPATCH_PID=""
 
 # Flags (defaults).
 TICKETS=10
+TICKETS_SET=0
 FAST=0
 NO_RUN=0
 KEEP=0
@@ -89,7 +94,7 @@ load_env() {
   : "${REPO_VISIBILITY:=private}"
   : "${REMOTE_URL:=git@github.com:${TARGET_REPO}.git}"
   : "${BASE_BRANCH:=main}"
-  : "${BASELINE_TAG:=smoke-baseline}"
+  : "${BASELINE_TAG:=smoke-baseline-py}"
 
   : "${TEAM_KEY:=CLI}"
   : "${TEAM_ID:=8b5b3301-8da3-4933-9b07-9efc027bc09d}"
@@ -100,26 +105,35 @@ load_env() {
   : "${PRIMARY_CLONE:=$SMOKE_HOME/primary}"
   : "${SMOKE_YAML:=$SMOKE_HOME/clipse.smoke.yaml}"
   : "${CLIPSE_REPO:=$REPO_ROOT}"
+  BASELINE_DIR="$SCRIPT_DIR/baseline"
+  DAG_DIR="$SCRIPT_DIR/dag"
 
   : "${LINEAR_KEY_SOURCE:=$HOME/.secrets}"
   : "${ANTHROPIC_KEY_SOURCE:=env}"
 
   : "${POLL_INTERVAL_S:=20}"
-  : "${MAX_RUNTIME_S:=900}"
+  # code turns run longer than markdown turns
+  : "${MAX_RUNTIME_S:=1800}"
   : "${MAX_TOKENS_PER_RUN:=2000000}"
   : "${TURN_CAP:=3}"
   : "${MAX_ATTEMPTS:=3}"
   : "${REWORK_CAP:=3}"
   : "${RECOVER_CAP:=5}"
 
-  : "${TIMEOUT_S:=3600}"
+  : "${TIMEOUT_S:=5400}"
   : "${WATCH_INTERVAL_S:=15}"
 
   : "${CAP_GLOBAL:=6}"
   : "${CAP_CODER:=3}"
   : "${CAP_REVIEWER:=2}"
   : "${CAP_GIT_OPERATOR:=2}"
-  : "${CAP_SCRIBE:=2}"
+
+  # optional per-lane model overrides / verbatim config append (empty =
+  # omitted from the generated config)
+  : "${MODEL_CODER:=}"
+  : "${MODEL_CODER_DOCS:=}"
+  : "${MODEL_REVIEWER:=}"
+  : "${EXTRA_CONFIG_YAML:=}"
 
   DB="$BOARD_DIR/clipse.db"
   DISPATCH_LOG="$SMOKE_HOME/dispatch.log"
@@ -199,7 +213,6 @@ caps:
     coder: $CAP_CODER
     reviewer: $CAP_REVIEWER
     git_operator: $CAP_GIT_OPERATOR
-    scribe: $CAP_SCRIBE
 
 turn_cap: $TURN_CAP
 max_runtime_s: $MAX_RUNTIME_S
@@ -229,6 +242,25 @@ env_allowlist:
   - GH_TOKEN
   - GITHUB_TOKEN
 YAML
+
+  if [[ -n "$MODEL_CODER$MODEL_CODER_DOCS$MODEL_REVIEWER" ]]; then
+    {
+      printf '\n# per-lane model overrides (from smoke.env MODEL_* vars)\n'
+      printf 'models:\n'
+      if [[ -n "$MODEL_CODER" ]];      then printf '  coder: "%s"\n' "$MODEL_CODER"; fi
+      if [[ -n "$MODEL_CODER_DOCS" ]]; then printf '  coder_docs: "%s"\n' "$MODEL_CODER_DOCS"; fi
+      if [[ -n "$MODEL_REVIEWER" ]];   then printf '  reviewer: "%s"\n' "$MODEL_REVIEWER"; fi
+    } >> "$SMOKE_YAML"
+  fi
+
+  if [[ -n "$EXTRA_CONFIG_YAML" ]]; then
+    [[ -f "$EXTRA_CONFIG_YAML" ]] || die "EXTRA_CONFIG_YAML is set but not a file: $EXTRA_CONFIG_YAML"
+    {
+      printf '\n# --- appended verbatim from EXTRA_CONFIG_YAML (%s) ---\n' "$EXTRA_CONFIG_YAML"
+      cat "$EXTRA_CONFIG_YAML"
+    } >> "$SMOKE_YAML"
+  fi
+
   info "wrote dispatcher config: $SMOKE_YAML"
 }
 
@@ -236,46 +268,29 @@ YAML
 # Setup (one-time, idempotent)
 # ---------------------------------------------------------------------------
 
-# ci_workflow prints the no-op CI workflow for the target repo. The three job
-# names (go, python, codegen-drift) are exactly the required status-check
-# contexts applied by apply_branch_protection, so PRs go green in seconds and
-# clipse's merge gate (gh pr checks --required) is satisfied.
-ci_workflow() {
-  cat <<'YAML'
-name: ci
-on:
-  push:
-    branches: [main]
-  pull_request:
-jobs:
-  go:
-    name: go
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "go ok"
-  python:
-    name: python
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "python ok"
-  codegen-drift:
-    name: codegen-drift
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "codegen-drift ok"
-YAML
-}
-
-baseline_readme() {
-  cat <<YAML
-# clipse-smoke-target
-
-Throwaway target repository for the clipse smoke test
-(scripts/smoke/smoke.sh in the clipse repo).
-
-Its \`$BASE_BRANCH\` branch is force-reset to the \`$BASELINE_TAG\` tag on
-every \`smoke.sh reset\`. Do not store anything here you want to keep.
-YAML
+# push_baseline publishes scripts/smoke/baseline/ as the target repo's
+# baseline commit and tags it. The tar copy excludes local dev droppings
+# (.venv, caches, uv.lock, egg-info) so only the intended files are pushed.
+push_baseline() {
+  local tmp
+  tmp="$(mktemp -d)"
+  tar -C "$BASELINE_DIR" \
+    --exclude .venv --exclude __pycache__ --exclude .pytest_cache \
+    --exclude uv.lock --exclude '*.egg-info' \
+    -cf - . | tar -C "$tmp" -xf -
+  (
+    cd "$tmp"
+    git init -q -b "$BASE_BRANCH"
+    git add pyproject.toml .gitignore README.md src tests .github
+    # Local identity so the commit succeeds regardless of global git config.
+    git -c user.name="clipse-smoke" -c user.email="smoke@clipse.local" \
+      commit -q -m "chore: smoke baseline (greet project)"
+    git remote add origin "$REMOTE_URL"
+    git push -q --force -u origin "$BASE_BRANCH"
+    git tag "$BASELINE_TAG"
+    git push -q --force origin "refs/tags/$BASELINE_TAG"
+  )
+  rm -rf "$tmp"
 }
 
 # apply_branch_protection PUTs classic branch protection matching clipse's
@@ -316,25 +331,8 @@ setup() {
   if gh api "repos/$TARGET_REPO/git/ref/tags/$BASELINE_TAG" >/dev/null 2>&1; then
     info "baseline tag $BASELINE_TAG already present -- skipping baseline push"
   else
-    info "pushing baseline commit + $BASELINE_TAG tag"
-    local tmp
-    tmp="$(mktemp -d)"
-    (
-      cd "$tmp"
-      git init -q -b "$BASE_BRANCH"
-      baseline_readme > README.md
-      mkdir -p .github/workflows
-      ci_workflow > .github/workflows/ci.yml
-      git add README.md .github/workflows/ci.yml
-      # Local identity so the commit succeeds regardless of global git config.
-      git -c user.name="clipse-smoke" -c user.email="smoke@clipse.local" \
-        commit -q -m "chore: smoke baseline"
-      git remote add origin "$REMOTE_URL"
-      git push -q --force -u origin "$BASE_BRANCH"
-      git tag "$BASELINE_TAG"
-      git push -q --force origin "refs/tags/$BASELINE_TAG"
-    )
-    rm -rf "$tmp"
+    info "pushing baseline project + $BASELINE_TAG tag"
+    push_baseline
   fi
 
   apply_branch_protection
@@ -459,92 +457,72 @@ build() {
 # Seed
 # ---------------------------------------------------------------------------
 
-# build_dag fills T_TITLE / T_FILE / T_DESC / T_DEPS (1-indexed) and N.
-#   --fast        -> 3-ticket linear chain
-#   --tickets 10  -> the greet DAG (fan-out + multi-blocker fan-in)
-#   --tickets N   -> a linear chain of length N
-# Every ticket creates exactly ONE distinct file, so the only ordering
-# constraint is the blocked-by graph (no merge conflicts).
+# build_dag fills T_TITLE / T_FILE / T_DESC / T_DEPS / T_TAGS (1-indexed),
+# N, and MODE.
+#   (no flag)     -> the 10-ticket greet app DAG from scripts/smoke/dag/
+#   --fast        -> 3-step semantic code chain
+#   --tickets N   -> N-step semantic code chain
 build_dag() {
-  T_TITLE=(_) ; T_FILE=(_) ; T_DESC=(_) ; T_DEPS=(_) ; IDS=(_)
+  T_TITLE=(_) ; T_FILE=(_) ; T_DESC=(_) ; T_DEPS=(_) ; T_TAGS=(_) ; IDS=(_)
 
   if [[ "$FAST" -eq 1 ]]; then
-    N=3
-    _dag_chain
-    return
+    MODE="chain" ; N=3 ; _dag_chain ; return
   fi
-
-  if [[ "$TICKETS" -eq 10 ]]; then
-    N=10
-    _dag_greet
-    return
+  if [[ "$TICKETS_SET" -eq 1 ]]; then
+    MODE="chain" ; N="$TICKETS" ; _dag_chain ; return
   fi
-
-  N="$TICKETS"
-  _dag_chain
+  MODE="app" ; _dag_app
 }
 
-# _dag_chain builds a linear chain T1 <- T2 <- ... <- TN of markdown files.
+# _dag_chain builds a chain of real Python modules: step i's run() calls
+# step i-1's, so the dependency is semantic -- a child claimed before its
+# blocker merged cannot pass its own tests (the imported module is absent).
 _dag_chain() {
-  local i prev file
+  local i file prev tag num expected="x" one
+  one="Run \`uv run pytest\` from the repo root and make it pass before committing. Do not add dependencies and do not touch \`pyproject.toml\` or CI files."
   for i in $(seq 1 "$N"); do
-    file="$(printf 'samples/smoke/step_%02d.md' "$i")"
+    num="$(printf '%02d' "$i")"
+    tag="step-$num"
+    expected="${tag}:${expected}"
+    file="src/greet/steps/step_${num}.py"
     T_TITLE[i]="[smoke] chain step $i"
-    T_FILE[i]="$file"
-    T_DESC[i]="Create the file \`$file\` containing a single markdown heading '# step $i' and one sentence describing step $i of a demo pipeline. Create ONLY that one file. Do not modify, rename, or create any other file, and do not touch application or test source code."
-    if [[ "$i" -gt 1 ]]; then
-      prev=$((i - 1))
-      T_DEPS[i]="$prev"
-    else
+    T_FILE[i]="$file,tests/test_step_${num}.py"
+    T_TAGS[i]=""
+    if [[ "$i" -eq 1 ]]; then
+      T_DESC[i]="Create the package directory \`src/greet/steps/\` with an empty \`__init__.py\`, and create \`$file\` containing exactly one public function \`def run(value: str) -> str\` that returns the string \`step-01:\` followed by \`value\` (so \`run(\"x\")\` returns \`\"step-01:x\"\`). Also create \`tests/test_step_01.py\` with a pytest test asserting exactly that. Modify ONLY those files. $one"
       T_DEPS[i]=""
+    else
+      prev="$(printf '%02d' $((i - 1)))"
+      T_DESC[i]="Create \`$file\` containing exactly one public function \`def run(value: str) -> str\`. It must call \`run\` from \`greet.steps.step_${prev}\` (the previous step) and prepend its own tag, so \`run(\"x\")\` returns exactly \`\"${expected}\"\`. Also create \`tests/test_step_${num}.py\` with a pytest test asserting \`run(\"x\") == \"${expected}\"\`. Modify ONLY those two files. $one"
+      T_DEPS[i]="$((i - 1))"
     fi
   done
 }
 
-# _dag_greet builds the 10-ticket "greet" DAG. Each ticket adds one file under
-# samples/greet/. DAG (blocked-by):
-#   T1 scaffold (root); T2,T3,T4 <- T1; T5 <- T2,T3; T6 <- T3;
-#   T7 <- T4,T5,T6; T8 <- T5,T6; T9 <- T7; T10 <- T8,T9
-_dag_greet() {
-  local one="Write ONLY that one Markdown file. Do not modify or add any other file, and do not touch application or test source code."
-
-  T_TITLE=(_ \
-    "[smoke] Scaffold sample module" \
-    "[smoke] Config schema" \
-    "[smoke] Message catalog (i18n)" \
-    "[smoke] CLI flag spec" \
-    "[smoke] Greeter core" \
-    "[smoke] Output formatter" \
-    "[smoke] Integration test plan" \
-    "[smoke] Usage guide" \
-    "[smoke] CI workflow notes" \
-    "[smoke] Release checklist")
-
-  T_FILE=(_ \
-    "samples/greet/README.md" \
-    "samples/greet/config.md" \
-    "samples/greet/messages.md" \
-    "samples/greet/flags.md" \
-    "samples/greet/core.md" \
-    "samples/greet/format.md" \
-    "samples/greet/tests.md" \
-    "samples/greet/usage.md" \
-    "samples/greet/ci.md" \
-    "samples/greet/release.md")
-
-  T_DESC=(_ \
-    "Create the file \`samples/greet/README.md\` with a short overview of a sample command-line tool called \`greet\` that prints a configurable greeting (e.g. \"Hello, <name>!\"). $one" \
-    "Create the file \`samples/greet/config.md\` documenting the configuration schema for \`greet\`: greeting template, default name, and locale. $one" \
-    "Create the file \`samples/greet/messages.md\` with a small i18n message catalog for \`greet\`: sample greetings in English, Spanish, and French. $one" \
-    "Create the file \`samples/greet/flags.md\` documenting the \`greet\` CLI flags: \`--name\`, \`--locale\`, and \`--loud\`. $one" \
-    "Create the file \`samples/greet/core.md\` describing the greeter core: how the config and message catalog combine to produce a greeting. $one" \
-    "Create the file \`samples/greet/format.md\` describing the \`greet\` output formatter: plain, loud (uppercase), and JSON output modes. $one" \
-    "Create the file \`samples/greet/tests.md\` with an integration test plan for \`greet\` covering flags, locales, and output formats. $one" \
-    "Create the file \`samples/greet/usage.md\` with a usage guide and example invocations for \`greet\`. $one" \
-    "Create the file \`samples/greet/ci.md\` describing a CI workflow outline for building and testing \`greet\`. $one" \
-    "Create the file \`samples/greet/release.md\` with a release checklist for \`greet\`. $one")
-
-  T_DEPS=(_ "" "1" "1" "1" "2 3" "3" "4 5 6" "5 6" "7" "8 9")
+# _dag_app loads the curated 10-ticket greet app DAG from scripts/smoke/dag/:
+# manifest.tsv (idx / title / files / deps / tags, tab-separated) plus one
+# TNN.md spec file per ticket (the verbatim Linear issue body). Rows must
+# appear in order 1..N with no gaps (enforced below) -- the parallel T_*
+# arrays are indexed by $idx, so a reordered or gapped manifest would
+# otherwise fail later with an opaque unbound-variable error.
+_dag_app() {
+  local manifest="$DAG_DIR/manifest.tsv"
+  [[ -f "$manifest" ]] || die "missing app DAG manifest: $manifest"
+  N=0
+  local idx title files deps tags spec
+  while IFS=$'\t' read -r idx title files deps tags || [[ -n "$idx" ]]; do
+    [[ -n "$idx" && "$idx" != \#* ]] || continue
+    [[ "$idx" -eq $((N + 1)) ]] || die "manifest rows must be 1..N in order (row $idx after $N)"
+    spec="$DAG_DIR/$(printf 'T%02d.md' "$idx")"
+    [[ -f "$spec" ]] || die "missing ticket spec: $spec"
+    T_TITLE[idx]="$title"
+    T_FILE[idx]="$files"
+    T_DESC[idx]="$(cat "$spec")"
+    T_DEPS[idx]="$deps"
+    T_TAGS[idx]="$tags"
+    N="$idx"
+  done < "$manifest"
+  [[ "$N" -gt 0 ]] || die "no tickets found in $manifest"
 }
 
 seed() {
@@ -582,28 +560,36 @@ seed() {
   info "seed complete: $(printf '%s ' "${IDS[@]:1}")"
 }
 
-# write_manifest records the seeded DAG for the run/verify phases:
-#   index<TAB>identifier<TAB>file<TAB>blocker-identifiers(space-separated)
-# The blocker list is the final tab-delimited field, so its internal spaces
-# survive `read -r ... blockers` intact and split cleanly on the default IFS.
+# write_manifest records the seeded DAG for the run/verify phases. Line 1 is
+# a "#mode=app|chain" header; data rows are
+#   index<TAB>identifier<TAB>files<TAB>blocker-identifiers<TAB>tags
+# Readers split on TAB only (IFS=$'\t'), so the space-separated blocker and
+# tag lists survive in any column.
 write_manifest() {
   mkdir -p "$SMOKE_HOME"
-  : > "$MANIFEST"
+  printf '#mode=%s\n' "$MODE" > "$MANIFEST"
   local i d blockers
   for i in $(seq 1 "$N"); do
     blockers=""
     for d in ${T_DEPS[i]:-}; do
       if [[ -n "$blockers" ]]; then blockers="$blockers ${IDS[d]}"; else blockers="${IDS[d]}"; fi
     done
-    printf '%s\t%s\t%s\t%s\n' "$i" "${IDS[i]}" "${T_FILE[i]}" "$blockers" >> "$MANIFEST"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "${IDS[i]}" "${T_FILE[i]}" "$blockers" "${T_TAGS[i]:-}" >> "$MANIFEST"
   done
   info "wrote manifest: $MANIFEST"
 }
 
-# manifest_ids prints the seeded identifiers, one per line.
+# manifest_ids prints the seeded identifiers, one per line (skips comments).
 manifest_ids() {
   [[ -f "$MANIFEST" ]] || die "no manifest at $MANIFEST -- run 'seed' first"
-  cut -f2 "$MANIFEST"
+  grep -v '^#' "$MANIFEST" | cut -f2
+}
+
+# manifest_mode prints the manifest's recorded mode (default: app).
+manifest_mode() {
+  local m=""
+  [[ -f "$MANIFEST" ]] && m="$(sed -n 's/^#mode=//p' "$MANIFEST" | head -1)"
+  printf '%s' "${m:-app}"
 }
 
 # sql_in_list prints a quoted, comma-separated SQL IN(...) body of the seeded
@@ -709,8 +695,9 @@ verify() {
   local id blockers
   local status done_ts start_ts tokens wall merged_yn branch
   local total_tokens=0
+  local tf itmp iclone out cruns tags markers
   # (a) + (c) + row rendering.
-  while IFS=$'\t' read -r _ id _ blockers; do
+  while IFS=$'\t' read -r _ id _ blockers _tags; do
     [[ -n "$id" ]] || continue
     status="$(db_scalar "SELECT board_status FROM issues WHERE identifier='$id';")"
     done_ts="$(db_scalar "SELECT COALESCE(MAX(e.ts),0) FROM events e JOIN issues i ON i.id=e.issue_id WHERE i.identifier='$id';")"
@@ -742,7 +729,7 @@ verify() {
       err "  $id has no merged PR"
       fails=$((fails + 1))
     fi
-  done < "$MANIFEST"
+  done < <(grep -v '^#' "$MANIFEST")
 
   info "total tokens (in+out): $total_tokens"
 
@@ -751,7 +738,7 @@ verify() {
   # blockers are done, so it necessarily finishes after them).
   info "verify: dependency ordering"
   local child_done blocker_done blocker
-  while IFS=$'\t' read -r _ id _ blockers; do
+  while IFS=$'\t' read -r _ id _ blockers _tags; do
     [[ -n "$id" && -n "$blockers" ]] || continue
     child_done="$(db_scalar "SELECT COALESCE(MAX(e.ts),0) FROM events e JOIN issues i ON i.id=e.issue_id WHERE i.identifier='$id';")"
     child_done="${child_done:-0}"
@@ -765,7 +752,89 @@ verify() {
         fails=$((fails + 1))
       fi
     done
-  done < "$MANIFEST"
+  done < <(grep -v '^#' "$MANIFEST")
+
+  # (c2) transcripts: every ticket must have a per-issue transcript with at
+  # least one coder and one coder_docs turn_start (the docs sub-turn is part
+  # of the coder graph's clean path).
+  info "verify: per-ticket transcripts"
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    tf="$BOARD_DIR/logs/$id.transcript.jsonl"
+    if [[ ! -f "$tf" ]]; then
+      err "  $id: missing transcript $tf"
+      fails=$((fails + 1))
+      continue
+    fi
+    if ! { jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null || true; } | grep -qx "coder"; then
+      err "  $id: transcript has no coder turn_start"
+      fails=$((fails + 1))
+    fi
+    if ! { jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null || true; } | grep -qx "coder_docs"; then
+      err "  $id: transcript has no coder_docs turn_start"
+      fails=$((fails + 1))
+    fi
+  done < <(manifest_ids)
+
+  # (d) integration: a fresh clone of merged main must actually work.
+  info "verify: integration clone (pytest + CLI)"
+  itmp="$(mktemp -d)" || die "mktemp -d failed for the integration clone"
+  iclone="$itmp/clone"
+  if git clone -q --depth 1 "$REMOTE_URL" "$iclone" 2>"$itmp/clone.err"; then
+    markers="$(grep -rl '^<<<<<<< ' "$iclone" --exclude-dir=.git 2>/dev/null || true)"
+    if [[ -n "$markers" ]]; then
+      err "  merged main contains conflict markers in: ${markers//$'\n'/ }"
+      fails=$((fails + 1))
+    fi
+    if (cd "$iclone" && uv run --quiet pytest -q >/dev/null 2>&1); then
+      info "  pytest green on merged main"
+    else
+      err "  pytest failed on merged main:"
+      (cd "$iclone" && uv run pytest -q 2>&1 | tail -n 20 >&2) || true
+      fails=$((fails + 1))
+    fi
+    if [[ "$(manifest_mode)" == "app" ]]; then
+      out="$(cd "$iclone" && uv run --quiet greet --name smoke --loud 2>/dev/null || true)"
+      if [[ "$out" != "HELLO, SMOKE!" ]]; then
+        err "  greet --name smoke --loud printed '$out', want 'HELLO, SMOKE!'"
+        fails=$((fails + 1))
+      fi
+      out="$(cd "$iclone" && uv run --quiet greet --name smoke --locale es 2>/dev/null || true)"
+      if [[ "$out" != "¡Hola, smoke!" ]]; then
+        err "  greet --name smoke --locale es printed '$out', want '¡Hola, smoke!'"
+        fails=$((fails + 1))
+      fi
+      if ! grep -q '^## Usage' "$iclone/README.md" 2>/dev/null; then
+        err "  README missing '## Usage' section"
+        fails=$((fails + 1))
+      fi
+      if ! grep -q '^## Examples' "$iclone/README.md" 2>/dev/null; then
+        err "  README missing '## Examples' section"
+        fails=$((fails + 1))
+      fi
+    fi
+  else
+    err "  could not clone $REMOTE_URL for the integration check"
+    sed 's/^/    /' "$itmp/clone.err" >&2 || true
+    fails=$((fails + 1))
+  fi
+  rm -rf "$itmp"
+
+  # (e) conflict-pair evidence (report-only): did the README pair actually
+  # exercise the stale-base -> rework -> sync_base path? Timing-dependent,
+  # so it never affects the verdict -- the merged outcome is what (d) asserts.
+  if [[ "$(manifest_mode)" == "app" ]]; then
+    info "verify: conflict-pair evidence (report-only)"
+    while IFS=$'\t' read -r _ id _ _ tags; do
+      [[ "$tags" == *conflict-pair* ]] || continue
+      cruns="$(db_scalar "SELECT count(*) FROM runs r JOIN issues i ON i.id=r.issue_id WHERE i.identifier='$id' AND r.lane='coder';")"
+      if [[ "${cruns:-0}" -gt 1 ]]; then
+        info "  $id: ${cruns} coder runs -- stale-base rework path fired"
+      else
+        info "  $id: ${cruns:-0} coder run(s) -- no conflict this run"
+      fi
+    done < <(grep -v '^#' "$MANIFEST")
+  fi
 
   # R5 (optional, report-only): reviewer inline-comment placement validity.
   # Never affects the smoke verdict; requires gh auth against $TARGET_REPO.
@@ -838,8 +907,8 @@ main() {
   local cmd=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --tickets) shift; TICKETS="${1:?--tickets needs a value}" ;;
-      --tickets=*) TICKETS="${1#*=}" ;;
+      --tickets) shift; TICKETS="${1:?--tickets needs a value}"; TICKETS_SET=1 ;;
+      --tickets=*) TICKETS="${1#*=}"; TICKETS_SET=1 ;;
       --fast) FAST=1 ;;
       --no-run) NO_RUN=1 ;;
       --keep) KEEP=1 ;;
