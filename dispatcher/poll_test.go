@@ -22,10 +22,10 @@ func zeroCapConfig() config.Config {
 }
 
 // TestTick_PollCachesCandidatesFromLinear asserts pollAndUpsert caches every
-// candidate Linear returns, mapping Lane->lane_label and Status->board_status
-// on the initial insert. issue-2 has an unresolved dependency so promote
-// leaves it in todo, isolating pollAndUpsert's own mapping from promotion's
-// separate effect.
+// LABELED candidate Linear returns, mapping Lane->lane_label and
+// Status->board_status on the initial insert -- and drops unlabeled issues
+// entirely (see TestTick_UnlabeledIssuesNeverIngested for the full incident
+// shape).
 func TestTick_PollCachesCandidatesFromLinear(t *testing.T) {
 	s := openTestStore(t)
 	lc := &linear.MockClient{
@@ -58,13 +58,10 @@ func TestTick_PollCachesCandidatesFromLinear(t *testing.T) {
 	if byLane["issue-1"] != "coder" {
 		t.Errorf("issue-1 lane_label = %q, want coder", byLane["issue-1"])
 	}
-	// issue-2 has no lane, so it's cached but inert for dispatch; its
-	// dependency (issue-1) isn't terminal, so promote leaves it in todo.
-	if byID["issue-2"] != "todo" {
-		t.Errorf("issue-2 board_status = %q, want todo", byID["issue-2"])
-	}
-	if byLane["issue-2"] != "" {
-		t.Errorf("issue-2 lane_label = %q, want empty", byLane["issue-2"])
+	// issue-2 has no lane label: it never opted into clipse, so it must not
+	// be ingested at all -- not even as an inert row.
+	if _, ok := byID["issue-2"]; ok {
+		t.Errorf("issue-2 was ingested (board_status %q), want dropped at poll", byID["issue-2"])
 	}
 
 	// title/description must flow from Linear into the store (Phase-2
@@ -80,6 +77,65 @@ func TestTick_PollCachesCandidatesFromLinear(t *testing.T) {
 	}
 	if got1.Description != "Implement the thing." {
 		t.Errorf("issue-1 Description = %q, want %q", got1.Description, "Implement the thing.")
+	}
+}
+
+// TestTick_UnlabeledIssuesNeverIngested pins the 2026-07-08 Spacelift
+// incident shape: on a shared team board, unlabeled issues include real
+// teammates' work, and some sit in states whose NAMES collide with board
+// columns ("In Review" -> review). Ingesting them let promote move their
+// Linear cards (todo -> Ready, outbox-mirrored) and let the column-claiming
+// lanes (review/rework/merging claim WITHOUT a lane filter) claim and work
+// them. The lane label is the opt-in gate, so an issue without one must be
+// invisible to the entire kernel: never upserted, never promoted, never
+// claimed, and never the subject of a Linear write.
+func TestTick_UnlabeledIssuesNeverIngested(t *testing.T) {
+	s := openTestStore(t)
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			// A teammate's ticket mid-human-review: state name collides with
+			// the review column -- the exact hijack path from the incident.
+			{ID: "stray-review", Identifier: "SPA-876", Title: "Teammate work", Status: "review", Lane: "", Priority: 2, BranchName: "spa-876", UpdatedAt: 100},
+			// A teammate's backlog ticket: promote would move it to ready
+			// and mirror that move to Linear.
+			{ID: "stray-todo", Identifier: "SPA-882", Title: "Backlog thing", Status: "todo", Lane: "", Priority: 3, BranchName: "spa-882", UpdatedAt: 100},
+			// The one opted-in ticket.
+			{ID: "labeled-1", Identifier: "SPA-854", Title: "Ours", Status: "todo", Lane: "coder", Priority: 3, BranchName: "spa-854", UpdatedAt: 100},
+		},
+	}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	snap, err := s.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot: unexpected error: %v", err)
+	}
+	if len(snap.Issues) != 1 {
+		ids := make([]string, 0, len(snap.Issues))
+		for _, is := range snap.Issues {
+			ids = append(ids, is.Identifier)
+		}
+		t.Fatalf("ingested issues = %v, want exactly [SPA-854]", ids)
+	}
+	if snap.Issues[0].ID != "labeled-1" {
+		t.Errorf("ingested issue = %q, want labeled-1", snap.Issues[0].ID)
+	}
+
+	// No Linear write may ever target an unlabeled issue -- the incident's
+	// visible damage was 24 teammates' cards moved on the shared board.
+	writes, err := s.DrainPendingLinearWrites(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: unexpected error: %v", err)
+	}
+	for _, w := range writes {
+		if w.IssueID == "stray-review" || w.IssueID == "stray-todo" {
+			t.Errorf("linear write enqueued for unlabeled issue %s (kind %s)", w.IssueID, w.Kind)
+		}
 	}
 }
 

@@ -15,10 +15,13 @@ import (
 // in-flight claim — this method just needs to map fields, not worry about
 // clobbering dispatcher-owned state.
 //
-// Issues with no lane assigned (Lane == "") are cached (so their identifier/
-// deps/priority stay current for when a lane label is eventually added) but
-// are otherwise inert: selectAndClaim only ever claims from a specific lane
-// label, so an empty lane_label issue is never a candidate to claim.
+// Issues with no lane assigned (Lane == "") are DROPPED, not cached: the
+// lane label is the opt-in gate, and "cached but inert" was false -- only
+// ClaimReady filters by lane_label; promote and ClaimColumn (review/rework/
+// merging) do not, so a cached unlabeled issue could be promoted (a
+// Linear-visible move) or, when its team state name collided with a board
+// column, claimed and worked (the 2026-07-08 Spacelift incident). See the
+// guard in the loop below.
 //
 // After each upsert, reconcileLinearDivergence (A3) checks the freshly
 // polled Linear status against the resulting SQLite row and either adopts a
@@ -32,6 +35,20 @@ func (d *Dispatcher) pollAndUpsert(ctx context.Context) error {
 
 	now := d.now()
 	for _, li := range issues {
+		if li.Lane == "" {
+			// No <prefix><lane> label: the issue never opted into clipse.
+			// The label is the ONLY opt-in gate, and it must be enforced
+			// here at ingest -- the 2026-07-08 Spacelift incident showed
+			// what happens otherwise on a shared team board: unlabeled
+			// teammates' tickets were upserted, promote moved their Linear
+			// cards (todo -> Ready, outbox-mirrored), and the ones whose
+			// team state NAME collided with a board column ("In Review" ->
+			// review) were claimed and worked by the column-claiming lanes
+			// (ClaimColumn has no lane filter by design). Dropping the
+			// issue before the upsert keeps every downstream mechanism --
+			// promote, claims, adoption, Linear writes -- blind to it.
+			continue
+		}
 		deps, err := json.Marshal(li.Deps)
 		if err != nil {
 			return fmt.Errorf("encoding deps for issue %s: %w", li.Identifier, err)
