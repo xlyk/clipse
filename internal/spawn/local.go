@@ -37,12 +37,12 @@ func NewLocalSpawner(command []string, boardDir string) *LocalSpawner {
 // workerArgs returns the ordered CLI flags every worker invocation carries:
 // the five fields every worker invocation carries, followed by
 // --checkpoint-db, --max-tokens, --model, --docs-model, --model-params,
-// --docs-model-params, --shell-allow-list, --docs-shell-allow-list, and
-// --base-branch ONLY when spec carries them (CheckpointDB non-empty /
-// MaxTokens > 0 / Model non-empty / DocsModel non-empty / ModelParams
-// non-empty / DocsModelParams non-empty / ShellAllowList non-empty /
-// DocsShellAllowList non-empty / BaseBranch non-empty — see WorkerSpec's doc
-// comment).
+// --docs-model-params, --shell-allow-list, --docs-shell-allow-list,
+// --base-branch, and --transcript ONLY when spec carries them (CheckpointDB
+// non-empty / MaxTokens > 0 / Model non-empty / DocsModel non-empty /
+// ModelParams non-empty / DocsModelParams non-empty / ShellAllowList
+// non-empty / DocsShellAllowList non-empty / BaseBranch non-empty /
+// TranscriptPath non-empty — see WorkerSpec's doc comment).
 // Kept as a pure helper (tested directly in argv_test.go) so this
 // conditional-append logic doesn't need a real subprocess to exercise, and
 // so a worker that has none of these configured (e.g. testworker, driven by
@@ -82,6 +82,9 @@ func workerArgs(spec WorkerSpec) []string {
 	}
 	if spec.BaseBranch != "" {
 		args = append(args, "--base-branch="+spec.BaseBranch)
+	}
+	if spec.TranscriptPath != "" {
+		args = append(args, "--transcript="+spec.TranscriptPath)
 	}
 	return args
 }

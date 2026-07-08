@@ -27,6 +27,7 @@ from clipse_agent import dac
 from clipse_agent.contract import BlockKind, Lane, Outcome, WorkerResult
 from clipse_agent.dac import DacTurnResult
 from clipse_agent.graphs import coder
+from clipse_agent.profiles.coder import get_coder_profile
 
 # ---------------------------------------------------------------------------
 # Fakes / fixtures
@@ -167,6 +168,24 @@ def _fake_turn_driver_by_turn(
     return driver
 
 
+class _FakeTranscript:
+    """Stand-in for `transcript.TranscriptWriter`: records every `bind()`
+    call's context, and merges that context into every event a bound sink
+    receives -- without ever touching a real file."""
+
+    def __init__(self) -> None:
+        self.bind_calls: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+
+    def bind(self, **context: Any) -> Callable[[dict[str, Any]], None]:
+        self.bind_calls.append(context)
+
+        def _sink(event: dict[str, Any]) -> None:
+            self.events.append({**context, **event})
+
+        return _sink
+
+
 async def _drive(
     graph: Any, input_state: dict[str, Any], config: dict[str, Any]
 ) -> tuple[list[str], WorkerResult]:
@@ -295,6 +314,37 @@ def test_happy_path_runs_full_node_order_and_emits_needs_review(tmp_path):
     assert all(c["checkpointer"] is None and c["cwd"] == str(Path(workspace).resolve()) for c in agent_calls)
     assert agent_calls[0]["profile"].assistant_id == "clipse-coder"
     assert agent_calls[1]["profile"].assistant_id == "clipse-coder-docs"
+
+
+def test_build_coder_graph_threads_transcript_to_both_dac_turns(tmp_path):
+    runner = _base_runner()
+    turn_calls: list[dict[str, Any]] = []
+    code_result = DacTurnResult(outcome_hint="completed", final_text="code done", tokens_in=1, tokens_out=1)
+    docs_result = DacTurnResult(outcome_hint="completed", final_text="docs done", tokens_in=1, tokens_out=1)
+    transcript = _FakeTranscript()
+
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver_by_turn(code_result, docs_result, turn_calls),
+        run_command=runner,
+        transcript=transcript,
+    )
+    workspace = _worktree(tmp_path)
+    input_state: coder.CoderState = {
+        "issue_id": "SPAC-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "workspace": workspace,
+        "issue_text": "Build the widget factory.",
+    }
+    config = {"configurable": {"thread_id": "thread-1"}}
+
+    asyncio.run(_drive(graph, input_state, config))
+
+    lanes = {call.get("lane") for call in transcript.bind_calls}
+    assert lanes == {"coder", "coder_docs"}
+    for call in turn_calls:
+        assert callable(call["event_sink"])
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1219,48 @@ def test_run_dac_sends_normal_task_text_when_no_merge_conflict_files(tmp_path):
     asyncio.run(node(state))
 
     assert turn_calls[0]["task_text"] == "Build the widget factory."
+
+
+def test_run_dac_threads_transcript_event_sink_to_turn_driver(tmp_path):
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="done", tokens_in=1, tokens_out=1)
+    profile = get_coder_profile()
+    transcript = _FakeTranscript()
+    node = coder.make_run_dac(
+        profile, _fake_agent_factory([]), _fake_turn_driver(turn_result, turn_calls), None, transcript
+    )
+    state: coder.CoderState = {
+        "cwd": str(tmp_path),
+        "run_id": "run-9",
+        "thread_id": "thread-9",
+        "task_text": "Build the widget factory.",
+    }
+
+    asyncio.run(node(state))
+
+    assert transcript.bind_calls == [
+        {
+            "lane": "coder",
+            "run_id": "run-9",
+            "thread_id": "thread-9",
+            "assistant_id": profile.assistant_id,
+            "model": profile.model,
+        }
+    ]
+    assert callable(turn_calls[0]["event_sink"])
+
+
+def test_run_dac_passes_no_event_sink_when_transcript_is_none(tmp_path):
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="done", tokens_in=1, tokens_out=1)
+    node = coder.make_run_dac(
+        "unused-profile", _fake_agent_factory([]), _fake_turn_driver(turn_result, turn_calls), None
+    )
+    state: coder.CoderState = {"cwd": str(tmp_path), "thread_id": "t", "task_text": "x"}
+
+    asyncio.run(node(state))
+
+    assert turn_calls[0]["event_sink"] is None
 
 
 def test_conflict_resolution_turn_completes_merge_and_reaches_needs_review(tmp_path):

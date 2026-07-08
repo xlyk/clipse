@@ -130,6 +130,24 @@ def _fake_turn_driver(result: DacTurnResult, calls: list[dict[str, Any]]) -> Cal
     return driver
 
 
+class _FakeTranscript:
+    """Stand-in for `transcript.TranscriptWriter`: records every `bind()`
+    call's context, and merges that context into every event a bound sink
+    receives -- without ever touching a real file."""
+
+    def __init__(self) -> None:
+        self.bind_calls: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+
+    def bind(self, **context: Any) -> Callable[[dict[str, Any]], None]:
+        self.bind_calls.append(context)
+
+        def _sink(event: dict[str, Any]) -> None:
+            self.events.append({**context, **event})
+
+        return _sink
+
+
 async def _drive(graph: Any, input_state: dict[str, Any], config: dict[str, Any]) -> tuple[list[str], WorkerResult]:
     """Run `graph` once via `.astream(..., stream_mode="updates")`.
 
@@ -1007,6 +1025,44 @@ def test_run_dac_stashes_last_text() -> None:
     )
     out = asyncio.run(node({"thread_id": "t", "cwd": "/tmp", "task_text": "review"}))
     assert out["dac_last_text"] == turn.last_text
+
+
+def test_run_dac_threads_transcript_event_sink_to_turn_driver() -> None:
+    calls: list[dict[str, Any]] = []
+    turn = DacTurnResult(outcome_hint="completed", final_text="ok", tokens_in=1, tokens_out=1)
+    profile = get_reviewer_profile()
+    transcript = _FakeTranscript()
+    node = reviewer.make_run_dac(
+        profile, _fake_agent_factory(calls), _fake_turn_driver(turn, calls), None, transcript
+    )
+
+    asyncio.run(node({"run_id": "run-3", "thread_id": "thread-3", "cwd": "/tmp", "task_text": "review"}))
+
+    assert transcript.bind_calls == [
+        {
+            "lane": "reviewer",
+            "run_id": "run-3",
+            "thread_id": "thread-3",
+            "assistant_id": profile.assistant_id,
+            "model": profile.model,
+        }
+    ]
+    # calls[0] is the agent_factory's own recorded call (no event_sink key);
+    # calls[1] is the turn_driver's -- agent_factory runs first in _node.
+    assert callable(calls[1]["event_sink"])
+
+
+def test_run_dac_passes_no_event_sink_when_transcript_is_none() -> None:
+    calls: list[dict[str, Any]] = []
+    turn = DacTurnResult(outcome_hint="completed", final_text="ok", tokens_in=1, tokens_out=1)
+    node = reviewer.make_run_dac(
+        get_reviewer_profile(), _fake_agent_factory(calls), _fake_turn_driver(turn, calls), None
+    )
+
+    asyncio.run(node({"thread_id": "t", "cwd": "/tmp", "task_text": "review"}))
+
+    # calls[1] is the turn_driver's own recorded call (see the sibling test).
+    assert calls[1]["event_sink"] is None
 
 
 # ---------------------------------------------------------------------------

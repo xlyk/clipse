@@ -347,6 +347,57 @@ func TestRecoverOrphans_DownstreamColumnBlocksWhenAttemptAtMax(t *testing.T) {
 	}
 }
 
+// TestRecoverOrphans_GitOperatorLaneIgnoresAttemptCap asserts the fix for
+// finding 5: the git-operator lane's "attempt" counter inflates on every
+// CI-pending recheck cycle (claimAndRunGitops re-claims "merging" roughly
+// every PollIntervalS -- see mergingTTL's doc comment), not on a genuine
+// failure, so a restart mid-CI-wait must not mistake a high accumulated
+// attempt count for N real failures and park an otherwise-healthy card.
+// Unlike TestRecoverOrphans_DownstreamColumnBlocksWhenAttemptAtMax (the
+// reviewer lane, where the cap correctly still applies), a git_operator
+// orphan always requeues back to merging regardless of Attempt.
+func TestRecoverOrphans_GitOperatorLaneIgnoresAttemptCap(t *testing.T) {
+	s := openTestStore(t)
+	boardDir := t.TempDir()
+
+	handle := spawnRealOrphan(t, boardDir, "issue-1", "git_operator")
+	pid := handle.PID()
+	startedAt := handle.ProcStartedAt()
+
+	cfg := testConfig()
+	cfg.MaxAttempts = 2
+	const runID = "orphan-run"
+	// Attempt is far past MaxAttempts -- exactly what dozens of CI-pending
+	// recheck cycles would accumulate on a slow CI run, not a real failure.
+	seedOrphanColumnRun(t, s, "issue-1", "merging", "git_operator", runID, pid, startedAt, 50, 1000)
+
+	lc := &linear.MockClient{}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(2000))
+
+	if err := d.RecoverOrphans(context.Background()); err != nil {
+		t.Fatalf("RecoverOrphans: unexpected error: %v", err)
+	}
+	_, _ = handle.Wait()
+
+	issue, err := s.GetIssue(context.Background(), "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if issue.BoardStatus != string(contract.ColumnMerging) {
+		t.Errorf("BoardStatus = %q, want merging (git-operator orphan requeues regardless of attempt)", issue.BoardStatus)
+	}
+	if issue.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want cleared")
+	}
+
+	run := getRunStatus(t, s, runID)
+	if run != "orphaned" {
+		t.Errorf("run status = %q, want orphaned", run)
+	}
+}
+
 // TestRecoverOrphans_AlreadyDeadPIDRequeuesWithoutError asserts that a run
 // whose worker_pid is already gone (the process exited or was never
 // recorded) is requeued (or blocked, per the attempt cap) without

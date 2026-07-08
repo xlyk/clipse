@@ -47,7 +47,11 @@ type TransitionReq struct {
 	// blocked_until to 0 (a clean recovery slate). Set on any normal
 	// (non-block) terminal advance (dispatcher.applyTerminalWorkerOutcome), so
 	// a later, independent transient failure gets a full retry budget rather
-	// than inheriting a spent one. Takes priority over BumpRecoverAttempts.
+	// than inheriting a spent one -- and also set by
+	// dispatcher.adoptLinearMove's blocked->{ready,todo} human-requeue path,
+	// for the same reason ResetReworkCount is: a human intervening means the
+	// prior cycle's budget shouldn't follow the issue around forever. Takes
+	// priority over BumpRecoverAttempts.
 	ResetRecoverAttempts bool
 
 	// SetBlockedUntil, when > 0, sets issues.blocked_until to this unix time:

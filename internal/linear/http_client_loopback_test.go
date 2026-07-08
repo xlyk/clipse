@@ -32,7 +32,7 @@ func newLoopbackClient(t *testing.T, handler http.HandlerFunc) *linear.HTTPClien
 	t.Cleanup(srv.Close)
 
 	t.Setenv("LINEAR_API_KEY", "test-key")
-	c, err := linear.NewHTTPClientWithBaseURL(srv.URL, testTeamKey, testTeamID)
+	c, err := linear.NewHTTPClientWithBaseURL(srv.URL, testTeamKey, testTeamID, "agent:")
 	if err != nil {
 		t.Fatalf("NewHTTPClientWithBaseURL: unexpected error: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestNewHTTPClient_MissingAPIKey(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "")
 	os.Unsetenv("LINEAR_API_KEY")
 
-	_, err := linear.NewHTTPClient(testTeamKey, testTeamID)
+	_, err := linear.NewHTTPClient(testTeamKey, testTeamID, "agent:")
 	if err == nil {
 		t.Fatal("NewHTTPClient: expected error when LINEAR_API_KEY is unset, got nil")
 	}

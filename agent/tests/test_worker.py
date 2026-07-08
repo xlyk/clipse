@@ -20,12 +20,14 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from clipse_agent import worker
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
+from clipse_agent.transcript import TranscriptWriter
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -722,6 +724,89 @@ def test_dispatch_reviewer_shell_allow_list_defaults_to_none_when_flag_omitted(m
     )
 
     assert kwarg_calls[-1]["profile"].shell_allow_list is None
+
+
+# ---------------------------------------------------------------------------
+# --transcript threading: absent flag (the default "") means disabled --
+# _dispatch's extra_kwargs carries transcript=None, same "no config means
+# None" contract as --model-params/--shell-allow-list above. A present flag
+# carries the jsonl path a TranscriptWriter is built from.
+# ---------------------------------------------------------------------------
+
+
+def test_transcript_flag_reaches_coder_and_docs_extra_kwargs(monkeypatch, capsys, tmp_path):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+    transcript_path = str(tmp_path / "SPAC-1.transcript.jsonl")
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            "--issue=SPAC-1",
+            "--lane=coder",
+            "--run=run-1",
+            "--thread=thread-1",
+            "--workspace=/ws",
+            f"--transcript={transcript_path}",
+        ],
+        graph=graph,
+        build_calls=build_calls,
+        kwarg_calls=kwarg_calls,
+    )
+
+    transcript = kwarg_calls[-1]["transcript"]
+    assert isinstance(transcript, TranscriptWriter)
+    assert transcript.path == Path(transcript_path)
+
+
+def test_transcript_omitted_flag_disables_transcript_for_coder(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        ["--issue=SPAC-1", "--lane=coder", "--run=run-1", "--thread=thread-1", "--workspace=/ws"],
+        graph=graph,
+        build_calls=build_calls,
+        kwarg_calls=kwarg_calls,
+    )
+
+    assert kwarg_calls[-1]["transcript"] is None
+
+
+def test_transcript_flag_reaches_reviewer_extra_kwargs(monkeypatch, capsys, tmp_path):
+    canned = _canned_result(lane=Lane.reviewer, outcome=Outcome.done, summary="reviewed the diff: no issues found")
+    graph = _FakeGraph(final_state={"result": canned})
+    build_calls: list[Any] = []
+    kwarg_calls: list[dict[str, Any]] = []
+    transcript_path = str(tmp_path / "SPAC-1.transcript.jsonl")
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            "--issue=SPAC-1",
+            "--lane=reviewer",
+            "--run=run-1",
+            "--thread=thread-1",
+            "--workspace=/ws",
+            f"--transcript={transcript_path}",
+        ],
+        graph=graph,
+        build_calls=build_calls,
+        attr="build_reviewer_graph",
+        kwarg_calls=kwarg_calls,
+    )
+
+    transcript = kwarg_calls[-1]["transcript"]
+    assert isinstance(transcript, TranscriptWriter)
+    assert transcript.path == Path(transcript_path)
 
 
 # ---------------------------------------------------------------------------

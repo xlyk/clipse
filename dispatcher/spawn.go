@@ -35,6 +35,15 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		// A workspace/spawn failure is transient by nature, so it is eligible
 		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
 		// to blockOnSpawnFailure once the budget is spent (or RecoverCap is 0).
+		// Either way the store's claim on runID is being cleared right now, so
+		// any stale d.inflight[runID] left over from a "continue" respawn
+		// (this is the SAME runID as the turn that just finished -- see
+		// applyContinue) must go with it: otherwise the next tick's Heartbeat
+		// finds no active claim for a run this dispatcher still thinks is
+		// inflight, errors, and aborts reconcile before promote/claim/outbox
+		// ever run again. A no-op for a fresh claim's first spawn
+		// (spawnClaim), which never has a pre-existing entry for runID.
+		delete(d.inflight, runID)
 		cause := fmt.Errorf("preparing workspace: %w", err)
 		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
 			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
@@ -85,6 +94,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		ShellAllowList:     shellAllowList,
 		DocsShellAllowList: docsShellAllowList,
 		BaseBranch:         d.cfg.Repo.BaseBranch,
+		TranscriptPath:     d.transcriptPath(issue),
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -97,6 +107,11 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	handle, err := d.spawner.Spawn(spawnCtx, spec)
 	if err != nil {
 		cancel()
+		// See the matching delete() in the Ensure error branch above: this
+		// spawn attempt may be a "continue" respawn reusing runID, and its
+		// failure clears the store claim, so the stale inflight record must
+		// not survive it either.
+		delete(d.inflight, runID)
 		cause := fmt.Errorf("spawning worker: %w", err)
 		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
 			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
@@ -141,6 +156,26 @@ func (d *Dispatcher) checkpointDBPath(issue store.Issue) string {
 		return ""
 	}
 	return filepath.Join(d.cfg.CheckpointsDir, issue.Identifier+".db")
+}
+
+// transcriptPath returns the per-issue agent transcript JSONL path the
+// worker should append every DAC turn/tool event to, derived from
+// cfg.BoardDir and the issue's Linear identifier -- one file per issue,
+// living next to the per-issue stderr log LocalSpawner already writes to
+// <board_dir>/logs/<issue>.log (see internal/spawn/local.go's
+// stderrLogPath), so every turn/lane/rework this issue ever runs
+// accumulates into the SAME file (AGENTS.md's transcript bullet). Returns
+// "" when BoardDir is unset -- mirrors checkpointDBPath's own "no directory
+// to root a path under" fallback for hand-built Configs that bypass
+// config.Load (most dispatcher tests); LocalSpawner only appends
+// --transcript when this is non-empty (see internal/spawn.workerArgs). Real
+// production configs always have a non-empty BoardDir (config.Load defaults
+// it), so the transcript is always-on there.
+func (d *Dispatcher) transcriptPath(issue store.Issue) string {
+	if d.cfg.BoardDir == "" {
+		return ""
+	}
+	return filepath.Join(d.cfg.BoardDir, "logs", issue.Identifier+".transcript.jsonl")
 }
 
 // modelsFor resolves the "provider:model" spec(s) a spawned lane's worker

@@ -149,11 +149,31 @@ func WithResultsBuffer(n int) Option {
 	return func(d *Dispatcher) { d.results = make(chan runResult, n) }
 }
 
-// defaultResultsBuffer sizes the results channel comfortably above
-// cfg.Caps.Global in the common case; Tick's non-blocking drain never blocks
-// on a full channel anyway (the Wait-goroutine send would just block a
-// little longer), but a generous buffer keeps that from ever mattering.
+// defaultResultsBuffer is the floor New sizes d.results to (see
+// resultsBufferSize): at least this many slots regardless of cfg.Caps.Global,
+// generous for the common case.
+//
+// A full buffer is not harmless. Tick's own drain (drainResults) never blocks
+// on it -- but applyResult's GetIssue-failure path (dispatcher/reconcile.go)
+// requeues a result it can't yet apply by sending it back onto this exact
+// channel, from the Tick goroutine, which is also the channel's ONLY reader.
+// A blocking send there with a full buffer deadlocks the dispatcher forever:
+// the one goroutine that could ever drain the channel is stuck sending to it.
+// resultsBufferSize's cfg.Caps.Global+1 floor is the first line of defense
+// (room for one in-flight result per concurrently-running worker plus one
+// spare requeue slot); applyResult's own non-blocking send with a
+// leave-it-inflight fallback is the second, for the case this sizing
+// invariant is somehow violated anyway.
 const defaultResultsBuffer = 256
+
+// resultsBufferSize returns the capacity New gives d.results: at least
+// defaultResultsBuffer, but never less than cfg.Caps.Global+1 so the channel
+// can hold one result per concurrently-running worker with a spare slot free
+// for applyResult's same-tick requeue — see defaultResultsBuffer's doc
+// comment for why that spare slot matters.
+func resultsBufferSize(cfg config.Config) int {
+	return max(defaultResultsBuffer, cfg.Caps.Global+1)
+}
 
 // New constructs a Dispatcher from its required dependencies, applying any
 // Options on top of the defaults (a real time.Now clock, a crypto/rand hex
@@ -172,7 +192,7 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 		gitOps:         defaultGitOpsRunner,
 		gitOpsPreCheck: defaultGitOpsPreChecker,
 		logger:         slog.Default(),
-		results:        make(chan runResult, defaultResultsBuffer),
+		results:        make(chan runResult, resultsBufferSize(cfg)),
 		inflight:       make(map[string]inflightRun),
 	}
 	for _, opt := range opts {

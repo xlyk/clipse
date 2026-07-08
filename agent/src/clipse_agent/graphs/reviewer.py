@@ -65,6 +65,7 @@ from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs import coder
 from clipse_agent.graphs.coder import CoderGraphError as ReviewerGraphError
 from clipse_agent.profiles.reviewer import ReviewerProfile, get_reviewer_profile
+from clipse_agent.transcript import TranscriptWriter
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -309,16 +310,18 @@ def make_run_dac(
     agent_factory: AgentFactory,
     turn_driver: TurnDriver,
     checkpointer: BaseCheckpointSaver | None,
+    transcript: TranscriptWriter | None = None,
 ) -> Callable[[ReviewerState], Awaitable[dict[str, Any]]]:
     """Drive exactly one DAC turn: a fresh `task_text` turn normally, or a
     `resume` of a previously-interrupted turn when `resume_payload` is set.
 
-    Structurally identical to `graphs.coder.make_run_dac`, but intentionally
-    **not** imported from there: it must call this module's own
-    `_dac_config` (a distinct thread-namespace suffix), not Coder's -- see
-    that function's docstring for the cross-lane checkpoint collision this
-    prevents. Everything else about driving a DAC turn is genuinely
-    lane-agnostic, hence the otherwise-identical body.
+    Structurally identical to `graphs.coder.make_run_dac` (including how it
+    binds `transcript` fresh per invocation, since `run_id`/`thread_id` only
+    arrive with `state`), but intentionally **not** imported from there: it
+    must call this module's own `_dac_config` (a distinct thread-namespace
+    suffix), not Coder's -- see that function's docstring for the cross-lane
+    checkpoint collision this prevents. Everything else about driving a DAC
+    turn is genuinely lane-agnostic, hence the otherwise-identical body.
     """
 
     async def _node(state: ReviewerState) -> dict[str, Any]:
@@ -326,12 +329,25 @@ def make_run_dac(
         config = _dac_config(state["thread_id"])
         max_tokens = state.get("max_tokens")
         resume_payload = state.get("resume_payload")
+        event_sink = (
+            transcript.bind(
+                lane="reviewer",
+                run_id=state["run_id"],
+                thread_id=state["thread_id"],
+                assistant_id=profile.assistant_id,
+                model=profile.model,
+            )
+            if transcript is not None
+            else None
+        )
 
         if resume_payload is not None:
-            turn_result = await turn_driver(agent_graph, config, resume=resume_payload, max_tokens=max_tokens)
+            turn_result = await turn_driver(
+                agent_graph, config, resume=resume_payload, max_tokens=max_tokens, event_sink=event_sink
+            )
         else:
             turn_result = await turn_driver(
-                agent_graph, config, task_text=state.get("task_text", ""), max_tokens=max_tokens
+                agent_graph, config, task_text=state.get("task_text", ""), max_tokens=max_tokens, event_sink=event_sink
             )
 
         return {
@@ -717,6 +733,7 @@ def build_reviewer_graph(
     agent_factory: AgentFactory = dac.build_coder_agent,
     turn_driver: TurnDriver = dac.drive_turn,
     run_command: CommandRunner | None = None,
+    transcript: TranscriptWriter | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Build and compile the Reviewer lane's graph.
 
@@ -733,6 +750,11 @@ def build_reviewer_graph(
     lane's own DAC sub-thread avoids colliding with the Coder lane's within
     that shared store.
 
+    `transcript` (default `None` = disabled) threads through to the DAC turn
+    the same way `checkpointer` does: a construction-time value closed over
+    by `make_run_dac`, never carried on `ReviewerState` -- mirrors
+    `graphs.coder.build_coder_graph`.
+
     The returned graph's only async node is `run_DAC`, so it must be driven
     with `.ainvoke`/`.astream` -- never the sync `.invoke`.
     """
@@ -743,7 +765,7 @@ def build_reviewer_graph(
     graph.add_node("load_context", load_context)
     graph.add_node("ensure_worktree", coder.make_ensure_worktree(resolved_run_command))
     graph.add_node("load_diff", make_load_diff(resolved_run_command))
-    graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer))
+    graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer, transcript))
     graph.add_node("classify", classify)
     graph.add_node("post_comments", make_post_comments(resolved_run_command))
     graph.add_node("emit_result", emit_result)

@@ -90,7 +90,20 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 		return nil
 	}
 
-	if !issue.ClaimLock.Valid {
+	// board_status="running" is entered ONLY via the CAS claim
+	// (store.ClaimReady/ClaimColumn) -- see AGENTS.md's kernel invariant.
+	// Reaching here at all already means issue.BoardStatus != linearStatus,
+	// so an observed linearStatus=="running" can NEVER be backed by a real
+	// claim on THIS issue's own row: either a human dragged the card to
+	// Running by hand, or Linear's own mirror of a prior (now-released)
+	// claim hasn't caught up yet (a restart-requeue race). Adopting it would
+	// write board_status='running' with claim_lock left NULL -- a row
+	// ClaimReady's CAS can never claim again (it requires board_status=
+	// 'ready') and ReleaseStaleClaims can never release (it only looks at
+	// claim_expires, permanently NULL here). Treat it exactly like the
+	// dispatcher-owns-this-claim case below: re-assert the store's real
+	// status instead of trusting Linear's.
+	if !issue.ClaimLock.Valid && linearStatus != string(contract.ColumnRunning) {
 		return d.adoptLinearMove(ctx, issueID, issue.BoardStatus, linearStatus, now)
 	}
 	return d.reassertOwnedState(ctx, issueID, issue.BoardStatus, now)
@@ -101,20 +114,26 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 // no outbox mirror, since Linear is already the source of this state.
 //
 // A blocked->{ready,todo} move additionally resets issues.rework_count
-// (TransitionReq.ResetReworkCount): once a human pulls an issue back out of
-// Blocked, whatever rework_count it accumulated on its prior review/rework
-// cycle no longer bounds anything relevant. Without this, an issue blocked
-// after tripping amendment C1's rework_cap would keep that stale count
+// (TransitionReq.ResetReworkCount) and issues.recover_attempts (plus its
+// paired blocked_until backoff deadline, via TransitionReq.
+// ResetRecoverAttempts): once a human pulls an issue back out of Blocked,
+// whatever rework_count/recover_attempts it accumulated on its prior review/
+// rework or auto-retry cycle no longer bounds anything relevant. Without
+// this, an issue blocked after tripping amendment C1's rework_cap (or after
+// auto-unblock layer 1 exhausted RecoverCap) would keep that stale count
 // forever, and a human's very next requeue could immediately re-trip
-// blockIfReworkCapExceeded on the first subsequent changes_requested —
-// defeating the point of requeuing it by hand. Scoped specifically to a
-// requeue FROM blocked (priorStatus) so an ordinary human move that never
-// touched Blocked at all doesn't reset a count it has no bearing on.
+// blockIfReworkCapExceeded or park again on the very first subsequent
+// transient failure — defeating the point of requeuing it by hand. Scoped
+// specifically to a requeue FROM blocked (priorStatus) so an ordinary human
+// move that never touched Blocked at all doesn't reset counts it has no
+// bearing on.
 func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, priorStatus, linearStatus string, now int64) error {
+	humanRequeueFromBlocked := priorStatus == string(contract.ColumnBlocked) && isHumanRequeueTarget(linearStatus)
 	req := store.TransitionReq{
-		IssueID:          issueID,
-		NewStatus:        linearStatus,
-		ResetReworkCount: priorStatus == string(contract.ColumnBlocked) && isHumanRequeueTarget(linearStatus),
+		IssueID:              issueID,
+		NewStatus:            linearStatus,
+		ResetReworkCount:     humanRequeueFromBlocked,
+		ResetRecoverAttempts: humanRequeueFromBlocked,
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),

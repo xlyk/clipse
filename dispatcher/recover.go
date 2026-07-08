@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
 )
@@ -52,6 +53,9 @@ func (d *Dispatcher) recoverOrphanRun(ctx context.Context, run store.Run) error 
 		return fmt.Errorf("loading issue %s: %w", run.IssueID, err)
 	}
 
+	// "cancelled" (like "done") is a genuinely terminal issue whose leftover
+	// run row is restart debris, not a real orphan -- see promote.go's
+	// terminalStatuses for how a store row actually reaches this string.
 	if issue.BoardStatus == "done" || issue.BoardStatus == "cancelled" {
 		// The issue already finished; this run row is just restart debris.
 		// Blocking here would flap a terminal ticket back to blocked and
@@ -64,6 +68,21 @@ func (d *Dispatcher) recoverOrphanRun(ctx context.Context, run store.Run) error 
 		}
 		d.logger.Info("orphan run terminalized (issue already terminal)", "issue_id", issue.ID, "run_id", run.RunID, "board_status", issue.BoardStatus)
 		return nil
+	}
+
+	if run.Lane == string(contract.LaneGitOperator) {
+		// The git-operator lane's "attempt" counter inflates on every
+		// CI-pending recheck cycle (claimAndRunGitops re-claims "merging"
+		// roughly every PollIntervalS via mergingTTL's short natural expiry
+		// -- see mergingTTL's doc comment), NOT on a genuine failure: gitops
+		// itself decides retriability per outcome (applyGitopsResult's
+		// OutcomeNotMergeable branch, bounded separately and persistently by
+		// issues.recover_attempts via parkOrRetry -- a store column, unlike
+		// this run-row-derived MaxAttempts check, so it survives a restart
+		// intact). A restart mid-CI-wait must not mistake "still waiting" for
+		// "N failed attempts" and park an otherwise-healthy card -- always
+		// requeue it back to merging regardless of Attempt.
+		return d.requeueOrphan(ctx, *issue, run)
 	}
 
 	if run.Attempt >= d.cfg.MaxAttempts {

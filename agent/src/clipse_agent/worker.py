@@ -37,6 +37,7 @@ from clipse_agent.graphs.coder import build_coder_graph
 from clipse_agent.graphs.reviewer import build_reviewer_graph
 from clipse_agent.profiles.coder import get_coder_docs_profile, get_coder_profile
 from clipse_agent.profiles.reviewer import get_reviewer_profile
+from clipse_agent.transcript import TranscriptWriter
 
 _ZERO_TOKENS = Tokens(**{"in": 0, "out": 0})
 
@@ -61,6 +62,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--docs-model-params", default="")
     parser.add_argument("--shell-allow-list", default="")
     parser.add_argument("--docs-shell-allow-list", default="")
+    parser.add_argument("--transcript", default="")
     parser.add_argument("--base-branch", default="")
     return parser
 
@@ -106,6 +108,17 @@ def _parse_shell(raw: str) -> list[str] | None:
     command names, which becomes the profile's restrictive tuple.
     """
     return json.loads(raw) if raw else None
+
+
+def _build_transcript(path: str) -> TranscriptWriter | None:
+    """Build this run's transcript writer, or None when disabled.
+
+    `""` (the default, and what `internal/spawn.workerArgs` sends whenever
+    `WorkerSpec.TranscriptPath` is unset -- e.g. a hand-built test config
+    with no `BoardDir`) means disabled: no writer is built, and the lane's
+    graph gets `transcript=None`, its own default.
+    """
+    return TranscriptWriter(path) if path else None
 
 
 def _coerce_lane(raw: str) -> Lane | None:
@@ -235,6 +248,7 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
                     model_params=_parse_params(args.docs_model_params),
                     shell_allow_list=_parse_shell(args.docs_shell_allow_list),
                 ),
+                "transcript": _build_transcript(args.transcript),
             },
         )
     if lane == Lane.reviewer:
@@ -247,7 +261,8 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
                     args.model or None,
                     model_params=_parse_params(args.model_params),
                     shell_allow_list=_parse_shell(args.shell_allow_list),
-                )
+                ),
+                "transcript": _build_transcript(args.transcript),
             },
         )
     return _blocked_transient(

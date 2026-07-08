@@ -106,6 +106,50 @@ func TestBuildCommentRequest_ExactPayload(t *testing.T) {
 	assertJSONEqual(t, body, want)
 }
 
+func TestCandidateIssuesQuery_KeepsCancelledIssuesInScope(t *testing.T) {
+	// Cancellation is a human-only Linear event the dispatcher has no other
+	// way to learn about, so "canceled" can't just be excluded outright (a
+	// cancelled blocker's stale store row would freeze forever). But nor can
+	// it stay in scope forever: this query has no pagination (Linear's
+	// GraphQL default is first:50), so an unbounded population of cancelled
+	// issues can silently push an active issue off the page. The fix: the
+	// unconditional (non-terminal) branch excludes "canceled" outright, and a
+	// second OR'd branch folds it back into scope, but ONLY when recently
+	// updated -- the dispatcher only needs to OBSERVE a cancellation once (an
+	// already-adopted cancelled row is terminal, see promote.go's
+	// terminalStatuses, and is never polled again).
+	q := linear.CandidateIssuesQuery
+
+	// The unconditional branch excludes exactly completed and canceled, with
+	// NO recency restriction -- backlog/unstarted/started/triage are never
+	// terminal, so bounding them would risk losing a genuinely active issue.
+	if !strings.Contains(q, `nin: ["completed", "canceled"]`) {
+		t.Errorf("query = %q, want an unconditional branch excluding exactly completed and canceled", q)
+	}
+
+	// The recency-scoped branch folds canceled back into view, but only
+	// within the last cancelledRecencyDays window.
+	if !strings.Contains(q, `eq: "canceled"`) {
+		t.Errorf("query = %q, want a second branch re-including canceled issues", q)
+	}
+	if !strings.Contains(q, `updatedAt: { gt: "-P14D" }`) {
+		t.Errorf("query = %q, want a 14-day updatedAt recency clause scoping the canceled branch", q)
+	}
+
+	// "duplicate" is not a real Linear state type (the six real ones are
+	// backlog/unstarted/started/completed/canceled/triage) -- it was dead
+	// filter text pinned by a prior test, not a defense against anything.
+	if strings.Contains(q, "duplicate") {
+		t.Errorf("query = %q, want no reference to the nonexistent %q state type", q, "duplicate")
+	}
+
+	// state.type must be fetched so normalize can detect a cancelled state
+	// regardless of its (per-team-configurable) display name.
+	if !strings.Contains(q, "type") {
+		t.Errorf("candidate query must fetch state.type for cancellation detection")
+	}
+}
+
 func mustMarshal(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

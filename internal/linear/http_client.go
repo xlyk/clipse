@@ -19,11 +19,25 @@ const apiURL = "https://api.linear.app/graphql"
 // API key from.
 const apiKeyEnvVar = "LINEAR_API_KEY"
 
+// cancelledRecencyDays bounds how long a Linear-cancelled issue stays in
+// CandidateIssuesQuery's scope after its last update. The dispatcher only
+// needs to OBSERVE a cancellation once: adoptLinearMove (dispatcher/poll.go)
+// writes board_status="cancelled" into SQLite the first time it sees one, and
+// promote.go's terminalStatuses already treats "cancelled" as terminal, so an
+// already-adopted cancelled row is never read from Linear again. Without this
+// bound, every issue a team has ever cancelled stays in the candidate result
+// forever — and this query has no pagination (Linear's GraphQL default page
+// size is first:50), so a large enough backlog of old cancellations can
+// silently push a genuinely active issue off the page. 14 days comfortably
+// covers the poll-interval-to-adoption lag (normally seconds) with generous
+// slack for a dispatcher outage.
+const cancelledRecencyDays = 14
+
 // CandidateIssuesQuery fetches active-state issues on the configured team
 // along with the fields NormalizeCandidateIssues needs: title, description,
-// workflow state name, agent:<lane> labels, inverse blocking relations (the
-// issues that block this one — see below), priority, branch name, and
-// updatedAt.
+// workflow state name AND type, agent:<lane> labels, inverse blocking
+// relations (the issues that block this one — see below), priority, branch
+// name, and updatedAt.
 //
 // It fetches inverseRelations, NOT relations: a dependency of an issue is an
 // issue that blocks it, and Linear records a blocking relationship once, on
@@ -37,15 +51,33 @@ const apiKeyEnvVar = "LINEAR_API_KEY"
 // CLIPSE_ISSUE_TEXT) -- without them here, that env var is always empty
 // regardless of anything downstream.
 //
-// Excluding the terminal state types (Linear has no "active" type; the real
-// types are backlog/unstarted/started/completed/canceled/triage, plus
-// duplicate) keeps completed/cancelled/duplicate work out of the candidate
-// set; the dispatcher decides dispatchability from Status/Deps, not from this
-// query. Filtering to team.key scopes the candidate set to the single team
-// clipse is configured against (config.Config.TeamKey), so a workspace with
-// other teams' issues never surfaces them as candidates.
-const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
-  issues(filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } }, team: { key: { eq: $teamKey } } }) {
+// The filter is an OR of two branches (Linear has no "active" type; the real
+// types are backlog/unstarted/started/completed/canceled/triage):
+//
+//  1. An unconditional branch excluding "completed" and "canceled", with NO
+//     recency restriction — backlog/unstarted/started/triage are never
+//     terminal, so bounding them by updatedAt would risk losing a genuinely
+//     active issue that just hasn't been touched in a while. "completed" is
+//     excluded because the dispatcher learns about a merge from its OWN
+//     action (the git-operator lane merges it, then the dispatcher writes
+//     board_status="done" itself, before Linear's state even changes) — it
+//     never needs to observe "completed" from Linear at all. ("duplicate" is
+//     NOT a real Linear state type and was dead filter text.)
+//  2. A second branch folding "canceled" back into scope, but only when
+//     updated within the last cancelledRecencyDays — cancellation is a
+//     human-only Linear event with no other signal, so it can't be excluded
+//     outright the way "completed" is (see status.go's cancelled-type
+//     mapping and dispatcher/promote.go's dependency-gating), but nor can it
+//     stay in scope forever (see cancelledRecencyDays's doc comment).
+//
+// Filtering to team.key scopes the candidate set to the single team clipse is
+// configured against (config.Config.TeamKey), so a workspace with other
+// teams' issues never surfaces them as candidates.
+var CandidateIssuesQuery = fmt.Sprintf(`query CandidateIssues($teamKey: String!) {
+  issues(filter: { team: { key: { eq: $teamKey } }, or: [
+    { state: { type: { nin: ["completed", "canceled"] } } },
+    { state: { type: { eq: "canceled" } }, updatedAt: { gt: "-P%dD" } }
+  ] }) {
     nodes {
       id
       identifier
@@ -56,6 +88,7 @@ const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
       updatedAt
       state {
         name
+        type
       }
       labels {
         nodes {
@@ -72,7 +105,7 @@ const CandidateIssuesQuery = `query CandidateIssues($teamKey: String!) {
       }
     }
   }
-}`
+}`, cancelledRecencyDays)
 
 // SetStateMutation moves an issue to a given workflow state.
 const SetStateMutation = `mutation SetState($issueId: String!, $stateId: String!) {
@@ -164,11 +197,12 @@ func marshalGraphQLRequest(query string, variables map[string]any) ([]byte, erro
 // the LINEAR_API_KEY environment variable, scoped to a single configured
 // team.
 type HTTPClient struct {
-	apiKey     string
-	baseURL    string
-	teamKey    string
-	teamID     string
-	httpClient *http.Client
+	apiKey      string
+	baseURL     string
+	teamKey     string
+	teamID      string
+	labelPrefix string
+	httpClient  *http.Client
 
 	// mu guards stateIDs, the lazily-resolved and cached name(lowercase)->id
 	// map for teamID (see state_resolver.go). The dispatch loop is
@@ -181,31 +215,33 @@ type HTTPClient struct {
 // NewHTTPClient builds an HTTPClient using the API key from LINEAR_API_KEY,
 // pointed at Linear's real GraphQL endpoint and scoped to the Linear team
 // identified by teamKey (candidate-issues filter) and teamID (workflow-state
-// resolution for SetState).
+// resolution for SetState). labelPrefix is config.Config.LaneLabelPrefix,
+// threaded through for Linear label parsing (see status.go's laneFromLabels).
 // Returns an error if the environment variable is unset or empty.
-func NewHTTPClient(teamKey, teamID string) (*HTTPClient, error) {
-	return newHTTPClient(apiURL, teamKey, teamID)
+func NewHTTPClient(teamKey, teamID, labelPrefix string) (*HTTPClient, error) {
+	return newHTTPClient(apiURL, teamKey, teamID, labelPrefix)
 }
 
 // NewHTTPClientWithBaseURL builds an HTTPClient like NewHTTPClient, but
 // against baseURL instead of Linear's real API. Intended for tests that
 // point the client at a local httptest.Server; production code should use
 // NewHTTPClient.
-func NewHTTPClientWithBaseURL(baseURL, teamKey, teamID string) (*HTTPClient, error) {
-	return newHTTPClient(baseURL, teamKey, teamID)
+func NewHTTPClientWithBaseURL(baseURL, teamKey, teamID, labelPrefix string) (*HTTPClient, error) {
+	return newHTTPClient(baseURL, teamKey, teamID, labelPrefix)
 }
 
-func newHTTPClient(baseURL, teamKey, teamID string) (*HTTPClient, error) {
+func newHTTPClient(baseURL, teamKey, teamID, labelPrefix string) (*HTTPClient, error) {
 	apiKey := os.Getenv(apiKeyEnvVar)
 	if apiKey == "" {
 		return nil, fmt.Errorf("building linear http client: %s is not set", apiKeyEnvVar)
 	}
 	return &HTTPClient{
-		apiKey:     apiKey,
-		baseURL:    baseURL,
-		teamKey:    teamKey,
-		teamID:     teamID,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiKey:      apiKey,
+		baseURL:     baseURL,
+		teamKey:     teamKey,
+		teamID:      teamID,
+		labelPrefix: labelPrefix,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
@@ -222,7 +258,7 @@ func (c *HTTPClient) CandidateIssues(ctx context.Context) ([]Issue, error) {
 		return nil, fmt.Errorf("candidate issues: %w", err)
 	}
 
-	issues, err := NormalizeCandidateIssues(respBody)
+	issues, err := NormalizeCandidateIssues(respBody, c.labelPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("candidate issues: %w", err)
 	}

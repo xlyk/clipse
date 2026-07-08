@@ -12,7 +12,13 @@ import (
 
 // terminalStatuses are the board columns board.Promote treats as "this
 // dependency will never re-enter an active column" (see board.DepState.
-// Terminal).
+// Terminal). "cancelled" (double-l) is not a contract.Column value -- Linear
+// cancellation is a human-only event with no dispatcher-owned transition, so
+// it's written as a raw board_status string by adoptLinearMove once
+// internal/linear observes it (status.go's statusFromWorkflowName, driven by
+// the state's TYPE; http_client.go's CandidateIssuesQuery used to exclude
+// cancelled issues from the poll entirely, which is why this was dead code
+// until both were fixed together).
 var terminalStatuses = map[string]bool{
 	string(contract.ColumnDone): true,
 	"cancelled":                 true,

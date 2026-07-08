@@ -322,6 +322,53 @@ func TestTick_PollAdoptsHumanMove_FromNonBlocked_DoesNotResetReworkCount(t *test
 	}
 }
 
+// TestTick_PollAdoptsHumanRequeueFromBlocked_ResetsRecoverAttemptsToo asserts
+// the fix for finding 5(b): a human requeue out of Blocked resets
+// recover_attempts and clears blocked_until, the same way it already resets
+// rework_count -- otherwise a card auto-retried close to RecoverCap before
+// parking keeps that near-exhausted budget after a human's fresh requeue.
+func TestTick_PollAdoptsHumanRequeueFromBlocked_ResetsRecoverAttemptsToo(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	issue := store.Issue{
+		ID: "issue-1", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "blocked",
+		RecoverAttempts: 2, BlockedUntil: 5000,
+		Deps: `[]`, Priority: 1, BranchName: "issue-1-branch",
+		UpdatedAt: 100, LastSeen: 100, CreatedAt: 100,
+	}
+	if err := s.UpsertIssue(ctx, issue); err != nil {
+		t.Fatalf("seed UpsertIssue: unexpected error: %v", err)
+	}
+
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			{ID: "issue-1", Identifier: "CLP-1", Status: "ready", Lane: "coder", Priority: 1, BranchName: "issue-1-branch", UpdatedAt: 200},
+		},
+	}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Fatalf("BoardStatus = %q, want ready (adopted human move)", got.BoardStatus)
+	}
+	if got.RecoverAttempts != 0 {
+		t.Errorf("RecoverAttempts = %d, want reset to 0 on human requeue from blocked", got.RecoverAttempts)
+	}
+	if got.BlockedUntil != 0 {
+		t.Errorf("BlockedUntil = %d, want cleared to 0 on human requeue from blocked", got.BlockedUntil)
+	}
+}
+
 // TestTick_PollReassertsDispatcherOwnedStateWhenClaimed asserts A3's other
 // half: when an issue's SQLite board_status diverges from Linear's polled
 // status BUT the issue holds an active claim (the dispatcher owns it right
@@ -383,5 +430,75 @@ func TestTick_PollReassertsDispatcherOwnedStateWhenClaimed(t *testing.T) {
 	}
 	if !sawRunningReassert {
 		t.Errorf("SetStateCalls = %+v, want a setstate -> running reassertion", lc.SetStateCalls)
+	}
+}
+
+// TestTick_PollNeverAdoptsRunningWithoutClaim asserts the fix for adopting an
+// unclaimed "running" status from Linear: a human dragging a card to Running
+// (or a restart-requeue race observing a stale label) must not be adopted --
+// board_status='running' is entered ONLY via the CAS claim (store.ClaimReady/
+// ClaimColumn). Adopting it here would write claim_lock=NULL, board_status=
+// 'running': unclaimable by ClaimReady's CAS (which requires board_status=
+// 'ready') and unreleasable by ReleaseStaleClaims (which only looks at
+// claim_expires, permanently NULL on this row).
+func TestTick_PollNeverAdoptsRunningWithoutClaim(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// issue-1 sits at 'ready' with no active claim.
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+
+	// Linear reports "running" for this issue with no backing claim.
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{
+			{ID: "issue-1", Identifier: "CLP-1", Status: "running", Lane: "coder", Priority: 1, BranchName: "issue-1-branch", UpdatedAt: 200},
+		},
+	}
+	spawner := newFakeSpawner()
+	ws := newStubWorkspacer(t.TempDir())
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, spawner, ws, fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: unexpected error: %v", err)
+	}
+	if got.BoardStatus != "ready" {
+		t.Fatalf("BoardStatus = %q, want unchanged ready (an unclaimed running status must never be adopted)", got.BoardStatus)
+	}
+	if got.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = true, want still unclaimed")
+	}
+
+	// Instead of adopting, the dispatcher corrects Linear's stale view: a
+	// setstate mirror pushing the store's real status (ready) back.
+	var sawReadyReassert bool
+	for _, c := range lc.SetStateCalls {
+		if c.IssueID == "issue-1" && c.TargetColumn == "ready" {
+			sawReadyReassert = true
+		}
+	}
+	if !sawReadyReassert {
+		t.Errorf("SetStateCalls = %+v, want a setstate -> ready reassertion correcting Linear's stray running", lc.SetStateCalls)
+	}
+
+	// The issue remains genuinely claimable on a later tick with real caps.
+	cfg := testConfig()
+	d2 := newTestDispatcher(t, cfg, s, lc, spawner, ws, fixedClock(1000))
+	if err := d2.Tick(ctx); err != nil {
+		t.Fatalf("second Tick: unexpected error: %v", err)
+	}
+	got2, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue after second tick: unexpected error: %v", err)
+	}
+	if got2.BoardStatus != "running" {
+		t.Errorf("BoardStatus after second tick = %q, want running (claimed for real this time)", got2.BoardStatus)
+	}
+	if !got2.ClaimLock.Valid {
+		t.Errorf("ClaimLock.Valid = false after second tick, want a real claim backing running")
 	}
 }
