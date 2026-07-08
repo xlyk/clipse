@@ -47,14 +47,16 @@ ENV_FILE="$SCRIPT_DIR/smoke.env"
 # Populated by build_dag(): parallel 1-indexed arrays (index 0 is a "_"
 # placeholder so ticket numbers read naturally). DEPS holds space-separated
 # blocker indices; IDS is filled with the created CLI-N identifiers.
-T_TITLE=() ; T_FILE=() ; T_DESC=() ; T_DEPS=() ; IDS=()
+T_TITLE=() ; T_FILE=() ; T_DESC=() ; T_DEPS=() ; T_TAGS=() ; IDS=()
 N=0
+MODE=""
 
 # Set when the dispatcher is launched so the EXIT trap can stop it.
 DISPATCH_PID=""
 
 # Flags (defaults).
 TICKETS=10
+TICKETS_SET=0
 FAST=0
 NO_RUN=0
 KEEP=0
@@ -426,44 +428,44 @@ build() {
 # Seed
 # ---------------------------------------------------------------------------
 
-# build_dag fills T_TITLE / T_FILE / T_DESC / T_DEPS (1-indexed) and N.
-#   --fast        -> 3-ticket linear chain
-#   --tickets 10  -> the greet DAG (fan-out + multi-blocker fan-in)
-#   --tickets N   -> a linear chain of length N
-# Every ticket creates exactly ONE distinct file, so the only ordering
-# constraint is the blocked-by graph (no merge conflicts).
+# build_dag fills T_TITLE / T_FILE / T_DESC / T_DEPS / T_TAGS (1-indexed),
+# N, and MODE.
+#   (no flag)     -> the 10-ticket greet app DAG from scripts/smoke/dag/
+#   --fast        -> 3-step semantic code chain
+#   --tickets N   -> N-step semantic code chain
 build_dag() {
-  T_TITLE=(_) ; T_FILE=(_) ; T_DESC=(_) ; T_DEPS=(_) ; IDS=(_)
+  T_TITLE=(_) ; T_FILE=(_) ; T_DESC=(_) ; T_DEPS=(_) ; T_TAGS=(_) ; IDS=(_)
 
   if [[ "$FAST" -eq 1 ]]; then
-    N=3
-    _dag_chain
-    return
+    MODE="chain" ; N=3 ; _dag_chain ; return
   fi
-
-  if [[ "$TICKETS" -eq 10 ]]; then
-    N=10
-    _dag_greet
-    return
+  if [[ "$TICKETS_SET" -eq 1 ]]; then
+    MODE="chain" ; N="$TICKETS" ; _dag_chain ; return
   fi
-
-  N="$TICKETS"
-  _dag_chain
+  MODE="app" ; _dag_app
 }
 
-# _dag_chain builds a linear chain T1 <- T2 <- ... <- TN of markdown files.
+# _dag_chain builds a chain of real Python modules: step i's run() calls
+# step i-1's, so the dependency is semantic -- a child claimed before its
+# blocker merged cannot pass its own tests (the imported module is absent).
 _dag_chain() {
-  local i prev file
+  local i file prev tag num expected="x" one
+  one="Run \`uv run pytest\` from the repo root and make it pass before committing. Do not add dependencies and do not touch \`pyproject.toml\` or CI files."
   for i in $(seq 1 "$N"); do
-    file="$(printf 'samples/smoke/step_%02d.md' "$i")"
+    num="$(printf '%02d' "$i")"
+    tag="step-$num"
+    expected="${tag}:${expected}"
+    file="src/greet/steps/step_${num}.py"
     T_TITLE[i]="[smoke] chain step $i"
-    T_FILE[i]="$file"
-    T_DESC[i]="Create the file \`$file\` containing a single markdown heading '# step $i' and one sentence describing step $i of a demo pipeline. Create ONLY that one file. Do not modify, rename, or create any other file, and do not touch application or test source code."
-    if [[ "$i" -gt 1 ]]; then
-      prev=$((i - 1))
-      T_DEPS[i]="$prev"
-    else
+    T_FILE[i]="$file,tests/test_step_${num}.py"
+    T_TAGS[i]=""
+    if [[ "$i" -eq 1 ]]; then
+      T_DESC[i]="Create the package directory \`src/greet/steps/\` with an empty \`__init__.py\`, and create \`$file\` containing exactly one public function \`def run(value: str) -> str\` that returns the string \`step-01:\` followed by \`value\` (so \`run(\"x\")\` returns \`\"step-01:x\"\`). Also create \`tests/test_step_01.py\` with a pytest test asserting exactly that. Modify ONLY those files. $one"
       T_DEPS[i]=""
+    else
+      prev="$(printf '%02d' $((i - 1)))"
+      T_DESC[i]="Create \`$file\` containing exactly one public function \`def run(value: str) -> str\`. It must call \`run\` from \`greet.steps.step_${prev}\` (the previous step) and prepend its own tag, so \`run(\"x\")\` returns exactly \`\"${expected}\"\`. Also create \`tests/test_step_${num}.py\` with a pytest test asserting \`run(\"x\") == \"${expected}\"\`. Modify ONLY those two files. $one"
+      T_DEPS[i]="$((i - 1))"
     fi
   done
 }
@@ -549,28 +551,36 @@ seed() {
   info "seed complete: $(printf '%s ' "${IDS[@]:1}")"
 }
 
-# write_manifest records the seeded DAG for the run/verify phases:
-#   index<TAB>identifier<TAB>file<TAB>blocker-identifiers(space-separated)
-# The blocker list is the final tab-delimited field, so its internal spaces
-# survive `read -r ... blockers` intact and split cleanly on the default IFS.
+# write_manifest records the seeded DAG for the run/verify phases. Line 1 is
+# a "#mode=app|chain" header; data rows are
+#   index<TAB>identifier<TAB>files<TAB>blocker-identifiers<TAB>tags
+# Readers split on TAB only (IFS=$'\t'), so the space-separated blocker and
+# tag lists survive in any column.
 write_manifest() {
   mkdir -p "$SMOKE_HOME"
-  : > "$MANIFEST"
+  printf '#mode=%s\n' "$MODE" > "$MANIFEST"
   local i d blockers
   for i in $(seq 1 "$N"); do
     blockers=""
     for d in ${T_DEPS[i]:-}; do
       if [[ -n "$blockers" ]]; then blockers="$blockers ${IDS[d]}"; else blockers="${IDS[d]}"; fi
     done
-    printf '%s\t%s\t%s\t%s\n' "$i" "${IDS[i]}" "${T_FILE[i]}" "$blockers" >> "$MANIFEST"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "${IDS[i]}" "${T_FILE[i]}" "$blockers" "${T_TAGS[i]:-}" >> "$MANIFEST"
   done
   info "wrote manifest: $MANIFEST"
 }
 
-# manifest_ids prints the seeded identifiers, one per line.
+# manifest_ids prints the seeded identifiers, one per line (skips comments).
 manifest_ids() {
   [[ -f "$MANIFEST" ]] || die "no manifest at $MANIFEST -- run 'seed' first"
-  cut -f2 "$MANIFEST"
+  grep -v '^#' "$MANIFEST" | cut -f2
+}
+
+# manifest_mode prints the manifest's recorded mode (default: app).
+manifest_mode() {
+  local m=""
+  [[ -f "$MANIFEST" ]] && m="$(sed -n 's/^#mode=//p' "$MANIFEST" | head -1)"
+  printf '%s' "${m:-app}"
 }
 
 # sql_in_list prints a quoted, comma-separated SQL IN(...) body of the seeded
@@ -677,7 +687,7 @@ verify() {
   local status done_ts start_ts tokens wall merged_yn branch
   local total_tokens=0
   # (a) + (c) + row rendering.
-  while IFS=$'\t' read -r _ id _ blockers; do
+  while IFS=$'\t' read -r _ id _ blockers _tags; do
     [[ -n "$id" ]] || continue
     status="$(db_scalar "SELECT board_status FROM issues WHERE identifier='$id';")"
     done_ts="$(db_scalar "SELECT COALESCE(MAX(e.ts),0) FROM events e JOIN issues i ON i.id=e.issue_id WHERE i.identifier='$id';")"
@@ -709,7 +719,7 @@ verify() {
       err "  $id has no merged PR"
       fails=$((fails + 1))
     fi
-  done < "$MANIFEST"
+  done < <(grep -v '^#' "$MANIFEST")
 
   info "total tokens (in+out): $total_tokens"
 
@@ -718,7 +728,7 @@ verify() {
   # blockers are done, so it necessarily finishes after them).
   info "verify: dependency ordering"
   local child_done blocker_done blocker
-  while IFS=$'\t' read -r _ id _ blockers; do
+  while IFS=$'\t' read -r _ id _ blockers _tags; do
     [[ -n "$id" && -n "$blockers" ]] || continue
     child_done="$(db_scalar "SELECT COALESCE(MAX(e.ts),0) FROM events e JOIN issues i ON i.id=e.issue_id WHERE i.identifier='$id';")"
     child_done="${child_done:-0}"
@@ -732,7 +742,7 @@ verify() {
         fails=$((fails + 1))
       fi
     done
-  done < "$MANIFEST"
+  done < <(grep -v '^#' "$MANIFEST")
 
   # R5 (optional, report-only): reviewer inline-comment placement validity.
   # Never affects the smoke verdict; requires gh auth against $TARGET_REPO.
@@ -805,8 +815,8 @@ main() {
   local cmd=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --tickets) shift; TICKETS="${1:?--tickets needs a value}" ;;
-      --tickets=*) TICKETS="${1#*=}" ;;
+      --tickets) shift; TICKETS="${1:?--tickets needs a value}"; TICKETS_SET=1 ;;
+      --tickets=*) TICKETS="${1#*=}"; TICKETS_SET=1 ;;
       --fast) FAST=1 ;;
       --no-run) NO_RUN=1 ;;
       --keep) KEEP=1 ;;
