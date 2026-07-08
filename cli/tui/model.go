@@ -120,6 +120,10 @@ type Model struct {
 	// something human-readable.
 	identByID  map[string]string
 	statusByID map[string]string
+	// laneByRunID resolves a run id to its bare lane, built from every
+	// issue's full run history — the activity feed uses it to badge each
+	// event with the lane that produced it (P3).
+	laneByRunID map[string]string
 
 	tokensIn  int
 	tokensOut int
@@ -493,6 +497,7 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.issuesByIdent = make(map[string]store.IssueSnapshot, len(snap.Issues))
 	m.identByID = make(map[string]string, len(snap.Issues))
 	m.statusByID = make(map[string]string, len(snap.Issues))
+	m.laneByRunID = make(map[string]string)
 
 	for _, is := range sortedIssueSnapshots(snap.Issues) {
 		// A held claim means a worker is actively on this card now, in whatever
@@ -520,6 +525,9 @@ func (m *Model) fold(snap store.Snapshot) {
 		m.issuesByIdent[is.Identifier] = is
 		m.identByID[is.ID] = is.Identifier
 		m.statusByID[is.ID] = is.BoardStatus
+		for _, r := range is.Runs {
+			m.laneByRunID[r.RunID] = r.Lane
+		}
 
 		switch is.BoardStatus {
 		case "running", "review", "rework", "merging":
