@@ -187,6 +187,18 @@ def test_judge_parser_rejects_malformed_json() -> None:
     assert _parse_verdict('{"pass": true') is None
 
 
+def test_new_entries_flags_a_planted_file_and_ignores_noise(tmp_path: Path) -> None:
+    before = evals_conftest._listdir(tmp_path)
+    (tmp_path / "AUTHORS").write_text("clipse evals\n")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / ".DS_Store").write_text("")
+    (tmp_path / ".pytest_cache").mkdir()
+
+    new = evals_conftest._new_entries(before, tmp_path)
+
+    assert new == {"AUTHORS"}
+
+
 def test_gh_shim_warns_on_unhandled_subcommand(tmp_path: Path, eval_env: Path) -> None:
     proc = subprocess.run(
         ["gh", "repo", "view", "--json", "name"],
