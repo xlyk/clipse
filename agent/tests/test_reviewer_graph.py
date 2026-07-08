@@ -271,14 +271,46 @@ def test_load_diff_injects_pr_diff_into_task_text(tmp_path):
 
     asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-9"}}))
 
-    # load_diff ran the diff command (default base "main")...
-    assert any(c.argv[:2] == ["git", "diff"] and "main...HEAD" in c.argv for c in runner.calls)
+    # load_diff fetched the base then diffed against origin/<base> (default
+    # base "main") -- the worktree's local base ref is frozen at creation, so
+    # diffing against it after sibling PRs merge shows THEIR files too (the
+    # 2026-07-08 smoke's phantom-scope-violation reject loop).
+    assert any(c.argv == ["git", "fetch", "origin", "main"] for c in runner.calls)
+    assert any(c.argv[:2] == ["git", "diff"] and "origin/main...HEAD" in c.argv for c in runner.calls)
     # ...and the DAC turn was driven with a task_text that carries BOTH the
     # original issue text AND the diff content, in a ```diff fence.
     task_text = turn_calls[0]["task_text"]
     assert "Add HELLO.md with the tagline." in task_text
     assert "Clipse turns Linear issues into merged PRs." in task_text
     assert "```diff" in task_text
+
+
+def test_load_diff_falls_back_to_local_base_when_fetch_fails(tmp_path):
+    # Offline (unit tests, air-gapped runs): the fetch is best-effort; the
+    # diff must still be produced against the local base ref, never raise.
+    runner = _base_runner()
+    runner.rules.insert(0, (_starts_with("git", "fetch"), coder.CommandResult(1, "", "fatal: unable to access remote")))
+    runner.rules.insert(0, (_starts_with("git", "diff"), coder.CommandResult(0, "diff --git a/x b/x\n", "")))
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="ok.\n\nVERDICT: PASS", tokens_in=1, tokens_out=1)
+
+    graph = reviewer.build_reviewer_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        run_command=runner,
+    )
+    input_state: reviewer.ReviewerState = {
+        "issue_id": "SPAC-9c",
+        "run_id": "run-1",
+        "thread_id": "thread-9c",
+        "workspace": _worktree(tmp_path),
+        "issue_text": "x",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-9c"}}))
+
+    assert any(c.argv[:2] == ["git", "diff"] and "main...HEAD" in c.argv for c in runner.calls)
+    assert not any(c.argv[:2] == ["git", "diff"] and "origin/main...HEAD" in c.argv for c in runner.calls)
 
 
 def test_load_diff_degrades_gracefully_when_git_diff_fails(tmp_path):
@@ -354,7 +386,7 @@ def test_load_diff_truncated_names_the_omitted_files(tmp_path):
     assert "- third.py" in section
     assert "- first.py" not in section
     # instructs per-file reads, and the section is the tail of the task text
-    assert "git diff main...HEAD -- <file>" in section
+    assert "git diff origin/main...HEAD -- <file>" in section
     assert task_text.rstrip().endswith("- third.py")
 
 

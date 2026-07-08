@@ -25,7 +25,8 @@ func setupScenario(t *testing.T, scenario string) (spec Spec, callLog string) {
 	branch := "clp-1-feature"
 	worktree := newIssueWorktree(t, primary, branch, "main")
 
-	if scenario == "stale_base_conflict" || scenario == "update_branch_refused" {
+	if scenario == "stale_base_conflict" || scenario == "update_branch_refused" ||
+		scenario == "conflicting_absent_checks" || scenario == "conflicting_pending_checks" {
 		writeFileT(t, worktree, "README.md", "issue branch changed this line\n")
 		runGitT(t, worktree, "commit", "-am", "issue branch edits README")
 		writeFileT(t, primary, "README.md", "main branch changed this line differently\n")
@@ -251,6 +252,54 @@ func TestRunAbsentChecksProceedsWhenNotRequired(t *testing.T) {
 		t.Fatalf("Run() Outcome = %q, want %q (checks not required)", res.Outcome, OutcomeMerged)
 	}
 	assertWorktreeRemoved(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+}
+
+// TestRun_ConflictingPRWithAbsentChecks_RoutesToRework asserts the CLI-67
+// smoke deadlock cannot recur: a CONFLICTING PR never produces required
+// checks at all -- GitHub runs pull_request CI against the PR's merge
+// commit, which cannot exist while the PR conflicts with its base -- so
+// treating absent checks as "wait for CI to register" waits forever (55
+// stale re-claims over 32 minutes in the 2026-07-08 smoke run). Absent
+// checks on a conflicting PR must take the stale-base-conflict route to
+// rework instead of the CI wait.
+func TestRun_ConflictingPRWithAbsentChecks_RoutesToRework(t *testing.T) {
+	spec, _ := setupScenario(t, "conflicting_absent_checks")
+	spec.RequireChecks = true
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+	if res.Outcome != OutcomeStaleBaseConflict {
+		t.Fatalf("Run() Outcome = %q, want %q (Reason: %q)", res.Outcome, OutcomeStaleBaseConflict, res.Reason)
+	}
+	if len(res.ConflictingFiles) != 1 || res.ConflictingFiles[0] != "README.md" {
+		t.Errorf("Run() ConflictingFiles = %v, want [README.md]", res.ConflictingFiles)
+	}
+	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+	assertNoMergeInProgress(t, spec.Workspace)
+}
+
+// TestRun_ConflictingPRWithPendingChecks_RoutesToRework covers the sibling
+// window: a rollup still reporting pending on a CONFLICTING PR can only be
+// left over from an older head -- no new check can complete while the
+// conflict stands -- so it takes the same conflict-first route.
+func TestRun_ConflictingPRWithPendingChecks_RoutesToRework(t *testing.T) {
+	spec, _ := setupScenario(t, "conflicting_pending_checks")
+	spec.RequireChecks = true
+
+	res, err := Run(ctxWithTimeout(t), spec, nil)
+	if err != nil {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+	if res.Outcome != OutcomeStaleBaseConflict {
+		t.Fatalf("Run() Outcome = %q, want %q (Reason: %q)", res.Outcome, OutcomeStaleBaseConflict, res.Reason)
+	}
+	if len(res.ConflictingFiles) != 1 || res.ConflictingFiles[0] != "README.md" {
+		t.Errorf("Run() ConflictingFiles = %v, want [README.md]", res.ConflictingFiles)
+	}
+	assertWorktreeIntact(t, spec.PrimaryClonePath, spec.Workspace, spec.Branch)
+	assertNoMergeInProgress(t, spec.Workspace)
 }
 
 // TestRun_ProtectionUnsatisfied_NotMergeable asserts green checks alone are

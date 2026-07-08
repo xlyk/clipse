@@ -290,6 +290,9 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 	switch state, failing := classifyChecks(checks); state {
 	case checksAbsent:
 		if spec.RequireChecks {
+			if result, handled, err := conflictBeforeCIWait(ctx, spec, view, runCommand); handled || err != nil {
+				return result, err
+			}
 			// No checks *yet*: on this repo CI may just not have registered
 			// (observed ~40 min late during the Reflex build). Same handling
 			// as pending -- wait, don't block. Blocking here strands a PR
@@ -302,6 +305,9 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 		// re-fails. Park for a human/coder, don't auto-retry.
 		return notMergeable(view, fmt.Sprintf("required checks failing: %s", joinNames(failing)), false), nil
 	case checksPending:
+		if result, handled, err := conflictBeforeCIWait(ctx, spec, view, runCommand); handled || err != nil {
+			return result, err
+		}
 		return Result{Outcome: OutcomeCIPending, PRURL: view.URL, PRNumber: view.Number}, nil
 	}
 	// checksGreen falls through.
@@ -377,6 +383,37 @@ func Run(ctx context.Context, spec Spec, runCommand CommandRunner) (Result, erro
 	}
 
 	return Result{Outcome: OutcomeMerged, PRURL: view.URL, PRNumber: view.Number}, nil
+}
+
+// conflictBeforeCIWait routes a CONFLICTING PR to the stale-base-conflict
+// path when the checks gate would otherwise wait for CI. A conflicting PR
+// can never produce required checks: GitHub runs pull_request CI against
+// the PR's merge commit, which does not exist while the PR conflicts with
+// its base -- so "wait for CI" waits forever (the 2026-07-08 smoke
+// deadlock: CLI-67 spun through 55 stale merging re-claims in 32 minutes
+// with the conflict route unreachable behind the CI gate). The absent or
+// stale-pending checks are a SYMPTOM of the conflict; the conflict is what
+// must be resolved first, by the coder's conflict-resolution rework.
+//
+// handled=false means view is not conflicting -- the caller applies its
+// normal CI-wait handling. Otherwise the caller returns result/err as-is:
+// the resolveStaleBase verdict (conflict -> rework), or -- when
+// update-branch resolved it cleanly after all (mergeability had gone stale)
+// -- an OutcomeCIPending to wait for the checks the fresh merge commit will
+// now trigger, never a fall-through to merge (checks are still required and
+// still not green).
+func conflictBeforeCIWait(ctx context.Context, spec Spec, view prView, runCommand CommandRunner) (result Result, handled bool, err error) {
+	if !hasConflict(view) {
+		return Result{}, false, nil
+	}
+	result, proceed, err := resolveStaleBase(ctx, spec, view, runCommand)
+	if err != nil {
+		return Result{}, true, err
+	}
+	if !proceed {
+		return result, true, nil
+	}
+	return Result{Outcome: OutcomeCIPending, PRURL: view.URL, PRNumber: view.Number}, true, nil
 }
 
 // resolveStaleBase attempts to bring an out-of-date or conflicting branch

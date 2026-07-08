@@ -18,6 +18,19 @@ def test_get_coder_profile_returns_a_coder_profile():
     assert isinstance(profile, CoderProfile)
 
 
+def test_coder_prompt_forbids_history_rewrites():
+    # Smoke run 2026-07-08 (CLI-73): fed phantom scope violations by a
+    # stale-base review diff, the coder tried to "repair" its PR with
+    # rebase/reset/cherry-pick, diverging from the pushed branch and
+    # spinning every subsequent push into non-fast-forward rejection.
+    # The prompt must ban rewriting pushed history outright and tell the
+    # agent to report a wrong-looking diff instead of fixing it with git.
+    prompt = get_coder_profile().system_prompt.lower()
+    assert "rebase" in prompt
+    assert "force-push" in prompt
+    assert "handoff" in prompt
+
+
 def test_coder_profile_is_frozen():
     profile = get_coder_profile()
 
