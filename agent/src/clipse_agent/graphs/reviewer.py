@@ -249,11 +249,22 @@ def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict
     def _node(state: ReviewerState) -> dict[str, Any]:
         base = state.get("base_branch") or "main"
         cwd = state["cwd"]
-        result = _run(run_command, ["git", "diff", f"{base}...HEAD"], cwd, check=False)
+        # Diff against origin/<base>, not the local base ref: the worktree's
+        # local ref is frozen at worktree creation, so once sibling PRs merge
+        # (and the coder's sync_base folds origin/<base> into HEAD) a diff
+        # against it includes THEIR files too -- the 2026-07-08 smoke run's
+        # phantom-scope-violation reject loop, which drove the coder into
+        # history-rewriting "repairs". The fetch is best-effort: offline
+        # (unit tests, air-gapped runs) it degrades to the local ref.
+        diff_base = base
+        fetch = _run(run_command, ["git", "fetch", "origin", base], cwd, check=False)
+        if fetch.returncode == 0:
+            diff_base = f"origin/{base}"
+        result = _run(run_command, ["git", "diff", f"{diff_base}...HEAD"], cwd, check=False)
         truncation_note = ""
         if result.returncode != 0:
             diff_block = (
-                f"(could not compute `git diff {base}...HEAD` "
+                f"(could not compute `git diff {diff_base}...HEAD` "
                 f"(exit {result.returncode}): {result.stderr.strip()})"
             )
         else:
@@ -261,12 +272,12 @@ def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict
             if len(diff) > _MAX_DIFF_CHARS:
                 kept = diff[:_MAX_DIFF_CHARS]
                 diff = kept + f"\n... (diff truncated at {_MAX_DIFF_CHARS} chars)"
-                truncation_note = _truncated_files_note(run_command, base, cwd, kept)
+                truncation_note = _truncated_files_note(run_command, diff_base, cwd, kept)
             diff_block = diff.strip() or "(empty diff -- no changes between base and HEAD)"
 
         task_text = state.get("task_text", "")
         augmented = (
-            f"{task_text}\n\n---\nPR diff (`git diff {base}...HEAD`), provided for your review:\n\n"
+            f"{task_text}\n\n---\nPR diff (`git diff {diff_base}...HEAD`), provided for your review:\n\n"
             f"```diff\n{diff_block}\n```\n"
         )
         return {"task_text": augmented + truncation_note}

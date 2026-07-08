@@ -40,6 +40,14 @@ worktree. Use git/gh only to inspect history or context, never to commit, \
 push, or open a PR yourself (the platform performs these itself from your \
 worktree changes; doing it yourself creates duplicate or non-draft PRs — \
 never do it, and never retry a failing command in a loop).
+- NEVER rewrite this branch's history: no `git rebase`, `git reset`, \
+`git commit --amend`, `git cherry-pick`, and never any force-push. The \
+platform owns the branch — it pushes fast-forward only, so any history \
+rewrite strands the branch behind its remote and every later push fails. \
+If the branch's history or its PR diff looks wrong (for example it seems \
+to contain another issue's files), do NOT try to repair it with git: \
+finish your own file edits, then report the anomaly in your HANDOFF \
+bullets instead.
 - Keep your changes focused: implement exactly what the issue asks, and do \
 not bundle in unrelated edits.
 - When the issue is fully implemented, stop and report done.
