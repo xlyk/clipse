@@ -214,9 +214,10 @@ func (m Model) rowDetail(row Row, s section, now int64) string {
 	return strings.Join(parts, dimStyle.Render(" · "))
 }
 
-// renderDoneSummary renders a single compact line listing the identifiers of
-// completed issues (dim), so terminal "done" cards — which the stacked
-// sections omit — remain visible. Returns "" when nothing is done.
+// renderDoneSummary renders a single compact line listing completed issues
+// (dim) with their merged PR numbers when a run carried one — "CLI-52 #38" —
+// so terminal "done" cards remain visible and satisfying (P6). Returns ""
+// when nothing is done.
 func (m Model) renderDoneSummary(inner int) string {
 	done := m.byStatus["done"]
 	if len(done) == 0 {
@@ -224,7 +225,13 @@ func (m Model) renderDoneSummary(inner int) string {
 	}
 	idents := make([]string, 0, len(done))
 	for _, r := range done {
-		idents = append(idents, r.Identifier)
+		label := r.Identifier
+		if is, ok := m.issuesByIdent[r.Identifier]; ok {
+			if n := prNumber(prURLFromRuns(is.Runs)); n != "" {
+				label += " " + n
+			}
+		}
+		idents = append(idents, label)
 	}
 	// Match the section groups: a full-width labeled band, then the completed
 	// identifiers on the line below (budgeted so the line never wraps).
@@ -234,6 +241,22 @@ func (m Model) renderDoneSummary(inner int) string {
 	}
 	list := dimStyle.Render("   " + truncatePlain(strings.Join(idents, "  "), maxInt(inner-4, 4)))
 	return head + "\n" + list
+}
+
+// prNumber extracts a "#<digits>" display form from a PR URL's trailing path
+// segment ("…/pull/38" → "#38"), or "" when the URL doesn't end in a number.
+func prNumber(url string) string {
+	i := strings.LastIndex(url, "/")
+	if i < 0 || i == len(url)-1 {
+		return ""
+	}
+	tail := url[i+1:]
+	for _, r := range tail {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return "#" + tail
 }
 
 // orderedLineIndex returns the 0-based line, within renderBody's output, of the

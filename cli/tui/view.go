@@ -403,7 +403,7 @@ func (m Model) workingCount() int {
 
 // renderProgress draws the completion progress bar (done/total issues) via the
 // bubbles progress widget, rendered statically with ViewAs so Update carries
-// none of its animation state, plus a rough "$ spent" estimate.
+// none of its animation state, plus a rough "est. $" cost estimate.
 func (m Model) renderProgress() string {
 	var frac float64
 	if m.totalIssues > 0 {
@@ -411,17 +411,27 @@ func (m Model) renderProgress() string {
 	}
 	bar := m.progress.ViewAs(frac)
 	label := dimStyle.Render(fmt.Sprintf("  %d/%d done", m.doneCount, m.totalIssues))
-	cost := costStyle.Render(fmt.Sprintf("   ~$%.2f spent", estimateCostUSD(m.tokensIn, m.tokensOut)))
+	cost := costStyle.Render(fmt.Sprintf("   est. $%.2f", estimateCostUSD(m.laneTokens)))
 	return lipgloss.JoinHorizontal(lipgloss.Center, bar, label, cost)
 }
 
 // renderFooter draws the pinned bottom bar: a thin full-width rule, then the
-// key hints (bubbles help, short form) on the left with a "mode · selection"
-// context flush right.
+// key hints (bubbles help, short form) on the left with a "mode · selection ·
+// status" context flush right.
 func (m Model) renderFooter(cw int) string {
+	// ViewMode() is a stable identifier other tests assert on verbatim
+	// ("kanban"); the tab bar and help hint both say "board" (P6), so the
+	// footer's user-facing mode label is remapped here rather than changing
+	// ViewMode()'s contract.
 	ctx := m.ViewMode()
+	if ctx == "kanban" {
+		ctx = "board"
+	}
 	if m.selected != "" {
 		ctx += " · " + m.selected
+		if is, ok := m.issuesByIdent[m.selected]; ok {
+			ctx += " · " + is.BoardStatus
+		}
 	}
 	line := padBetween(footerStyle.Render(m.help.View(m.keys)), dimStyle.Render(ctx), cw)
 	return lipgloss.JoinVertical(lipgloss.Left, ruleStyle.Render(strings.Repeat("─", cw)), line)

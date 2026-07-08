@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 
@@ -175,5 +176,106 @@ func TestHeader_UnmirroredChip(t *testing.T) {
 	m, _ = m.Update(SnapshotMsg{Snap: store.Snapshot{}})
 	if view := m.View(); strings.Contains(view, "unmirrored") {
 		t.Errorf("View() shows an unmirrored chip at zero pending writes")
+	}
+}
+
+// TestPRNumber asserts the trailing PR number extraction used by the DONE
+// summary (P6): a GitHub PR URL yields "#<n>", anything else yields "".
+func TestPRNumber(t *testing.T) {
+	tests := []struct {
+		url  string
+		want string
+	}{
+		{"https://github.com/xlyk/demo/pull/38", "#38"},
+		{"https://github.com/xlyk/demo/pull/38/", ""},
+		{"https://github.com/xlyk/demo", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := prNumber(tt.url); got != tt.want {
+			t.Errorf("prNumber(%q) = %q, want %q", tt.url, got, tt.want)
+		}
+	}
+}
+
+// TestRenderDoneSummary_IncludesPRNumbers asserts the DONE line pairs each
+// completed identifier with its merged PR number when a run carried one (P6).
+func TestRenderDoneSummary_IncludesPRNumbers(t *testing.T) {
+	pr := `{"outcome":"done","summary":"merged","pr_url":"https://github.com/xlyk/demo/pull/38"}`
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			{
+				Issue: store.Issue{ID: "i-1", Identifier: "CLI-52", LaneLabel: "coder", BoardStatus: "done"},
+				Runs: []store.Run{
+					{RunID: "r1", IssueID: "i-1", Lane: "coder", Status: "done", ResultJSON: sql.NullString{String: pr, Valid: true}},
+				},
+			},
+		},
+	}
+	m := NewModel()
+	m, _ = m.Update(SnapshotMsg{Snap: snap})
+
+	done := m.renderDoneSummary(100)
+	if !strings.Contains(done, "CLI-52 #38") {
+		t.Errorf("renderDoneSummary = %q, want it to contain %q", done, "CLI-52 #38")
+	}
+}
+
+// TestKanbanCard_LiveShowsSpinnerAndActiveLane asserts a live kanban card
+// animates (spinner glyph) and badges the lane actually working it, not the
+// home label — so the board tab visibly runs (P6).
+func TestKanbanCard_LiveShowsSpinnerAndActiveLane(t *testing.T) {
+	m := NewModel()
+	live := Row{Identifier: "CLI-1", LaneLabel: "coder", Status: "review", Live: true, ActiveLane: "reviewer"}
+	card := m.renderKanbanCard(live)
+	if !strings.Contains(card, "reviewer") {
+		t.Errorf("live card = %q, want the active lane %q badged", card, "reviewer")
+	}
+	if !strings.Contains(card, spinnerFrames[0]) {
+		t.Errorf("live card = %q, want spinner frame %q", card, spinnerFrames[0])
+	}
+
+	parked := Row{Identifier: "CLI-2", LaneLabel: "coder", Status: "review"}
+	card = m.renderKanbanCard(parked)
+	if strings.Contains(card, spinnerFrames[0]) {
+		t.Errorf("parked card = %q, want no spinner", card)
+	}
+	if !strings.Contains(card, "coder") {
+		t.Errorf("parked card = %q, want the home lane %q", card, "coder")
+	}
+}
+
+// TestFooter_ShowsSelectedStatus asserts the footer context names the
+// selected row's column: "dashboard · CLI-1 · review" (P6).
+func TestFooter_ShowsSelectedStatus(t *testing.T) {
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			{Issue: store.Issue{ID: "i-1", Identifier: "CLI-1", LaneLabel: "coder", BoardStatus: "review"}},
+		},
+	}
+	m := NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: snap})
+
+	footer := m.renderFooter(100)
+	if !strings.Contains(footer, "CLI-1 · review") {
+		t.Errorf("renderFooter = %q, want it to contain %q", footer, "CLI-1 · review")
+	}
+}
+
+// TestFooter_BoardModeLabelMatchesTab asserts the footer's mode label reads
+// "board" on the kanban screen (P6), matching the tab bar / help hint — not
+// the internal "kanban" identifier ViewMode() still returns for other tests.
+func TestFooter_BoardModeLabelMatchesTab(t *testing.T) {
+	m := NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	footer := m.renderFooter(100)
+	if !strings.Contains(footer, "board") {
+		t.Errorf("renderFooter = %q, want it to contain %q", footer, "board")
+	}
+	if strings.Contains(footer, "kanban") {
+		t.Errorf("renderFooter = %q, want it NOT to contain %q", footer, "kanban")
 	}
 }

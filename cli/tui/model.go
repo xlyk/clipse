@@ -138,6 +138,9 @@ type Model struct {
 	// issue's full run history — the activity feed uses it to badge each
 	// event with the lane that produced it (P3).
 	laneByRunID map[string]string
+	// laneTokens sums cumulative token usage ({in, out}) per lane across
+	// every run of every issue, for the header's two-rate cost estimate.
+	laneTokens map[string][2]int
 
 	tokensIn  int
 	tokensOut int
@@ -516,6 +519,7 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.identByID = make(map[string]string, len(snap.Issues))
 	m.statusByID = make(map[string]string, len(snap.Issues))
 	m.laneByRunID = make(map[string]string)
+	m.laneTokens = make(map[string][2]int)
 
 	for _, is := range sortedIssueSnapshots(snap.Issues) {
 		// A held claim means a worker is actively on this card now, in whatever
@@ -550,6 +554,10 @@ func (m *Model) fold(snap store.Snapshot) {
 		m.statusByID[is.ID] = is.BoardStatus
 		for _, r := range is.Runs {
 			m.laneByRunID[r.RunID] = r.Lane
+			t := m.laneTokens[r.Lane]
+			t[0] += r.TokensIn
+			t[1] += r.TokensOut
+			m.laneTokens[r.Lane] = t
 		}
 
 		switch is.BoardStatus {

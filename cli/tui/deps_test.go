@@ -90,14 +90,28 @@ func TestBlockers(t *testing.T) {
 	}
 }
 
-// TestEstimateCostUSD asserts the blended display-rate cost math.
+// TestEstimateCostUSD asserts the two-rate-class display cost math (P6):
+// reviewer tokens price at Opus-class rates, every other lane at
+// Sonnet-class. Still an estimate — the honest fix (persisting runs.model)
+// is deferred to U6 — but no longer silently 5× low on reviewer tokens.
 func TestEstimateCostUSD(t *testing.T) {
-	// 1M input @ $3 + 1M output @ $15 = $18.00.
-	if got := estimateCostUSD(1_000_000, 1_000_000); math.Abs(got-18.0) > 1e-9 {
-		t.Errorf("estimateCostUSD(1M,1M) = %f, want 18.0", got)
+	// 1M coder input @ $3 + 1M coder output @ $15 = $18.00.
+	coderOnly := map[string][2]int{"coder": {1_000_000, 1_000_000}}
+	if got := estimateCostUSD(coderOnly); math.Abs(got-18.0) > 1e-9 {
+		t.Errorf("estimateCostUSD(coder 1M/1M) = %f, want 18.0", got)
 	}
-	if got := estimateCostUSD(0, 0); got != 0 {
-		t.Errorf("estimateCostUSD(0,0) = %f, want 0", got)
+	// 1M reviewer input @ $15 + 1M reviewer output @ $75 = $90.00.
+	reviewerOnly := map[string][2]int{"reviewer": {1_000_000, 1_000_000}}
+	if got := estimateCostUSD(reviewerOnly); math.Abs(got-90.0) > 1e-9 {
+		t.Errorf("estimateCostUSD(reviewer 1M/1M) = %f, want 90.0", got)
+	}
+	// The agent: prefix normalizes away, matching bareLane's contract.
+	prefixed := map[string][2]int{"agent:reviewer": {1_000_000, 0}}
+	if got := estimateCostUSD(prefixed); math.Abs(got-15.0) > 1e-9 {
+		t.Errorf("estimateCostUSD(agent:reviewer 1M in) = %f, want 15.0", got)
+	}
+	if got := estimateCostUSD(nil); got != 0 {
+		t.Errorf("estimateCostUSD(nil) = %f, want 0", got)
 	}
 }
 

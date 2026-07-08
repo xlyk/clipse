@@ -42,7 +42,7 @@ func defaultKeyMap() keyMap {
 		),
 		Kanban: key.NewBinding(
 			key.WithKeys("tab", "v"),
-			key.WithHelp("tab", "kanban"),
+			key.WithHelp("tab", "board"),
 		),
 		Help: key.NewBinding(
 			key.WithKeys("?"),

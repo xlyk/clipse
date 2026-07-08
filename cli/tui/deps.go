@@ -78,16 +78,32 @@ func shortID(id string) string {
 	return id
 }
 
-// Rough, display-only blended token prices (Sonnet-class $/token). These exist
-// solely to turn cumulative token counts into a ballpark "$ spent" figure in
-// the header; they are NOT billing-accurate and are intentionally coarse.
+// Rough, display-only per-lane token prices ($/token). The coder lanes run a
+// Sonnet-class model and the reviewer an Opus-class one by default (see
+// AGENTS.md "Model config"); pricing the two classes separately keeps the
+// header estimate within the right order of magnitude instead of silently
+// ~5× low on reviewer tokens. Still NOT billing-accurate (the honest fix —
+// persisting runs.model — is deferred to U6), which is why the header labels
+// it "est.". git_operator is deterministic Go and records no tokens.
 const (
-	costPerInputToken  = 3.0 / 1_000_000  // ~$3 per 1M input tokens
-	costPerOutputToken = 15.0 / 1_000_000 // ~$15 per 1M output tokens
+	sonnetInPerTok  = 3.0 / 1_000_000  // ~$3 per 1M input tokens
+	sonnetOutPerTok = 15.0 / 1_000_000 // ~$15 per 1M output tokens
+	opusInPerTok    = 15.0 / 1_000_000 // ~$15 per 1M input tokens
+	opusOutPerTok   = 75.0 / 1_000_000 // ~$75 per 1M output tokens
 )
 
-// estimateCostUSD returns a rough dollar estimate for the given cumulative
-// token totals using the blended display rates above.
-func estimateCostUSD(tokensIn, tokensOut int) float64 {
-	return float64(tokensIn)*costPerInputToken + float64(tokensOut)*costPerOutputToken
+// estimateCostUSD prices per-lane cumulative token sums ({in, out} pairs
+// keyed by lane) with the two display rate classes: reviewer tokens at
+// Opus-class rates, every other lane at Sonnet-class.
+func estimateCostUSD(laneTokens map[string][2]int) float64 {
+	total := 0.0
+	for lane, t := range laneTokens {
+		in, out := float64(t[0]), float64(t[1])
+		if bareLane(lane) == "reviewer" {
+			total += in*opusInPerTok + out*opusOutPerTok
+		} else {
+			total += in*sonnetInPerTok + out*sonnetOutPerTok
+		}
+	}
+	return total
 }
