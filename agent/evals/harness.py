@@ -23,6 +23,7 @@ from clipse_agent.graphs.coder import build_coder_graph
 from clipse_agent.graphs.reviewer import build_reviewer_graph
 from clipse_agent.profiles.coder import get_coder_docs_profile, get_coder_profile
 from clipse_agent.profiles.reviewer import get_reviewer_profile
+from clipse_agent.transcript import TranscriptWriter
 
 # Override the lane model for a whole eval run, e.g.
 #   CLIPSE_EVAL_MODEL=openai_codex:gpt-5-codex make eval
@@ -133,10 +134,12 @@ def run_coder_turn(
     review_feedback: str = "",
     max_tokens: int = 400_000,
     thread_id: str = "eval-thread",
+    transcript_path: str = "",
 ) -> WorkerResult:
     graph = build_coder_graph(
         profile=get_coder_profile(EVAL_MODEL),
         docs_profile=get_coder_docs_profile(EVAL_MODEL),
+        transcript=TranscriptWriter(transcript_path) if transcript_path else None,
     )
     state = _input_state(repo, issue_text, max_tokens=max_tokens, thread_id=thread_id)
     if review_feedback:
