@@ -177,6 +177,55 @@ func TestNormalizeCandidateIssues_CancelledStateTypeOverridesName(t *testing.T) 
 	}
 }
 
+func TestNormalizeCandidateIssues_TerminalBlockersDroppedFromDeps(t *testing.T) {
+	// A blocker that is already completed or canceled in Linear is satisfied
+	// at ingest and must not appear in Deps at all. Blockers outside the
+	// candidate set (unlabeled teammates' tickets, shipped work) are never
+	// ingested, so a dep pointing at one can never become terminal on the
+	// board -- promote would hold the child in todo forever (2026-07-08
+	// Spacelift relaunch: SPA-872 stuck behind Done-but-unlabeled SPA-868).
+	// A live blocker (unstarted/started) stays in Deps; a blocker with NO
+	// state in the payload stays too (unknown = conservatively live).
+	const raw = `{
+		"data": {
+			"issues": {
+				"nodes": [
+					{
+						"id": "child-1",
+						"identifier": "SPA-872",
+						"title": "Child",
+						"description": "",
+						"priority": 3,
+						"branchName": "spa-872",
+						"updatedAt": "2026-07-01T16:00:00.000Z",
+						"state": { "name": "Todo", "type": "unstarted" },
+						"labels": { "nodes": [{ "name": "agent:coder" }] },
+						"inverseRelations": { "nodes": [
+							{ "type": "blocks", "issue": { "id": "done-blocker", "state": { "type": "completed" } } },
+							{ "type": "blocks", "issue": { "id": "cancelled-blocker", "state": { "type": "canceled" } } },
+							{ "type": "blocks", "issue": { "id": "live-blocker", "state": { "type": "started" } } },
+							{ "type": "blocks", "issue": { "id": "stateless-blocker" } }
+						] }
+					}
+				]
+			}
+		}
+	}`
+
+	issues, err := linear.NormalizeCandidateIssues([]byte(raw), "agent:")
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: unexpected error: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("len(issues) = %d, want 1", len(issues))
+	}
+	wantDeps := []string{"live-blocker", "stateless-blocker"}
+	got := issues[0].Deps
+	if len(got) != len(wantDeps) || got[0] != wantDeps[0] || got[1] != wantDeps[1] {
+		t.Errorf("Deps = %v, want %v (terminal blockers satisfied at ingest)", got, wantDeps)
+	}
+}
+
 func TestNormalizeCandidateIssues_CompletedStateTypeOverridesName(t *testing.T) {
 	// A completed-type state with a team-specific NAME ("Ready for Release",
 	// as on the Spacelift team) must read as done, not fall back to todo --

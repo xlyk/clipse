@@ -15,7 +15,7 @@ type gqlRequest struct {
 }
 
 func TestBuildCandidateIssuesRequest(t *testing.T) {
-	body, err := linear.BuildCandidateIssuesRequest("CLI")
+	body, err := linear.BuildCandidateIssuesRequest("CLI", "agent:")
 	if err != nil {
 		t.Fatalf("BuildCandidateIssuesRequest: unexpected error: %v", err)
 	}
@@ -34,9 +34,30 @@ func TestBuildCandidateIssuesRequest(t *testing.T) {
 	if !strings.Contains(linear.CandidateIssuesQuery, "inverseRelations") {
 		t.Errorf("candidate query must fetch inverseRelations for dependency edges")
 	}
-	wantVars := map[string]any{"teamKey": "CLI"}
-	if len(req.Variables) != len(wantVars) || req.Variables["teamKey"] != wantVars["teamKey"] {
-		t.Errorf("Variables = %v, want %v (query filters to the configured team)", req.Variables, wantVars)
+	// The lane label is the opt-in gate and must be enforced SERVER-side:
+	// without a label filter the query returns Linear's default first page
+	// (50 nodes) of ALL team issues, so on a big shared board a labeled
+	// ticket outside that window silently never ingests (2026-07-08
+	// Spacelift relaunch: 854/850 missing from an 8/10 board), and the
+	// Go-side lane guard filters an arbitrary 50, not the opted-in set.
+	if !strings.Contains(linear.CandidateIssuesQuery, "labels: { some: { name: { startsWith: $labelPrefix } } }") {
+		t.Errorf("candidate query must filter by the lane-label prefix server-side")
+	}
+	// Belt for boards bigger than Linear's default page: fetch the maximum
+	// page. With the label filter this bounds CLIPSE-LABELED issues, not
+	// team size.
+	if !strings.Contains(linear.CandidateIssuesQuery, "first: 250") {
+		t.Errorf("candidate query must request the maximum page size")
+	}
+	// Dependency gating needs each blocker's terminal-ness even when the
+	// blocker itself is not a clipse candidate (unlabeled, already shipped):
+	// the inverse relation must carry the blocker's state type.
+	if !strings.Contains(linear.CandidateIssuesQuery, "state {\n            type") && !strings.Contains(linear.CandidateIssuesQuery, "state { type }") {
+		t.Errorf("candidate query must fetch each blocker's state type on inverseRelations")
+	}
+	wantVars := map[string]any{"teamKey": "CLI", "labelPrefix": "agent:"}
+	if len(req.Variables) != len(wantVars) || req.Variables["teamKey"] != wantVars["teamKey"] || req.Variables["labelPrefix"] != wantVars["labelPrefix"] {
+		t.Errorf("Variables = %v, want %v (team + label-prefix scoping)", req.Variables, wantVars)
 	}
 }
 

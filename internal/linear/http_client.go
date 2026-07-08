@@ -73,8 +73,22 @@ const cancelledRecencyDays = 14
 // Filtering to team.key scopes the candidate set to the single team clipse is
 // configured against (config.Config.TeamKey), so a workspace with other
 // teams' issues never surfaces them as candidates.
-var CandidateIssuesQuery = fmt.Sprintf(`query CandidateIssues($teamKey: String!) {
-  issues(filter: { team: { key: { eq: $teamKey } }, or: [
+//
+// The labels filter scopes candidates SERVER-side to issues carrying a
+// "<labelPrefix>..." lane label -- the opt-in gate. Without it the query
+// returns Linear's default first page (50 nodes) of ALL team issues, so on
+// a big shared board a labeled ticket outside that window silently never
+// ingests, and the Go-side lane guard (dispatcher/poll.go) filters an
+// arbitrary 50 rather than the opted-in set (2026-07-08 Spacelift
+// relaunch). first: 250 (Linear's max page) is the belt on top: with the
+// label filter it bounds clipse-labeled issues, not team size.
+//
+// inverseRelations carries each blocker's state.type so normalization can
+// drop already-terminal blockers from Deps at ingest -- a blocker outside
+// the candidate set (unlabeled, shipped) never reaches the board, so a dep
+// on one could otherwise never be satisfied.
+var CandidateIssuesQuery = fmt.Sprintf(`query CandidateIssues($teamKey: String!, $labelPrefix: String!) {
+  issues(first: 250, filter: { team: { key: { eq: $teamKey } }, labels: { some: { name: { startsWith: $labelPrefix } } }, or: [
     { state: { type: { nin: ["completed", "canceled"] } } },
     { state: { type: { eq: "canceled" } }, updatedAt: { gt: "-P%dD" } }
   ] }) {
@@ -100,6 +114,7 @@ var CandidateIssuesQuery = fmt.Sprintf(`query CandidateIssues($teamKey: String!)
           type
           issue {
             id
+            state { type }
           }
         }
       }
@@ -151,11 +166,13 @@ type graphqlResponse struct {
 }
 
 // BuildCandidateIssuesRequest builds the request body for CandidateIssuesQuery,
-// scoped to teamKey. Factored out from the HTTP call so tests can assert the
-// exact payload without sending anything.
-func BuildCandidateIssuesRequest(teamKey string) ([]byte, error) {
+// scoped to teamKey and to issues carrying a labelPrefix-prefixed lane label.
+// Factored out from the HTTP call so tests can assert the exact payload
+// without sending anything.
+func BuildCandidateIssuesRequest(teamKey, labelPrefix string) ([]byte, error) {
 	return marshalGraphQLRequest(CandidateIssuesQuery, map[string]any{
-		"teamKey": teamKey,
+		"teamKey":     teamKey,
+		"labelPrefix": labelPrefix,
 	})
 }
 
@@ -248,7 +265,7 @@ func newHTTPClient(baseURL, teamKey, teamID, labelPrefix string) (*HTTPClient, e
 // CandidateIssues runs CandidateIssuesQuery, scoped to c's configured team,
 // and normalizes the response.
 func (c *HTTPClient) CandidateIssues(ctx context.Context) ([]Issue, error) {
-	reqBody, err := BuildCandidateIssuesRequest(c.teamKey)
+	reqBody, err := BuildCandidateIssuesRequest(c.teamKey, c.labelPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("candidate issues: %w", err)
 	}

@@ -79,7 +79,7 @@ func TestHTTPClient_CandidateIssues_ParsesLoopbackResponse(t *testing.T) {
 
 	// The candidate-issues query must filter to the client's configured
 	// team, not the whole Linear workspace.
-	want, err := linear.BuildCandidateIssuesRequest(testTeamKey)
+	want, err := linear.BuildCandidateIssuesRequest(testTeamKey, "agent:")
 	if err != nil {
 		t.Fatalf("BuildCandidateIssuesRequest: unexpected error: %v", err)
 	}
