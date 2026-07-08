@@ -1,10 +1,11 @@
-"""Eval-suite fixtures: gh shim on PATH, per-case metrics recording."""
+"""Eval-suite fixtures: gh shim on PATH, per-run metrics recording."""
 from __future__ import annotations
 
 import json
 import os
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,14 @@ from clipse_agent.contract import WorkerResult
 
 _SHIM_DIR = Path(__file__).parent / "gh_shim"
 _RESULTS_DIR = Path(__file__).parent / "results"
+
+# Lazily created on first append: one file per pytest session, with
+# latest.jsonl re-pointed at it. A symlink (not truncation) because run
+# history is the point -- R7's flip count and C2's budget tuning are
+# explicitly cross-run metrics; latest.jsonl stays the stable path docs
+# reference. Module-global (not a fixture) so the status-row hook below can
+# reach it without fixture plumbing.
+_RUN_FILE: Path | None = None
 
 
 @pytest.fixture
@@ -29,14 +38,33 @@ def eval_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return gh_dir
 
 
+def _run_file() -> Path:
+    global _RUN_FILE
+    if _RUN_FILE is None:
+        _RESULTS_DIR.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # PID suffix: two pytest processes started in the same second (e.g.
+        # a manual -k run alongside a cron sweep) must not collide on one
+        # run file.
+        _RUN_FILE = _RESULTS_DIR / f"run-{stamp}-{os.getpid()}.jsonl"
+        _RUN_FILE.touch()
+        latest = _RESULTS_DIR / "latest.jsonl"
+        latest.unlink(missing_ok=True)  # also clears a leftover v1 regular file
+        latest.symlink_to(_RUN_FILE.name)  # relative target: results/ is self-contained
+    return _RUN_FILE
+
+
+def _append_row(row: dict[str, Any]) -> None:
+    with _run_file().open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
 @pytest.fixture
 def record_result(request: pytest.FixtureRequest) -> Callable[..., None]:
-    """Append one JSONL metrics row per eval case to results/latest.jsonl."""
-    _RESULTS_DIR.mkdir(exist_ok=True)
-    out = _RESULTS_DIR / "latest.jsonl"
+    """Append one JSONL metrics row per recorded result to this session's run file."""
 
     def _record(result: WorkerResult, **extra: Any) -> None:
-        row = {
+        _append_row({
             "test": request.node.nodeid,
             "ts": time.time(),
             "outcome": result.outcome.value,
@@ -45,8 +73,24 @@ def record_result(request: pytest.FixtureRequest) -> Callable[..., None]:
             "tokens_out": result.tokens.out,
             "turn_count": result.turn_count,
             **extra,
-        }
-        with out.open("a") as f:
-            f.write(json.dumps(row) + "\n")
+        })
 
     return _record
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
+    """Append one status row per eval-marked case: pass/fail/skip + pytest's
+    authoritative wall-clock duration. record_result rows run BEFORE the
+    case's asserts and cannot know pass/fail; this hook can."""
+    outcome = yield
+    rep = outcome.get_result()
+    if item.get_closest_marker("eval") is None:
+        return
+    if rep.when == "call" or (rep.when == "setup" and rep.skipped):
+        _append_row({
+            "test": item.nodeid,
+            "ts": time.time(),
+            "status": rep.outcome,  # passed / failed / skipped
+            "duration_s": round(rep.duration, 1),
+        })

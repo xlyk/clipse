@@ -18,15 +18,6 @@ re-tests DAC engine mechanics (upstream `langchain-ai/deepagents`
 - Cost: a full run is a handful of coder/reviewer turns on the default
   lane models — order of a few dollars.
 
-## Model matrix
-
-`CLIPSE_EVAL_MODEL` overrides the lane model for the whole run:
-
-    CLIPSE_EVAL_MODEL=openai_codex:gpt-5-codex make eval
-
-(codex manages its own OAuth credential at `~/.deepagents/.state/`; the
-anthropic key skip-guard does not apply.)
-
 ## How it works
 
 Fixture repos are real git: a local bare repo is the `origin` remote, so
@@ -38,14 +29,47 @@ CommandRunner and the DAC agent's own shell. Graders are deterministic:
 outcome enums, git state (commits, merge parents, conflict markers), token
 budgets, and shim logs.
 
-Per-case metrics (outcome, tokens, wall time) append to
-`results/latest.jsonl` (gitignored) via the `record_result` fixture.
+Per-case metrics append to `results/run-<utc-ts>.jsonl` (one file per pytest
+session, gitignored); `results/latest.jsonl` is a symlink to the newest run.
+A status row per case (pass/fail/skip + wall time) is appended by a conftest
+hook. Summarize the newest run with `make eval-report` (or
+`uv run python evals/report.py path/to/run.jsonl` for an older one).
 
 LangSmith: traces flow automatically when the standard `LANGSMITH_*` env
 vars are set; no code here depends on it.
 
-## Deferred (v2)
+## Model matrix & cadence
 
-Inline-comment placement validity (needs live GitHub), reviewer-summary
-actionability + coder↔reviewer convergence loops, docs-accuracy LLM judge,
-nightly runs, failure-archive→eval-case pipeline.
+`CLIPSE_EVAL_MODEL` overrides the lane model for the whole run:
+
+    CLIPSE_EVAL_MODEL=openai_codex:gpt-5.1-codex make eval
+
+Codex prerequisite (once per host, as the dispatcher's OS user): interactive
+ChatGPT sign-in via `uv --project agent run dcode` -> `/auth` -> `openai_codex`;
+the token lands at `~/.deepagents/.state/chatgpt-auth.json` and auto-refreshes
+(see AGENTS.md). The anthropic skip guard does not apply to lane turns on a
+codex run -- but D3's docs-accuracy judge is PINNED to
+`anthropic:claude-haiku-4-5` so verdicts stay comparable across the matrix:
+without `ANTHROPIC_API_KEY` in the env, D3 skips and everything else runs.
+
+Recommended cadence (no automation infra -- deliberate):
+
+- **Nightly local:** a cron/launchd line on the dev machine, e.g.
+  `cd ~/Code/clipse && source ~/.secrets && make eval && make eval-report`
+  once for the default lane models, optionally a second run with
+  `CLIPSE_EVAL_MODEL` for the codex matrix. Runs are cheap enough to eyeball
+  the next morning via `results/run-*.jsonl`.
+- **Manual pre-release:** before tagging or bumping a lane model / the DAC
+  pin, run the full suite on both the default models and each configured
+  matrix model, and compare `rounds_to_done` / token totals against the last
+  few run files.
+
+Cost: full default-model run is on the order of $10-20 (the L2 convergence
+cases dominate -- each is 2-6 live turns with reviewer rounds on opus).
+Filter with `-k` when iterating on one case.
+
+## Deferred
+
+R5 as a pytest eval (placement is smoke-side: `scripts/smoke/check-placement.py`),
+`langsmith[pytest]` judge feedback, nightly automation infra,
+failure-archive->eval-case pipeline.
