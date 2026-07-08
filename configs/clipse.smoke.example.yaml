@@ -27,12 +27,22 @@ caps:
     git_operator: 2
 
 turn_cap: 3
-max_runtime_s: 900
+max_runtime_s: 1800
 max_tokens_per_run: 2000000
 lane_label_prefix: "agent:"
 max_attempts: 3
 rework_cap: 3
 recover_cap: 5
+
+# per-lane model overrides (from smoke.env MODEL_* vars, omitted if unset)
+# models:
+#   coder: "anthropic:claude-sonnet-4-6"
+#   coder_docs: "anthropic:claude-sonnet-4-6"
+#   reviewer: "anthropic:claude-opus-4-6"
+
+# appended verbatim from EXTRA_CONFIG_YAML, e.g. for model_params: / shell_allow_list:
+# model_params:
+#   coder: { reasoning_effort: high }
 
 worker:
   command:
