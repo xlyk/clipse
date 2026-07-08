@@ -91,9 +91,11 @@ var (
 )
 
 // section describes one dashboard group: its title, the accent color that
-// tints its border + heading, the glyph that leads each of its rows, whether
-// its rows show a live elapsed/spinner (only RUNNING does), and whether it is
-// the QUEUED group (whose rows get a dependency "waiting on …" hint).
+// tints its border + heading, the glyph that leads each of its rows, and
+// whether it is the QUEUED group (whose rows get a dependency "waiting on …"
+// hint) or the ACTIVE group (whose unclaimed rows render dim — see dimIdle).
+// Liveness itself (elapsed/spinner) is per-row, not a section-wide flag — see
+// Row.Live.
 type section struct {
 	title  string
 	accent lipgloss.AdaptiveColor
@@ -103,6 +105,10 @@ type section struct {
 	// dependency hint instead of run metadata. (Liveness is per-row — see
 	// Row.Live — not a section-wide flag.)
 	waiting bool
+	// dimIdle marks the ACTIVE section, whose unclaimed rows (no live
+	// worker) render dim with a ◇ lead so the eye lands on the live rows
+	// first.
+	dimIdle bool
 }
 
 // layoutDims is the per-frame geometry derived purely from the terminal size
@@ -190,7 +196,7 @@ func (m Model) View() string {
 func (m Model) renderDashboard(now int64) string {
 	d := m.dims()
 
-	// Rebuild the pipeline content with the live now so RUNNING rows' elapsed
+	// Rebuild the pipeline content with the live now so live rows' elapsed
 	// timers tick every frame; layout() already sized/clamped the viewport off
 	// the now=0 content (elapsed is inline, so the line counts match).
 	pipeVp := m.bodyVp
@@ -289,8 +295,8 @@ func (m Model) renderHeader(cw int, now int64) string {
 	)
 
 	chips := lipgloss.JoinHorizontal(lipgloss.Center,
-		countChip("▶", "running", m.count("running"), cGreen), "   ",
-		countChip("◐", "in flight", m.inFlightCount(), cCyan), "   ",
+		countChip("⚡", "working", m.workingCount(), cGreen), "   ",
+		countChip("◇", "waiting", m.waitingCount(), cCyan), "   ",
 		countChip("•", "queued", m.count("ready")+m.count("todo"), cAmber), "   ",
 		countChip("✖", "blocked", m.count("blocked"), cRed), "   ",
 		countChip("✓", "done", m.count("done"), cPurple),
@@ -434,9 +440,18 @@ func (m Model) renderHelpScreen(now int64) string {
 // count returns the board-wide number of issues in a given board_status.
 func (m Model) count(status string) int { return m.counts[status] }
 
-// inFlightCount sums the downstream active columns for the header chip.
-func (m Model) inFlightCount() int {
-	return m.count("review") + m.count("rework") + m.count("merging")
+// waitingCount is the number of ACTIVE rows no worker currently holds —
+// cards parked in a working column (running/review/rework/merging) awaiting
+// their next claim. Together with workingCount it partitions the ACTIVE
+// section, so the header chips and the section rows agree by construction.
+func (m Model) waitingCount() int {
+	n := 0
+	for _, r := range m.active {
+		if !r.Live {
+			n++
+		}
+	}
+	return n
 }
 
 // countChip renders a "glyph N label" stat chip in the given accent color.

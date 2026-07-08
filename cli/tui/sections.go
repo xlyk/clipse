@@ -7,16 +7,15 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// sectionList returns the four dashboard groups in render/navigation order.
+// sectionList returns the dashboard groups in render/navigation order.
 // The order here MUST match fold's construction of m.ordered and
-// orderedLineIndex's geometry, since the selection cursor walks all three in
+// orderedLineIndex's geometry, since the selection cursor walks them in
 // lockstep.
 func (m Model) sectionList() []section {
 	return []section{
-		{"RUNNING", cGreen, "▶", m.running, false},
-		{"IN FLIGHT", cCyan, "◐", m.inFlight, false},
-		{"BLOCKED", cRed, "✖", m.blocked, false},
-		{"QUEUED", cAmber, "•", m.queued, true},
+		{title: "ACTIVE", accent: cGreen, glyph: "⚡", rows: m.active, dimIdle: true},
+		{title: "BLOCKED", accent: cRed, glyph: "✖", rows: m.blocked},
+		{title: "QUEUED", accent: cAmber, glyph: "•", rows: m.queued, waiting: true},
 	}
 }
 
@@ -98,14 +97,21 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 
 	// Liveness is per-row (an active claim = a worker on it now), so the
 	// spinner lights up for a working agent in ANY lane — reviewer or
-	// git_operator — not only the coder-lane "running" section.
+	// git_operator — not only the coder. An unclaimed ACTIVE row is parked
+	// awaiting its next pickup: dim diamond, dim identifier (P2).
 	lead := lipgloss.NewStyle().Foreground(s.accent).Render(s.glyph)
-	if row.Live {
+	switch {
+	case row.Live:
 		lead = lipgloss.NewStyle().Foreground(cGreen).Render(spinnerFrames[m.frame%len(spinnerFrames)])
+	case s.dimIdle:
+		lead = dimStyle.Render("◇")
 	}
 
 	idText := fmt.Sprintf("%-9s", row.Identifier)
 	idCell := idStyle.Render(idText)
+	if s.dimIdle && !row.Live {
+		idCell = dimStyle.Render(idText)
+	}
 	if selected {
 		idCell = selIDStyle.Render(idText)
 	}

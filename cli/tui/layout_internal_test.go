@@ -91,9 +91,9 @@ func TestRenderBody_OmitsEmptySections(t *testing.T) {
 }
 
 // TestOrderedLineIndex_MatchesRenderBodyOnSparseBoard pins the render/index
-// lockstep on a MIXED board: RUNNING and QUEUED are populated while the two
-// sections BETWEEN them (IN FLIGHT, BLOCKED) are empty, so the empty-section
-// skip fires mid-walk. For every ordered row, orderedLineIndex must return
+// lockstep on a MIXED board: ACTIVE and QUEUED are populated while the
+// section BETWEEN them (BLOCKED) is empty, so the empty-section skip fires
+// mid-walk. For every ordered row, orderedLineIndex must return
 // the exact line of that row inside renderBody's "\n"-joined output — the
 // geometry ensureSelectionVisible scrolls by. A drift between the two skip
 // predicates breaks j/k selection-follow, which is this task's main risk.

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"sort"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -97,13 +98,16 @@ type Row struct {
 // error) — never a live store handle — so Update stays pure and unit-testable
 // without a DB or TTY.
 type Model struct {
-	running  []Row
-	blocked  []Row
-	queued   []Row // ready + todo, in that order
-	inFlight []Row // review + rework + merging, in that order
+	// active is every issue in play right now — the working columns
+	// running/review/rework/merging folded into one section (P2): live-claim
+	// rows first (a worker is on them at this moment), then unclaimed rows
+	// waiting for their next pickup.
+	active  []Row
+	blocked []Row
+	queued  []Row // ready + todo, in that order
 
 	// ordered is every visible row flattened in section order
-	// (running→in flight→blocked→queued), the list the selection cursor walks.
+	// (active→blocked→queued), the list the selection cursor walks.
 	ordered []Row
 	// byStatus groups rows by exact board_status, the source for the kanban
 	// columns (including terminal "done", which the stacked view omits).
@@ -195,16 +199,15 @@ func NewModel(opts ...Option) Model {
 	return m
 }
 
-// Running, Blocked, Queued, and InFlight expose the current display-ready
-// rows for each dashboard section. Queued folds "ready" and "todo" issues
-// together; InFlight folds every active downstream lane-entry column
-// (review/rework/merging) together, labeled per-row by its
-// own column (Row.Status) since — unlike the other three sections — it
-// spans more than one board_status value.
-func (m Model) Running() []Row  { return m.running }
-func (m Model) Blocked() []Row  { return m.blocked }
-func (m Model) Queued() []Row   { return m.queued }
-func (m Model) InFlight() []Row { return m.inFlight }
+// Active, Blocked, and Queued expose the current display-ready rows for each
+// dashboard section. Active folds every working column
+// (running/review/rework/merging) together — live-claim rows first, then
+// unclaimed rows awaiting pickup — labeled per-row by its own column
+// (Row.Status) since it spans more than one board_status value. Queued folds
+// "ready" and "todo" issues together.
+func (m Model) Active() []Row  { return m.active }
+func (m Model) Blocked() []Row { return m.blocked }
+func (m Model) Queued() []Row  { return m.queued }
 
 // TotalTokensIn and TotalTokensOut sum LatestRun token counts across every
 // issue in the snapshot, for the dashboard's header line.
@@ -470,10 +473,9 @@ func scheduleSpinner() tea.Cmd {
 // snap. It is deterministic: same snapshot in, same grouping/totals out,
 // regardless of the snapshot's underlying slice/map iteration order.
 func (m *Model) fold(snap store.Snapshot) {
-	m.running = m.running[:0]
+	m.active = m.active[:0]
 	m.blocked = m.blocked[:0]
 	m.queued = m.queued[:0]
-	m.inFlight = m.inFlight[:0]
 	m.ordered = m.ordered[:0]
 
 	// Board-wide cumulative token spend comes straight from the snapshot's
@@ -520,29 +522,31 @@ func (m *Model) fold(snap store.Snapshot) {
 		m.statusByID[is.ID] = is.BoardStatus
 
 		switch is.BoardStatus {
-		case "running":
-			m.running = append(m.running, row)
+		case "running", "review", "rework", "merging":
+			// The working columns fold into one ACTIVE section (P2): a card
+			// here is either currently claimed (a worker in some lane is on
+			// it right now) or waiting its turn to be claimed — either way it
+			// is in play. "done" deliberately has no case here (and this is
+			// why the switch stays an explicit list rather than a catch-all
+			// default): it's terminal, with nothing left to watch.
+			m.active = append(m.active, row)
 		case "blocked":
 			m.blocked = append(m.blocked, row)
 		case "ready", "todo":
 			m.queued = append(m.queued, row)
-		case "review", "rework", "merging":
-			// Active downstream lane-entry columns: a card here is either
-			// currently claimed (a Reviewer/Git-operator run in
-			// flight) or waiting its turn to be claimed — either way it is
-			// still "in play", not invisible the way an unhandled
-			// board_status previously left it. "done" deliberately has no
-			// case here (and this is why the switch stays an explicit list
-			// rather than a catch-all default): it's terminal, with
-			// nothing left to watch.
-			m.inFlight = append(m.inFlight, row)
 		}
 	}
 
+	// Live rows lead the ACTIVE section (spinner/lane/elapsed), unclaimed
+	// rows trail dim; the stable sort preserves identifier order within each
+	// half (rows arrive identifier-sorted from sortedIssueSnapshots).
+	sort.SliceStable(m.active, func(i, j int) bool {
+		return m.active[i].Live && !m.active[j].Live
+	})
+
 	// ordered is the section-order concatenation the cursor walks; it must
-	// match View's stacked render order (running, in flight, blocked, queued).
-	m.ordered = append(m.ordered, m.running...)
-	m.ordered = append(m.ordered, m.inFlight...)
+	// match View's stacked render order (active, blocked, queued).
+	m.ordered = append(m.ordered, m.active...)
 	m.ordered = append(m.ordered, m.blocked...)
 	m.ordered = append(m.ordered, m.queued...)
 
