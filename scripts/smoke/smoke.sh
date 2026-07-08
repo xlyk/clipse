@@ -691,6 +691,7 @@ verify() {
   local id blockers
   local status done_ts start_ts tokens wall merged_yn branch
   local total_tokens=0
+  local tf itmp iclone out cruns tags
   # (a) + (c) + row rendering.
   while IFS=$'\t' read -r _ id _ blockers _tags; do
     [[ -n "$id" ]] || continue
@@ -748,6 +749,86 @@ verify() {
       fi
     done
   done < <(grep -v '^#' "$MANIFEST")
+
+  # (c2) transcripts: every ticket must have a per-issue transcript with at
+  # least one coder and one coder_docs turn_start (the docs sub-turn is part
+  # of the coder graph's clean path).
+  info "verify: per-ticket transcripts"
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    tf="$BOARD_DIR/logs/$id.transcript.jsonl"
+    if [[ ! -f "$tf" ]]; then
+      err "  $id: missing transcript $tf"
+      fails=$((fails + 1))
+      continue
+    fi
+    if ! jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null | grep -qx "coder"; then
+      err "  $id: transcript has no coder turn_start"
+      fails=$((fails + 1))
+    fi
+    if ! jq -r 'select(.event=="turn_start") | .lane' "$tf" 2>/dev/null | grep -qx "coder_docs"; then
+      err "  $id: transcript has no coder_docs turn_start"
+      fails=$((fails + 1))
+    fi
+  done < <(manifest_ids)
+
+  # (d) integration: a fresh clone of merged main must actually work.
+  info "verify: integration clone (pytest + CLI)"
+  itmp="$(mktemp -d)"
+  iclone="$itmp/clone"
+  if git clone -q --depth 1 "$REMOTE_URL" "$iclone" 2>/dev/null; then
+    if grep -rn '^<<<<<<< ' "$iclone" --exclude-dir=.git >/dev/null 2>&1; then
+      err "  merged main contains conflict markers"
+      fails=$((fails + 1))
+    fi
+    if (cd "$iclone" && uv run --quiet pytest -q >/dev/null 2>&1); then
+      info "  pytest green on merged main"
+    else
+      err "  pytest failed on merged main:"
+      (cd "$iclone" && uv run pytest -q 2>&1 | tail -n 20 >&2) || true
+      fails=$((fails + 1))
+    fi
+    if [[ "$(manifest_mode)" == "app" ]]; then
+      out="$(cd "$iclone" && uv run --quiet greet --name smoke --loud 2>/dev/null || true)"
+      if [[ "$out" != "HELLO, SMOKE!" ]]; then
+        err "  greet --name smoke --loud printed '$out', want 'HELLO, SMOKE!'"
+        fails=$((fails + 1))
+      fi
+      out="$(cd "$iclone" && uv run --quiet greet --name smoke --locale es 2>/dev/null || true)"
+      if [[ "$out" != "¡Hola, smoke!" ]]; then
+        err "  greet --name smoke --locale es printed '$out', want '¡Hola, smoke!'"
+        fails=$((fails + 1))
+      fi
+      if ! grep -q '^## Usage' "$iclone/README.md" 2>/dev/null; then
+        err "  README missing '## Usage' section"
+        fails=$((fails + 1))
+      fi
+      if ! grep -q '^## Examples' "$iclone/README.md" 2>/dev/null; then
+        err "  README missing '## Examples' section"
+        fails=$((fails + 1))
+      fi
+    fi
+  else
+    err "  could not clone $REMOTE_URL for the integration check"
+    fails=$((fails + 1))
+  fi
+  rm -rf "$itmp"
+
+  # (e) conflict-pair evidence (report-only): did the README pair actually
+  # exercise the stale-base -> rework -> sync_base path? Timing-dependent,
+  # so it never affects the verdict -- the merged outcome is what (d) asserts.
+  if [[ "$(manifest_mode)" == "app" ]]; then
+    info "verify: conflict-pair evidence (report-only)"
+    while IFS=$'\t' read -r _ id _ _ tags; do
+      [[ "$tags" == *conflict-pair* ]] || continue
+      cruns="$(db_scalar "SELECT count(*) FROM runs r JOIN issues i ON i.id=r.issue_id WHERE i.identifier='$id' AND r.lane='coder';")"
+      if [[ "${cruns:-0}" -gt 1 ]]; then
+        info "  $id: ${cruns} coder runs -- stale-base rework path fired"
+      else
+        info "  $id: ${cruns:-0} coder run(s) -- no conflict this run"
+      fi
+    done < <(grep -v '^#' "$MANIFEST")
+  fi
 
   # R5 (optional, report-only): reviewer inline-comment placement validity.
   # Never affects the smoke verdict; requires gh auth against $TARGET_REPO.
