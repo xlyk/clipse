@@ -155,6 +155,41 @@ func TestRenderTranscriptLines_NeverPanics(t *testing.T) {
 	_ = renderRawLines([]string{"x"}, 1)
 }
 
+// TestMatchToolResults_TurnScoped asserts tool pairing never crosses a turn
+// boundary: a turn that ends with an unresolved tool_call (crash, interrupt,
+// ceiling abort — dac.py's _flush_pending emits the calls even when the
+// ToolNode never ran) must not steal the next turn's same-named result. The
+// open queues reset on every turn_start.
+func TestMatchToolResults_TurnScoped(t *testing.T) {
+	events := []transcriptEvent{
+		{Event: "turn_start", Lane: "coder", Ts: 100},
+		{Event: "tool_call", Name: "shell", Args: map[string]any{"command": "go build ./..."}, Ts: 101},
+		{Event: "turn_end", Error: "stream died", Ts: 102},
+		{Event: "turn_start", Lane: "coder", Ts: 200},
+		{Event: "tool_call", Name: "shell", Args: map[string]any{"command": "go test ./..."}, Ts: 201},
+		{Event: "tool_result", Name: "shell", Status: "success", Content: "ok", Ts: 203.5},
+	}
+
+	outcomes, consumed := matchToolResults(events)
+	if o, ok := outcomes[1]; ok {
+		t.Errorf("turn 1's dead call (index 1) matched a result = %+v, want unresolved", o)
+	}
+	if o, ok := outcomes[4]; !ok || o.status != "success" || o.dur != 2.5 {
+		t.Errorf("turn 2's call (index 4) outcome = %+v ok=%v, want success · 2.5s", o, ok)
+	}
+	if !consumed[5] {
+		t.Errorf("turn 2's result (index 5) not consumed, want consumed by its own turn's call")
+	}
+
+	out := strings.Join(renderTranscriptLines(events, 80), "\n")
+	if !strings.Contains(out, "$ go build ./...  → …") {
+		t.Errorf("crashed turn's call must render unresolved:\n%s", out)
+	}
+	if !strings.Contains(out, "$ go test ./...  → success · 2.5s") {
+		t.Errorf("later turn's call must pair with its own result:\n%s", out)
+	}
+}
+
 // TestPollFollowFile exercises the I/O command against real temp files: an
 // incremental read from a stored offset, a missing file, and the O_TRUNC
 // shrink → Reset + full re-read semantics the spec mandates.

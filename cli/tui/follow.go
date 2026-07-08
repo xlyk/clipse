@@ -209,15 +209,21 @@ type toolOutcome struct {
 
 // matchToolResults pairs each tool_call with the nearest following
 // tool_result of the same tool name (FIFO per name, each result consumed at
-// most once). It returns the outcome per call event index and the set of
-// result event indices that were consumed — an unconsumed result (its call
-// scrolled away in a reset) still renders standalone.
+// most once). Pairing is scoped to a single turn: the open queues reset on
+// every turn_start, so a turn that ended with an unresolved call (crash,
+// interrupt, ceiling abort — the worker flushes the calls even when the
+// ToolNode never ran) can't steal a later turn's same-named result. It
+// returns the outcome per call event index and the set of result event
+// indices that were consumed — an unconsumed result (its call scrolled away
+// in a reset) still renders standalone.
 func matchToolResults(events []transcriptEvent) (map[int]toolOutcome, map[int]bool) {
 	outcomes := make(map[int]toolOutcome)
 	consumed := make(map[int]bool)
 	open := make(map[string][]int)
 	for i, ev := range events {
 		switch ev.Event {
+		case "turn_start":
+			open = make(map[string][]int)
 		case "tool_call":
 			open[ev.Name] = append(open[ev.Name], i)
 		case "tool_result":
