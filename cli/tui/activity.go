@@ -56,20 +56,22 @@ func (m Model) activityLines(width int) []string {
 		glyph, color := eventGlyph(e.Kind)
 		label := fmt.Sprintf("%-11s", kindLabel(e.Kind))
 
-		idCell := lipgloss.NewStyle().Foreground(cText).Render(identText)
-		kindCell := lipgloss.NewStyle().Foreground(color).Render(glyph + " " + label)
+		idStyle := lipgloss.NewStyle().Foreground(cText)
+		kindStyle := lipgloss.NewStyle().Foreground(color)
 		detailStyle := dimStyle
 		switch class {
 		case classVerdict:
 			// Verdicts are the only loud feed lines: bold label, prose kept
 			// at full text weight.
-			kindCell = lipgloss.NewStyle().Foreground(color).Bold(true).Render(glyph + " " + label)
+			kindStyle = kindStyle.Bold(true)
 			detailStyle = lipgloss.NewStyle().Foreground(cText)
 		case classMechanic:
 			// Mechanics are bookkeeping: the whole line goes quiet.
-			idCell = dimStyle.Render(identText)
-			kindCell = dimStyle.Render(glyph + " " + label)
+			idStyle = dimStyle
+			kindStyle = dimStyle
 		}
+		idCell := idStyle.Render(identText)
+		kindCell := kindStyle.Render(glyph + " " + label)
 
 		detail := truncatePlain(cleanActivityDetail(e.Kind, e.Detail), maxInt(width-lead, 6))
 
@@ -196,7 +198,7 @@ func cleanActivityDetail(kind, detail string) string {
 		return "claim expired — requeued"
 	case kind == "retry_scheduled":
 		if m := retryRe.FindStringSubmatch(d); m != nil {
-			return fmt.Sprintf("transient failure — retry %s/%s: %s", m[1], m[2], m[3])
+			return fmt.Sprintf("transient failure — retry %s/%s: %s", m[1], m[2], shortenHexIDs(m[3]))
 		}
 		return shortenHexIDs(d)
 	default:

@@ -96,6 +96,12 @@ func TestCleanActivityDetail(t *testing.T) {
 			"transient failure — retry 1/2: worker crashed",
 		},
 		{
+			"retry reason hex ids shortened",
+			"retry_scheduled",
+			"auto-retry 2/2 after transient failure: worker crashed at commit 8494b1cc1690b9e368059c9db9d6717c",
+			"transient failure — retry 2/2: worker crashed at commit 8494b1cc",
+		},
+		{
 			"hex ids shortened in other details",
 			"orphan_requeue",
 			"requeued orphan run 8494b1cc1690b9e368059c9db9d6717c",
