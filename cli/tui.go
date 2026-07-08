@@ -67,17 +67,23 @@ func runTUI(cmd *cobra.Command, boardDir string) error {
 	}()
 
 	lockPath := filepath.Join(boardDir, "clipse.lock")
+	logsDir := filepath.Join(boardDir, "logs")
 	refresh := func() tea.Msg {
 		snap, err := st.ReadSnapshot(context.Background())
 		if err != nil {
 			return tui.ErrMsg{Err: fmt.Errorf("reading snapshot: %w", err)}
 		}
-		// Liveness is I/O (reading the lockfile), so it lives here in the
-		// refresh command rather than in the pure Update.
-		return tui.SnapshotMsg{Snap: snap, Live: dispatcherLive(lockPath)}
+		// Liveness (reading the lockfile) and the transcript listing (one
+		// ReadDir) are I/O, so they live here in the refresh command rather
+		// than in the pure Update.
+		return tui.SnapshotMsg{
+			Snap:             snap,
+			Live:             dispatcherLive(lockPath),
+			TranscriptIdents: transcriptIdents(logsDir),
+		}
 	}
 
-	model := tui.NewModel(tui.WithRefreshCmd(refresh))
+	model := tui.NewModel(tui.WithRefreshCmd(refresh), tui.WithLogsDir(logsDir))
 
 	// WithAltScreen takes over the whole terminal (alternate screen buffer):
 	// the dashboard renders fullscreen, never bleeds into scrollback, and the
@@ -113,6 +119,26 @@ func dispatcherLive(lockPath string) bool {
 	// alive); ESRCH ⇒ it is gone.
 	err = syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// transcriptIdents lists the issue identifiers that already have a
+// transcript file on disk (<logs>/<ISSUE>.transcript.jsonl), so the TUI can
+// enable follow mode on rows that aren't currently claimed. One ReadDir per
+// refresh tick — the same I/O budget class as the snapshot read it rides
+// along with. A missing logs dir (no worker has run yet) reads as no
+// transcripts.
+func transcriptIdents(logsDir string) map[string]bool {
+	entries, err := os.ReadDir(logsDir)
+	if err != nil {
+		return nil
+	}
+	idents := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if ident, ok := strings.CutSuffix(e.Name(), ".transcript.jsonl"); ok {
+			idents[ident] = true
+		}
+	}
+	return idents
 }
 
 // programModel adapts tui.Model to the tea.Model interface. tea.Model.Update

@@ -1,10 +1,16 @@
 package tui
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/xlyk/clipse/internal/store"
 )
 
 // TestParseTranscriptLine asserts the lenient JSONL decode: well-formed
@@ -244,5 +250,164 @@ func TestPollFollowFile(t *testing.T) {
 	msg = pollFollowFile(filepath.Join(dir, "absent.log"), 0)().(followPollMsg)
 	if !msg.NotExist || msg.Err != nil {
 		t.Errorf("poll on absent file = %+v, want NotExist with nil Err", msg)
+	}
+}
+
+// --- UI integration (Task 8) ---
+
+// followSnap builds a snapshot with one live (claimed) row CLI-1, one parked
+// review row CLI-2, and one todo row CLI-3.
+func followSnap() store.Snapshot {
+	claimed := sql.NullString{String: "claim-tok", Valid: true}
+	return store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			{
+				Issue:     store.Issue{ID: "i-1", Identifier: "CLI-1", LaneLabel: "coder", BoardStatus: "running", ClaimLock: claimed},
+				LatestRun: &store.Run{RunID: "r1", Lane: "coder", Status: "running", StartedAt: 100},
+			},
+			{Issue: store.Issue{ID: "i-2", Identifier: "CLI-2", LaneLabel: "coder", BoardStatus: "review"}},
+			{Issue: store.Issue{ID: "i-3", Identifier: "CLI-3", LaneLabel: "coder", BoardStatus: "todo"}},
+		},
+	}
+}
+
+var keyF = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")}
+var keyT = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}
+
+// TestFollowKey_OpensOnLiveRow asserts `f` on a live row enters follow mode
+// and schedules the tail (a non-nil cmd: first poll + tick).
+func TestFollowKey_OpensOnLiveRow(t *testing.T) {
+	m := NewModel(WithLogsDir("/tmp/logs"))
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: followSnap()})
+
+	if got := m.Selected(); got != "CLI-1" {
+		t.Fatalf("setup: Selected() = %q, want CLI-1", got)
+	}
+	m, cmd := m.Update(keyF)
+	if got := m.ViewMode(); got != "follow" {
+		t.Fatalf("after f ViewMode() = %q, want follow", got)
+	}
+	if cmd == nil {
+		t.Error("after f cmd = nil, want the poll+tick batch")
+	}
+	if m.follow.ident != "CLI-1" || m.follow.source != followTranscript || !m.follow.pinned {
+		t.Errorf("follow state = %+v, want CLI-1/transcript/pinned", m.follow)
+	}
+}
+
+// TestFollowKey_GatedOnClaimOrTranscript asserts `f` is a no-op on a row
+// with neither a live claim nor an on-disk transcript, and works on an
+// unclaimed row once the refresh reports a transcript file for it.
+func TestFollowKey_GatedOnClaimOrTranscript(t *testing.T) {
+	m := NewModel(WithLogsDir("/tmp/logs"))
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: followSnap()})
+
+	// Move to CLI-3 (todo, unclaimed, no transcript): f must do nothing.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if got := m.Selected(); got != "CLI-3" {
+		t.Fatalf("setup: Selected() = %q, want CLI-3", got)
+	}
+	m, _ = m.Update(keyF)
+	if got := m.ViewMode(); got != "dashboard" {
+		t.Errorf("f on unclaimed no-transcript row: ViewMode() = %q, want dashboard", got)
+	}
+
+	// A refresh reporting a transcript for CLI-2 unlocks f there.
+	m, _ = m.Update(SnapshotMsg{Snap: followSnap(), TranscriptIdents: map[string]bool{"CLI-2": true}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if got := m.Selected(); got != "CLI-2" {
+		t.Fatalf("setup: Selected() = %q, want CLI-2", got)
+	}
+	m, _ = m.Update(keyF)
+	if got := m.ViewMode(); got != "follow" {
+		t.Errorf("f on transcript-bearing row: ViewMode() = %q, want follow", got)
+	}
+}
+
+// TestFollowPoll_FoldsDataAndRenders asserts a followPollMsg's bytes reach
+// the view: transcript events render semantically, and a stale poll (path no
+// longer active after a toggle) is dropped.
+func TestFollowPoll_FoldsDataAndRenders(t *testing.T) {
+	m := NewModel(WithLogsDir("/logs"))
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: followSnap()})
+	m, _ = m.Update(keyF)
+
+	data := []byte(`{"event":"turn_start","lane":"coder","run_id":"r1","model":"anthropic:claude-sonnet-4-6","ts":1}` + "\n" +
+		`{"event":"assistant","text":"working on it","ts":2}` + "\n")
+	m, _ = m.Update(followPollMsg{Path: m.followPath(), Data: data, Offset: int64(len(data))})
+
+	if !strings.Contains(m.View(), "working on it") {
+		t.Errorf("View() missing folded assistant text")
+	}
+	if m.follow.offset != int64(len(data)) {
+		t.Errorf("offset = %d, want %d", m.follow.offset, len(data))
+	}
+
+	// A poll for a path that is no longer active must be dropped.
+	before := len(m.follow.events)
+	m, _ = m.Update(followPollMsg{Path: "/logs/OTHER.transcript.jsonl", Data: []byte(`{"event":"assistant","text":"stale","ts":3}` + "\n"), Offset: 999})
+	if len(m.follow.events) != before || m.follow.offset != int64(len(data)) {
+		t.Errorf("stale poll was folded: events=%d offset=%d", len(m.follow.events), m.follow.offset)
+	}
+}
+
+// TestFollowToggle_SwitchesSourceAndResets asserts `t` flips
+// transcript↔raw, resets the tail state (offset 0, buffers cleared, pinned),
+// and re-targets the poll path; esc returns to the dashboard and the next
+// followTickMsg dies (nil cmd) instead of polling forever.
+func TestFollowToggle_SwitchesSourceAndResets(t *testing.T) {
+	m := NewModel(WithLogsDir("/logs"))
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: followSnap()})
+	m, _ = m.Update(keyF)
+
+	if got, want := m.followPath(), "/logs/CLI-1.transcript.jsonl"; got != want {
+		t.Fatalf("followPath() = %q, want %q", got, want)
+	}
+
+	m, cmd := m.Update(keyT)
+	if m.follow.source != followRaw {
+		t.Errorf("after t source = %v, want followRaw", m.follow.source)
+	}
+	if got, want := m.followPath(), "/logs/CLI-1.log"; got != want {
+		t.Errorf("followPath() = %q, want %q", got, want)
+	}
+	if m.follow.offset != 0 || len(m.follow.events) != 0 || !m.follow.pinned {
+		t.Errorf("toggle did not reset tail state: %+v", m.follow)
+	}
+	if cmd == nil {
+		t.Error("after t cmd = nil, want an immediate re-poll")
+	}
+
+	// While following, the tick keeps the loop alive…
+	_, cmd = m.Update(followTickMsg{})
+	if cmd == nil {
+		t.Error("followTickMsg in follow mode returned nil cmd, want poll+reschedule")
+	}
+	// …and after esc, it dies.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if got := m.ViewMode(); got != "dashboard" {
+		t.Fatalf("after esc ViewMode() = %q, want dashboard", got)
+	}
+	_, cmd = m.Update(followTickMsg{})
+	if cmd != nil {
+		t.Error("followTickMsg after leaving follow mode returned a cmd, want nil (tick chain must die)")
+	}
+}
+
+// TestFollowView_FillsFrameHeight asserts the follow screen honors the
+// whole-frame invariant every other mode holds.
+func TestFollowView_FillsFrameHeight(t *testing.T) {
+	m := NewModel(WithLogsDir("/logs"))
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: followSnap()})
+	m, _ = m.Update(keyF)
+
+	if got := lipgloss.Height(m.View()); got != 40 {
+		t.Errorf("follow View height = %d, want 40", got)
 	}
 }

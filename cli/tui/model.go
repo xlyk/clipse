@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -27,6 +28,13 @@ type SnapshotMsg struct {
 	// singleton lock at the moment the snapshot was read. Defaults to false
 	// (unknown/none) for callers — e.g. tests — that don't supply it.
 	Live bool
+	// TranscriptIdents is the set of issue identifiers that already have a
+	// transcript file on disk (<logs>/<ISSUE>.transcript.jsonl). It is
+	// computed by the refresh command — a directory listing is I/O, so it
+	// must not happen inside the pure Update — and follow mode uses it to
+	// enable `f` on rows that aren't currently claimed. Nil is fine: no
+	// transcripts known.
+	TranscriptIdents map[string]bool
 }
 
 // TickMsg is the refresh trigger sent by tea.Tick. Update responds to it by
@@ -49,6 +57,7 @@ const (
 	modeDashboard viewMode = iota
 	modeDetail
 	modeKanban
+	modeFollow
 )
 
 // Row is one issue's display-ready state: identifier/lane plus its latest
@@ -105,6 +114,11 @@ type Row struct {
 	BlockedUntil    int64
 	Priority        int
 	Unmirrored      bool
+
+	// HasTranscript is true when this issue already has a transcript file on
+	// disk, so follow mode can replay a past run even when nothing is
+	// currently claimed. Sourced from SnapshotMsg.TranscriptIdents.
+	HasTranscript bool
 }
 
 // Model is the bubbletea model for `clipse tui`. It holds only
@@ -188,6 +202,14 @@ type Model struct {
 	activityVp viewport.Model
 	detailVp   viewport.Model
 
+	// Follow mode (U1): logsDir roots both tail paths (WithLogsDir),
+	// transcripts is the latest refresh's on-disk transcript set, follow is
+	// the active tail session, and followVp scrolls it.
+	logsDir     string
+	transcripts map[string]bool
+	follow      followState
+	followVp    viewport.Model
+
 	lastErr error
 
 	// refreshCmd is injected (see WithRefreshCmd) rather than hardcoded, so
@@ -207,6 +229,17 @@ type Option func(*Model)
 // wires in one that calls store.ReadSnapshot.
 func WithRefreshCmd(f func() tea.Msg) Option {
 	return func(m *Model) { m.refreshCmd = f }
+}
+
+// WithLogsDir points the model at the board's logs directory
+// (<board>/logs), the root both follow-mode tail paths derive from:
+// <ISSUE>.transcript.jsonl (the structured DAC transcript, written at the
+// path dispatcher.transcriptPath builds) and <ISSUE>.log (the worker's raw
+// stderr, spawn.LocalSpawner.stderrLogPath). Left unset (tests, misconfig)
+// follow mode simply finds no files: the poll reports NotExist and the view
+// shows its waiting placeholder.
+func WithLogsDir(dir string) Option {
+	return func(m *Model) { m.logsDir = dir }
 }
 
 // NewModel builds an empty Model, ready to receive its first SnapshotMsg.
@@ -254,6 +287,8 @@ func (m Model) ViewMode() string {
 		return "detail"
 	case modeKanban:
 		return "kanban"
+	case modeFollow:
+		return "follow"
 	default:
 		return "dashboard"
 	}
@@ -290,6 +325,7 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case SnapshotMsg:
+		m.transcripts = msg.TranscriptIdents
 		m.fold(msg.Snap)
 		m.live = msg.Live
 		m.lastErr = nil
@@ -302,6 +338,30 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	case spinnerTickMsg:
 		m.frame++
 		return m, scheduleSpinner()
+
+	case followTickMsg:
+		if m.mode != modeFollow {
+			// Follow mode was left since this tick was scheduled: let the
+			// chain die rather than polling a file nobody is watching.
+			return m, nil
+		}
+		return m, tea.Batch(pollFollowFile(m.followPath(), m.follow.offset), scheduleFollowTick())
+
+	case followPollMsg:
+		if m.mode != modeFollow || msg.Path != m.followPath() {
+			return m, nil // stale poll from before a toggle/exit — drop it
+		}
+		if msg.Err != nil {
+			m.follow.err = msg.Err
+			return m, nil
+		}
+		m.follow.err = nil
+		if msg.NotExist {
+			return m, nil // not written yet — keep polling, placeholder shows
+		}
+		m.follow.applyChunk(msg.Data, msg.Offset, msg.Reset)
+		m.layoutFollow()
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -333,6 +393,9 @@ func (m Model) handleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 	switch m.mode {
 	case modeDetail:
 		m.detailVp, _ = m.detailVp.Update(msg)
+	case modeFollow:
+		m.followVp, _ = m.followVp.Update(msg)
+		m.follow.pinned = m.followVp.AtBottom()
 	case modeDashboard:
 		if m.pointerOverActivity(msg.X, msg.Y) {
 			m.activityVp, _ = m.activityVp.Update(msg)
@@ -383,8 +446,40 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case key.Matches(msg, m.keys.Follow):
+		// f opens a realtime tail of the selected issue's agent logs — only
+		// for a row a worker is on right now (live claim) or one that
+		// already has a transcript on disk (HasTranscript, computed by the
+		// refresh cmd; a file check is I/O and can't happen here).
+		if m.mode != modeDashboard && m.mode != modeKanban {
+			return m, nil
+		}
+		row, ok := m.selectedRow()
+		if !ok || (!row.Live && !row.HasTranscript) {
+			return m, nil
+		}
+		m.mode = modeFollow
+		m.follow = followState{ident: row.Identifier, source: followTranscript, pinned: true}
+		m.layout()
+		return m, tea.Batch(pollFollowFile(m.followPath(), 0), scheduleFollowTick())
+
+	case key.Matches(msg, m.keys.ToggleSource):
+		// t flips the tail between the structured transcript and the raw
+		// worker stderr. The buffers and offset reset — the two files share
+		// nothing — and the next poll (issued immediately) starts from 0.
+		if m.mode != modeFollow {
+			return m, nil
+		}
+		src := followRaw
+		if m.follow.source == followRaw {
+			src = followTranscript
+		}
+		m.follow = followState{ident: m.follow.ident, source: src, pinned: true}
+		m.layout()
+		return m, pollFollowFile(m.followPath(), 0)
+
 	case key.Matches(msg, m.keys.Enter):
-		if m.mode != modeDetail && m.selected != "" {
+		if m.mode != modeDetail && m.mode != modeFollow && m.selected != "" {
 			m.mode = modeDetail
 			m.detailVp.SetYOffset(0)
 			m.layout()
@@ -392,9 +487,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Up):
-		if m.mode == modeDetail {
+		switch m.mode {
+		case modeDetail:
 			m.detailVp.ScrollUp(1)
-		} else {
+		case modeFollow:
+			m.followVp.ScrollUp(1)
+			m.follow.pinned = m.followVp.AtBottom()
+		default:
 			m.moveSelection(-1)
 			m.layout()
 			m.ensureSelectionVisible()
@@ -402,9 +501,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Down):
-		if m.mode == modeDetail {
+		switch m.mode {
+		case modeDetail:
 			m.detailVp.ScrollDown(1)
-		} else {
+		case modeFollow:
+			m.followVp.ScrollDown(1)
+			m.follow.pinned = m.followVp.AtBottom()
+		default:
 			m.moveSelection(1)
 			m.layout()
 			m.ensureSelectionVisible()
@@ -424,16 +527,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 // scrollActive scrolls whichever viewport the active mode owns by half a
 // page in dir (-1 up, +1 down). The viewports clamp to their own content, so
-// an over-scroll is a harmless no-op.
+// an over-scroll is a harmless no-op. In follow mode a manual scroll unpins
+// the tail unless it lands back on the bottom line.
 func (m *Model) scrollActive(dir int) {
 	vp := &m.bodyVp
-	if m.mode == modeDetail {
+	switch m.mode {
+	case modeDetail:
 		vp = &m.detailVp
+	case modeFollow:
+		vp = &m.followVp
 	}
 	if dir < 0 {
 		vp.HalfViewUp()
 	} else {
 		vp.HalfViewDown()
+	}
+	if m.mode == modeFollow {
+		m.follow.pinned = m.followVp.AtBottom()
 	}
 }
 
@@ -465,6 +575,28 @@ func (m Model) selectedIndex() int {
 		}
 	}
 	return 0
+}
+
+// selectedRow returns the ordered row matching the current selection.
+func (m Model) selectedRow() (Row, bool) {
+	for _, r := range m.ordered {
+		if r.Identifier == m.selected {
+			return r, true
+		}
+	}
+	return Row{}, false
+}
+
+// followPath is the on-disk file the active follow source tails. Both derive
+// from the logs dir runTUI wires in (WithLogsDir): the transcript is
+// <logs>/<ISSUE>.transcript.jsonl and the raw stderr log <logs>/<ISSUE>.log,
+// both keyed by the issue identifier — matching dispatcher.transcriptPath
+// and spawn.LocalSpawner.stderrLogPath exactly.
+func (m Model) followPath() string {
+	if m.follow.source == followRaw {
+		return filepath.Join(m.logsDir, m.follow.ident+".log")
+	}
+	return filepath.Join(m.logsDir, m.follow.ident+".transcript.jsonl")
 }
 
 // refresh returns the tea.Cmd that invokes the injected refreshCmd, if any.
@@ -546,6 +678,7 @@ func (m *Model) fold(snap store.Snapshot) {
 			BlockedUntil:    is.BlockedUntil,
 			Priority:        is.Priority,
 			Unmirrored:      is.Unmirrored,
+			HasTranscript:   m.transcripts[is.Identifier],
 		}
 
 		m.byStatus[is.BoardStatus] = append(m.byStatus[is.BoardStatus], row)

@@ -7,15 +7,17 @@ import "github.com/charmbracelet/bubbles/key"
 // both key handling and the bubbles help view. It satisfies help.KeyMap via
 // ShortHelp/FullHelp.
 type keyMap struct {
-	Up         key.Binding
-	Down       key.Binding
-	Enter      key.Binding
-	Back       key.Binding
-	Kanban     key.Binding
-	Help       key.Binding
-	ScrollUp   key.Binding
-	ScrollDown key.Binding
-	Quit       key.Binding
+	Up           key.Binding
+	Down         key.Binding
+	Enter        key.Binding
+	Back         key.Binding
+	Kanban       key.Binding
+	Follow       key.Binding
+	ToggleSource key.Binding
+	Help         key.Binding
+	ScrollUp     key.Binding
+	ScrollDown   key.Binding
+	Quit         key.Binding
 }
 
 // defaultKeyMap returns the standard bindings: vim-style j/k plus arrows for
@@ -44,6 +46,14 @@ func defaultKeyMap() keyMap {
 			key.WithKeys("tab", "v"),
 			key.WithHelp("tab", "board"),
 		),
+		Follow: key.NewBinding(
+			key.WithKeys("f"),
+			key.WithHelp("f", "follow logs"),
+		),
+		ToggleSource: key.NewBinding(
+			key.WithKeys("t"),
+			key.WithHelp("t", "transcript/raw"),
+		),
 		Help: key.NewBinding(
 			key.WithKeys("?"),
 			key.WithHelp("?", "help"),
@@ -65,7 +75,7 @@ func defaultKeyMap() keyMap {
 
 // ShortHelp is the single-line hint set (help.KeyMap).
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Enter, k.Kanban, k.Help, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.Enter, k.Follow, k.Kanban, k.Help, k.Quit}
 }
 
 // FullHelp is the expanded, column-grouped hint set shown when the help
@@ -73,7 +83,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Enter, k.Back},
-		{k.Kanban, k.Help},
+		{k.Follow, k.ToggleSource, k.Kanban, k.Help},
 		{k.ScrollUp, k.ScrollDown, k.Quit},
 	}
 }

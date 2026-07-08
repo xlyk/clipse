@@ -189,6 +189,8 @@ func (m Model) View() string {
 		return m.renderDetailScreen(d.cw, now)
 	case modeKanban:
 		return m.renderKanbanScreen(d.cw, now)
+	case modeFollow:
+		return m.renderFollowScreen(d.cw, now)
 	default:
 		return m.renderDashboard(now)
 	}
@@ -215,6 +217,38 @@ func (m Model) renderDashboard(now int64) string {
 		m.renderHeader(d.cw, now),
 		m.renderTabs(d.cw),
 		body,
+		m.renderFooter(d.cw),
+	)
+}
+
+// renderFollowScreen draws follow mode (U1): the header, then a full-height
+// panel tailing the selected issue's agent logs — the structured transcript
+// rendered semantically, or the raw worker stderr — then the pinned footer.
+// The panel title carries the issue, the driving lane (colored with the
+// lane's identity color once a turn_start has parsed), and the active
+// source; a ● marker shows while the tail is pinned to the newest line.
+func (m Model) renderFollowScreen(cw int, now int64) string {
+	d := m.dims()
+	lane := m.follow.lane()
+	accent := laneColor(lane)
+
+	src := "transcript"
+	if m.follow.source == followRaw {
+		src = "raw stderr"
+	}
+	title := "FOLLOW · " + m.follow.ident
+	if lane != "" {
+		title += " · " + lane
+	}
+	title += " · " + src
+	if m.follow.pinned {
+		title += " · ● streaming"
+	}
+
+	panelH := maxInt(d.frameH-d.headerH-d.footerH, 3)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		m.renderHeader(d.cw, now),
+		panelBox(title, accent, m.followVp.View(), d.cw, panelH),
 		m.renderFooter(d.cw),
 	)
 }
@@ -264,6 +298,39 @@ func (m *Model) layout() {
 	m.detailVp.Height = maxInt(d.frameH-d.headerH-d.footerH-3, 1)
 	m.detailVp.SetContent(m.detailContent(detailW))
 	m.detailVp.SetYOffset(m.detailVp.YOffset)
+
+	if m.mode == modeFollow {
+		m.layoutFollow()
+	}
+}
+
+// layoutFollow sizes and refills the follow viewport from the tail buffers.
+// pinned keeps the view glued to the newest line as content streams in; a
+// user who scrolled up stays where they are until they return to the bottom.
+func (m *Model) layoutFollow() {
+	d := m.dims()
+	w := maxInt(d.cw-2, 8)
+	m.followVp.Width = w
+	m.followVp.Height = maxInt(d.frameH-d.headerH-d.footerH-3, 1)
+
+	var lines []string
+	if m.follow.source == followTranscript {
+		lines = renderTranscriptLines(m.follow.events, w)
+	} else {
+		lines = renderRawLines(m.follow.rawLines, w)
+	}
+	if m.follow.err != nil {
+		lines = append(lines, errorStyle.Render(truncatePlain("⚠ "+oneLine(m.follow.err.Error()), w)))
+	}
+	if len(lines) == 0 {
+		lines = []string{dimStyle.Render("waiting for logs…")}
+	}
+	m.followVp.SetContent(strings.Join(lines, "\n"))
+	if m.follow.pinned {
+		m.followVp.GotoBottom()
+	} else {
+		m.followVp.SetYOffset(m.followVp.YOffset) // re-clamp against new bounds
+	}
 }
 
 // ensureSelectionVisible scrolls the body viewport just enough to keep the
