@@ -46,6 +46,14 @@ func statusFromWorkflowName(name, stateType string) string {
 	if stateType == "canceled" {
 		return "cancelled"
 	}
+	if stateType == "completed" {
+		// Same type-over-name rationale as canceled: a completed-type state
+		// with a team-specific name ("Ready for Release", "Closed") must
+		// never fall back to todo -- that would let a mislabeled,
+		// already-shipped ticket be claimed and re-run. Name-mapped
+		// completed states ("Done") resolve to "done" either way.
+		return "done"
+	}
 	if col, ok := statusByWorkflowName[strings.ToLower(name)]; ok {
 		return col
 	}
