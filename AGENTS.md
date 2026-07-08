@@ -1,4 +1,4 @@
-# Clipse — agent & contributor guide
+# AGENTS.md — Clipse agent & contributor guide
 
 Clipse turns Linear issues into merged PRs. A Go **dispatcher/kernel** polls Linear, atomically claims work into local SQLite, spawns per-issue Python **LangGraph + Deep Agents Code (DAC)** worker subprocesses in git worktrees, and owns every board transition off the worker's typed JSON result. The kernel is deterministic and LLM-free; the LLM lives only in the worker.
 
@@ -18,7 +18,7 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
 - `make lint` — `go vet`, a `gofmt` check, and `ruff` on `agent/`.
 - `make codegen` — regenerate the Go + Pydantic contract from `schema/` (idempotent; CI fails on drift).
 - `make run` — `go run ./cmd/clipse`.
-- `make eval` — live-model behavioral evals for the coder/coder_docs/reviewer
+- `make eval` — live-model evals for the coder/coder_docs/reviewer
   agents (`agent/evals/`, pytest, real git + fake `gh` shim; needs
   `ANTHROPIC_API_KEY`, costs tokens, never runs in `make test`/CI). Each case
   pins a clipse-specific behavior or a production incident; DAC engine
@@ -28,6 +28,52 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
   `agent/evals/README.md`.
 
 Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard). Kernel tests need **no** network or LLM.
+
+<!-- managed:readme-agents-doc:section=STYLE:BEGIN -->
+## Code style
+
+- Go: wrap errors, use `log/slog` JSON for runtime logs, and keep stdout for CLI results.
+- Tests: standard-library `testing`; no testify. Put interfaces at the consumer.
+- Python: `agent/` uv plus `ruff`; change generated `contract.py` only through `make codegen`.
+<!-- managed:readme-agents-doc:section=STYLE:END -->
+
+<!-- managed:readme-agents-doc:section=TESTING:BEGIN -->
+## Testing
+
+- Gate: `make test` (`go test -race ./...` plus `cd agent && uv run pytest`).
+- Go focus: `go test ./dispatcher -run TestName` or the changed package.
+- Python focus: `cd agent && uv run pytest tests/test_file.py::test_name`.
+- Live evals: `make eval`; costs tokens and stays out of normal CI.
+<!-- managed:readme-agents-doc:section=TESTING:END -->
+
+<!-- managed:readme-agents-doc:section=SECURITY:BEGIN -->
+## Security & secrets
+
+- `LINEAR_API_KEY` is kernel-only; `internal/config` rejects it in `env_allowlist`.
+- Workers may inherit only allow-listed env such as `ANTHROPIC_API_KEY`, `GH_TOKEN`/`GITHUB_TOKEN`, `HOME`, and `PATH`.
+- `openai_codex:*` stores OAuth under inherited `HOME`; treat `chatgpt-auth.json` as an account credential.
+- Default `shell_allow_list: all` means unrestricted shell. Narrow it for lower-trust issues.
+<!-- managed:readme-agents-doc:section=SECURITY:END -->
+
+<!-- managed:readme-agents-doc:section=PR_CONVENTIONS:BEGIN -->
+## PR conventions
+
+- Conventional Commits; lowercase/casual subject; no trailing period or AI/Claude signature.
+- One concern per commit. Never `git add -A` or `git add .`; stage exact files.
+- Draft PRs by default. Push rewrites with `--force-with-lease`; never `--no-verify`.
+- Required checks on `main`: `go`, `python`, `codegen-drift`.
+<!-- managed:readme-agents-doc:section=PR_CONVENTIONS:END -->
+
+<!-- managed:readme-agents-doc:section=GOTCHAS:BEGIN -->
+## Gotchas
+
+- **SQLite wins over Linear drift** — re-polling Linear must not clobber dispatcher-owned board state; use the outbox path for automated writes.
+- **`running` is claim-only** — only the CAS claim may enter `running`; direct status writes break recovery and Linear reconciliation.
+- **Generated contracts are off-limits** — edit `schema/`, then run `make codegen`; CI fails on codegen drift.
+- **Docs are inside the coder graph** — there is no `documentation` column, `scribe` lane, or `-docs` worktree.
+- **`max_tokens_per_run` is per DAC round** — it is a context guard after auto-compaction, not a cumulative spend cap.
+- **Codex auth is user-sensitive** — `/auth` must run as the dispatcher OS user so worker `HOME` finds the token.
+<!-- managed:readme-agents-doc:section=GOTCHAS:END -->
 
 ## Layout
 
