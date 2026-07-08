@@ -143,9 +143,9 @@ baseline is safe and total -- your real project is never touched.
 - Each ticket is a real module + a pytest test, not one small markdown file --
   it costs more tokens than the old markdown-ticket smoke. `--fast` (3-step
   chain) is the cheap way to confirm the pipeline end-to-end.
-- The full greet DAG is 10 runs plus review/merge/docs lanes; token spend is
-  reported per-ticket and in total by `verify`. `MAX_TOKENS_PER_RUN` in
-  `smoke.env` caps per-run spend.
+- The full greet DAG is 10 runs plus the review/merge lanes and the coder's
+  docs sub-turn; token spend is reported per-ticket and in total by `verify`.
+  `MAX_TOKENS_PER_RUN` in `smoke.env` caps per-run spend.
 - Defaults are sized for real code turns: `MAX_RUNTIME_S=1800` (per-worker
   wall-clock kill) and `TIMEOUT_S=5400` (overall run-phase watcher timeout).
 - Wall clock depends on Anthropic + GitHub Actions latency; the watcher prints
