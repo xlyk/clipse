@@ -140,15 +140,23 @@ func (f followState) lane() string {
 
 // followTickMsg drives the tail poll cadence, mirroring TickMsg's shape:
 // Update responds by returning the poll command plus the next tick — and by
-// returning nothing once follow mode has been left, which lets the tick
-// chain die instead of polling forever.
-type followTickMsg struct{}
+// returning nothing once follow mode has been left or the tick's session has
+// been superseded, which lets the stale chain die instead of polling forever.
+type followTickMsg struct {
+	// Gen identifies the follow session this tick was scheduled by (the
+	// model's followGen at schedule time). Update drops a tick whose Gen no
+	// longer matches, regardless of the current mode: a mode-only guard
+	// would let f→esc→f inside one tick interval resurrect the first
+	// session's chain alongside the second's — two concurrent 500ms chains
+	// polling the same file and sharing one offset.
+	Gen int
+}
 
 // scheduleFollowTick returns a tea.Cmd that fires a followTickMsg after
-// followInterval.
-func scheduleFollowTick() tea.Cmd {
+// followInterval, stamped with the scheduling session's generation.
+func scheduleFollowTick(gen int) tea.Cmd {
 	return tea.Tick(followInterval, func(time.Time) tea.Msg {
-		return followTickMsg{}
+		return followTickMsg{Gen: gen}
 	})
 }
 

@@ -383,8 +383,10 @@ func TestFollowToggle_SwitchesSourceAndResets(t *testing.T) {
 		t.Error("after t cmd = nil, want an immediate re-poll")
 	}
 
-	// While following, the tick keeps the loop alive…
-	_, cmd = m.Update(followTickMsg{})
+	// While following, the tick keeps the loop alive… (stamped with the
+	// session's generation, as scheduleFollowTick stamps the real ones)
+	gen := m.followGen
+	_, cmd = m.Update(followTickMsg{Gen: gen})
 	if cmd == nil {
 		t.Error("followTickMsg in follow mode returned nil cmd, want poll+reschedule")
 	}
@@ -393,9 +395,42 @@ func TestFollowToggle_SwitchesSourceAndResets(t *testing.T) {
 	if got := m.ViewMode(); got != "dashboard" {
 		t.Fatalf("after esc ViewMode() = %q, want dashboard", got)
 	}
-	_, cmd = m.Update(followTickMsg{})
+	_, cmd = m.Update(followTickMsg{Gen: gen})
 	if cmd != nil {
 		t.Error("followTickMsg after leaving follow mode returned a cmd, want nil (tick chain must die)")
+	}
+}
+
+// TestFollowTick_SupersededSessionDies asserts a tick from an earlier follow
+// session is dropped even when follow mode is active again: f→esc→f inside
+// one tick interval (normal key-repeat territory) must not leave the first
+// session's chain alive alongside the second's — two concurrent 500ms chains
+// polling one file and sharing one offset can duplicate lines. Every entry
+// into follow mode bumps a generation; a tick carrying a stale generation
+// returns nil cmd regardless of the current mode.
+func TestFollowTick_SupersededSessionDies(t *testing.T) {
+	m := NewModel(WithLogsDir("/logs"))
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: followSnap()})
+
+	m, _ = m.Update(keyF) // session 1
+	gen1 := m.followGen
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m, _ = m.Update(keyF) // session 2, before session 1's tick fires
+
+	if m.followGen == gen1 {
+		t.Fatalf("re-entering follow did not bump the generation (still %d)", gen1)
+	}
+	// Session 1's outstanding tick arrives now: it must die even though
+	// follow mode is (again) active.
+	_, cmd := m.Update(followTickMsg{Gen: gen1})
+	if cmd != nil {
+		t.Error("superseded session's tick returned a cmd, want nil (chain must die)")
+	}
+	// Session 2's own tick still drives the loop.
+	_, cmd = m.Update(followTickMsg{Gen: m.followGen})
+	if cmd == nil {
+		t.Error("current session's tick returned nil cmd, want poll+reschedule")
 	}
 }
 

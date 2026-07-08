@@ -204,10 +204,16 @@ type Model struct {
 
 	// Follow mode (U1): logsDir roots both tail paths (WithLogsDir),
 	// transcripts is the latest refresh's on-disk transcript set, follow is
-	// the active tail session, and followVp scrolls it.
+	// the active tail session, and followVp scrolls it. followGen counts
+	// follow-session entries: every `f` bumps it and stamps it into the
+	// session's tick chain (scheduleFollowTick), so a tick from a superseded
+	// session (f→esc→f inside one tick interval) is recognized and dropped
+	// even while a newer session is live — otherwise two concurrent chains
+	// would poll the same file against one shared offset.
 	logsDir     string
 	transcripts map[string]bool
 	follow      followState
+	followGen   int
 	followVp    viewport.Model
 
 	lastErr error
@@ -340,12 +346,14 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		return m, scheduleSpinner()
 
 	case followTickMsg:
-		if m.mode != modeFollow {
-			// Follow mode was left since this tick was scheduled: let the
-			// chain die rather than polling a file nobody is watching.
+		if m.mode != modeFollow || msg.Gen != m.followGen {
+			// Follow mode was left since this tick was scheduled — or the
+			// tick belongs to a superseded session (f→esc→f before it
+			// fired): let the stale chain die rather than running a second
+			// concurrent poll loop against the live session's offset.
 			return m, nil
 		}
-		return m, tea.Batch(pollFollowFile(m.followPath(), m.follow.offset), scheduleFollowTick())
+		return m, tea.Batch(pollFollowFile(m.followPath(), m.follow.offset), scheduleFollowTick(m.followGen))
 
 	case followPollMsg:
 		if m.mode != modeFollow || msg.Path != m.followPath() {
@@ -460,8 +468,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		m.mode = modeFollow
 		m.follow = followState{ident: row.Identifier, source: followTranscript, pinned: true}
+		m.followGen++ // new session: any prior session's outstanding tick is now stale
 		m.layout()
-		return m, tea.Batch(pollFollowFile(m.followPath(), 0), scheduleFollowTick())
+		return m, tea.Batch(pollFollowFile(m.followPath(), 0), scheduleFollowTick(m.followGen))
 
 	case key.Matches(msg, m.keys.ToggleSource):
 		// t flips the tail between the structured transcript and the raw
