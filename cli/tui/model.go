@@ -187,7 +187,7 @@ func NewModel(opts ...Option) Model {
 		mode:     modeDashboard,
 		keys:     defaultKeyMap(),
 		help:     help.New(),
-		progress: progress.New(progress.WithGradient(string(cCyan), string(cGreen)), progress.WithoutPercentage()),
+		progress: progress.New(progress.WithGradient(progressGradientColors()), progress.WithoutPercentage()),
 	}
 	for _, opt := range opts {
 		opt(&m)

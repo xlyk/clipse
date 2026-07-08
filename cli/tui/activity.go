@@ -103,7 +103,7 @@ func cleanActivityDetail(kind, detail string) string {
 // eventGlyph maps an event kind to a leading glyph and color: merges/dones are
 // green ✓, blocks are red ✖, claims are cyan ▶, reviews cyan ◆, rework/changes
 // amber ⟳, and everything else a dim ·.
-func eventGlyph(kind string) (string, lipgloss.Color) {
+func eventGlyph(kind string) (string, lipgloss.AdaptiveColor) {
 	switch {
 	case strings.Contains(kind, "merge") || kind == "done" || kind == "complete" || kind == "promoted":
 		return "✓", cGreen

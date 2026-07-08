@@ -10,22 +10,41 @@ import (
 	"github.com/xlyk/clipse/internal/store"
 )
 
-// Palette — a GitHub-dark-ish scheme so the dashboard looks at home in a
-// modern terminal. Truecolor hex degrades gracefully on 256-color terminals.
-const (
-	cText   = lipgloss.Color("#c9d1d9")
-	cDim    = lipgloss.Color("#6e7681")
-	cBorder = lipgloss.Color("#30363d")
-	cInk    = lipgloss.Color("#0d1117") // near-black, for text on a bright badge
+// Palette — adaptive light/dark (P5). Dark is the original GitHub-dark
+// scheme (unchanged, so dark terminals render pixel-identical to v1); Light
+// is the GitHub-light analogue of each hue, picked so the same semantic
+// reads on a white background. lipgloss resolves the pair against the
+// terminal's detected background per render. Truecolor hex degrades
+// gracefully on 256-color terminals.
+var (
+	cText   = lipgloss.AdaptiveColor{Light: "#1f2328", Dark: "#c9d1d9"}
+	cDim    = lipgloss.AdaptiveColor{Light: "#57606a", Dark: "#6e7681"}
+	cBorder = lipgloss.AdaptiveColor{Light: "#d0d7de", Dark: "#30363d"}
+	// cInk is the text color painted ON a bright accent badge: near-black on
+	// the pale dark-mode accents, white on the deeper light-mode accents.
+	cInk = lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#0d1117"}
 
-	cGreen  = lipgloss.Color("#3fb950")
-	cCyan   = lipgloss.Color("#58a6ff")
-	cRed    = lipgloss.Color("#f85149")
-	cAmber  = lipgloss.Color("#d29922")
-	cPurple = lipgloss.Color("#bc8cff")
-	cTeal   = lipgloss.Color("#39c5cf")
-	cOrange = lipgloss.Color("#db6d28")
+	cGreen  = lipgloss.AdaptiveColor{Light: "#1a7f37", Dark: "#3fb950"}
+	cCyan   = lipgloss.AdaptiveColor{Light: "#0969da", Dark: "#58a6ff"}
+	cRed    = lipgloss.AdaptiveColor{Light: "#cf222e", Dark: "#f85149"}
+	cAmber  = lipgloss.AdaptiveColor{Light: "#9a6700", Dark: "#d29922"}
+	cPurple = lipgloss.AdaptiveColor{Light: "#8250df", Dark: "#bc8cff"}
+	cTeal   = lipgloss.AdaptiveColor{Light: "#1b7c83", Dark: "#39c5cf"}
+	cOrange = lipgloss.AdaptiveColor{Light: "#bc4c00", Dark: "#db6d28"}
 )
+
+// progressGradientColors resolves the header progress bar's gradient pair
+// (cyan → green) against the terminal background once, at model
+// construction. progress.WithGradient needs concrete hex strings to lerp
+// between, so the adaptive palette can't be passed through directly. In a
+// non-TTY context (tests) lipgloss reports a light background and the light
+// pair is used — harmless, since styles render unstyled there anyway.
+func progressGradientColors() (string, string) {
+	if lipgloss.HasDarkBackground() {
+		return cCyan.Dark, cGreen.Dark
+	}
+	return cCyan.Light, cGreen.Light
+}
 
 // spinnerFrames animates running rows; braille cells give a smooth spin. The
 // frame-based spinner (advanced by spinnerTickMsg) is kept over the bubbles
@@ -77,7 +96,7 @@ var (
 // the QUEUED group (whose rows get a dependency "waiting on …" hint).
 type section struct {
 	title  string
-	accent lipgloss.Color
+	accent lipgloss.AdaptiveColor
 	glyph  string
 	rows   []Row
 	// waiting marks the QUEUED section, whose rows render a "waiting on …"
@@ -188,7 +207,7 @@ func (m Model) renderDashboard(now int64) string {
 // totalH is the panel's full height including the border, so body must already
 // be (totalH−3) lines tall — one title line plus (totalH−3) body lines fills
 // the (totalH−2) content box exactly.
-func panelBox(title string, accent lipgloss.Color, body string, colW, totalH int) string {
+func panelBox(title string, accent lipgloss.AdaptiveColor, body string, colW, totalH int) string {
 	head := panelTitleStyle.Foreground(accent).Render(title)
 	return panelBorderStyle.
 		Width(colW).
@@ -416,13 +435,13 @@ func (m Model) inFlightCount() int {
 }
 
 // countChip renders a "glyph N label" stat chip in the given accent color.
-func countChip(glyph, label string, n int, accent lipgloss.Color) string {
+func countChip(glyph, label string, n int, accent lipgloss.AdaptiveColor) string {
 	return lipgloss.NewStyle().Foreground(accent).Bold(true).Render(fmt.Sprintf("%s %d", glyph, n)) +
 		dimStyle.Render(" "+label)
 }
 
 // laneColor maps a bare lane to its badge color.
-func laneColor(lane string) lipgloss.Color {
+func laneColor(lane string) lipgloss.AdaptiveColor {
 	switch lane {
 	case "coder":
 		return cCyan
@@ -455,7 +474,7 @@ func laneBadge(lane string) string {
 }
 
 // statusColor maps a board column to its text color.
-func statusColor(status string) lipgloss.Color {
+func statusColor(status string) lipgloss.AdaptiveColor {
 	switch status {
 	case "running":
 		return cGreen
