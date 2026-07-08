@@ -20,18 +20,32 @@ func (m Model) sectionList() []section {
 	}
 }
 
-// renderBody renders the scrollable dashboard body: the non-empty section
-// panels stacked, then a compact DONE summary. Empty sections are omitted
-// entirely — their zero-counts already live in the header chips — so a
-// sparse board never spends rows saying "none" (P1). now feeds the live
-// rows' elapsed (View passes the wall clock; layout passes 0 for a stable
-// line count, since elapsed is inline and never adds lines).
-func (m Model) renderBody(inner int, now int64) string {
-	var parts []string
+// visibleSections filters sectionList down to the sections that actually
+// render: empty sections are omitted from the body entirely (their
+// zero-counts live in the header chips). It is the ONE skip predicate shared
+// by renderBody and orderedLineIndex, so the rendered geometry and the
+// selection-index math can never diverge — a drift there breaks
+// selection-follow scrolling.
+func (m Model) visibleSections() []section {
+	var vis []section
 	for _, s := range m.sectionList() {
 		if len(s.rows) == 0 {
 			continue
 		}
+		vis = append(vis, s)
+	}
+	return vis
+}
+
+// renderBody renders the scrollable dashboard body: the non-empty section
+// panels stacked, then a compact DONE summary. Empty sections are omitted
+// entirely (visibleSections) — their zero-counts already live in the header
+// chips — so a sparse board never spends rows saying "none" (P1). now feeds
+// the live rows' elapsed (View passes the wall clock; layout passes 0 for a
+// stable line count, since elapsed is inline and never adds lines).
+func (m Model) renderBody(inner int, now int64) string {
+	var parts []string
+	for _, s := range m.visibleSections() {
 		parts = append(parts, m.renderSection(s, inner, now))
 	}
 	body := strings.Join(parts, "\n")
@@ -183,18 +197,16 @@ func (m Model) renderDoneSummary(inner int) string {
 // than assuming one line per row, so a row that wraps at a narrow width can't
 // drift the result: preceding groups are summed via lipgloss.Height of the
 // whole (borderless) group, and rows preceding g within its group via
-// lipgloss.Height of each rendered row (the heading is a single line). Empty
-// sections are skipped, mirroring renderBody exactly. Used to keep the
-// selected row visible when scrolling the pipeline viewport.
+// lipgloss.Height of each rendered row (the heading is a single line). It
+// walks the same visibleSections list renderBody renders, so empty sections
+// are skipped by the identical predicate. Used to keep the selected row
+// visible when scrolling the pipeline viewport.
 func (m Model) orderedLineIndex(g int) int {
 	inner := m.dims().pipeTextW
 
 	line := 0
 	seen := 0
-	for _, s := range m.sectionList() {
-		if len(s.rows) == 0 {
-			continue
-		}
+	for _, s := range m.visibleSections() {
 		if g < seen+len(s.rows) {
 			line++ // heading
 			for i := 0; i < g-seen; i++ {

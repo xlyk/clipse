@@ -90,6 +90,48 @@ func TestRenderBody_OmitsEmptySections(t *testing.T) {
 	}
 }
 
+// TestOrderedLineIndex_MatchesRenderBodyOnSparseBoard pins the render/index
+// lockstep on a MIXED board: RUNNING and QUEUED are populated while the two
+// sections BETWEEN them (IN FLIGHT, BLOCKED) are empty, so the empty-section
+// skip fires mid-walk. For every ordered row, orderedLineIndex must return
+// the exact line of that row inside renderBody's "\n"-joined output — the
+// geometry ensureSelectionVisible scrolls by. A drift between the two skip
+// predicates breaks j/k selection-follow, which is this task's main risk.
+func TestOrderedLineIndex_MatchesRenderBodyOnSparseBoard(t *testing.T) {
+	snap := store.Snapshot{
+		Issues: []store.IssueSnapshot{
+			{Issue: store.Issue{ID: "1", Identifier: "RUN-01", BoardStatus: "running"}},
+			{Issue: store.Issue{ID: "2", Identifier: "RUN-02", BoardStatus: "running"}},
+			{Issue: store.Issue{ID: "3", Identifier: "QUE-01", BoardStatus: "ready"}},
+			{Issue: store.Issue{ID: "4", Identifier: "QUE-02", BoardStatus: "todo"}},
+		},
+	}
+	m := NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = m.Update(SnapshotMsg{Snap: snap})
+
+	if len(m.ordered) != 4 {
+		t.Fatalf("ordered rows = %d, want 4", len(m.ordered))
+	}
+	inner := m.dims().pipeTextW
+	lines := strings.Split(m.renderBody(inner, 0), "\n")
+	for i, row := range m.ordered {
+		want := -1
+		for li, l := range lines {
+			if strings.Contains(l, row.Identifier) {
+				want = li
+				break
+			}
+		}
+		if want < 0 {
+			t.Fatalf("row %s not found in renderBody output:\n%s", row.Identifier, strings.Join(lines, "\n"))
+		}
+		if got := m.orderedLineIndex(i); got != want {
+			t.Errorf("orderedLineIndex(%d) = %d, want %d (the rendered line of %s)", i, got, want, row.Identifier)
+		}
+	}
+}
+
 // TestRenderBody_EmptyBoardPlaceholder asserts a board with no issues still
 // renders something (never an empty string, which would collapse the panel).
 func TestRenderBody_EmptyBoardPlaceholder(t *testing.T) {
