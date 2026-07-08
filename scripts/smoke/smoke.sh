@@ -17,15 +17,18 @@
 #   reset     clean slate: delete smoke Linear issues, close PRs + delete
 #             branches, force target main back to baseline, wipe the board.
 #   build     compile a fresh ./bin/clipse.
-#   seed      create the issue DAG on Linear (honours --tickets/--fast).
+#   seed      create the issue DAG on Linear. Default: the 10-ticket greet
+#             app DAG (real Python modules + tests, incl. a deliberate
+#             README merge-conflict pair). --fast / --tickets N seed a
+#             semantic code chain instead.
 #   run       launch the dispatcher and poll the board until terminal.
 #   verify    assert every seeded ticket is done, order held, PRs merged.
 #   (none)    reset -> build -> seed -> run -> verify -> teardown.
 #
 # Flags:
-#   --tickets N   seed N tickets (default 10). N=10 is the greet DAG; other N
-#                 is a linear chain of length N.
-#   --fast        3-ticket linear chain (~10 min). Overrides --tickets.
+#   --tickets N   seed an N-step code chain (step i imports step i-1, so
+#                 dependency order is enforced by the tests themselves).
+#   --fast        3-step code chain (~10 min). Overrides --tickets.
 #   --no-run      stop after seed (do not launch the dispatcher).
 #   --keep        keep generated artifacts + board after the run for
 #                 `clipse tui` / `status` inspection.
@@ -103,6 +106,7 @@ load_env() {
   : "${SMOKE_YAML:=$SMOKE_HOME/clipse.smoke.yaml}"
   : "${CLIPSE_REPO:=$REPO_ROOT}"
   BASELINE_DIR="$SCRIPT_DIR/baseline"
+  DAG_DIR="$SCRIPT_DIR/dag"
 
   : "${LINEAR_KEY_SOURCE:=$HOME/.secrets}"
   : "${ANTHROPIC_KEY_SOURCE:=env}"
@@ -470,50 +474,26 @@ _dag_chain() {
   done
 }
 
-# _dag_greet builds the 10-ticket "greet" DAG. Each ticket adds one file under
-# samples/greet/. DAG (blocked-by):
-#   T1 scaffold (root); T2,T3,T4 <- T1; T5 <- T2,T3; T6 <- T3;
-#   T7 <- T4,T5,T6; T8 <- T5,T6; T9 <- T7; T10 <- T8,T9
-_dag_greet() {
-  local one="Write ONLY that one Markdown file. Do not modify or add any other file, and do not touch application or test source code."
-
-  T_TITLE=(_ \
-    "[smoke] Scaffold sample module" \
-    "[smoke] Config schema" \
-    "[smoke] Message catalog (i18n)" \
-    "[smoke] CLI flag spec" \
-    "[smoke] Greeter core" \
-    "[smoke] Output formatter" \
-    "[smoke] Integration test plan" \
-    "[smoke] Usage guide" \
-    "[smoke] CI workflow notes" \
-    "[smoke] Release checklist")
-
-  T_FILE=(_ \
-    "samples/greet/README.md" \
-    "samples/greet/config.md" \
-    "samples/greet/messages.md" \
-    "samples/greet/flags.md" \
-    "samples/greet/core.md" \
-    "samples/greet/format.md" \
-    "samples/greet/tests.md" \
-    "samples/greet/usage.md" \
-    "samples/greet/ci.md" \
-    "samples/greet/release.md")
-
-  T_DESC=(_ \
-    "Create the file \`samples/greet/README.md\` with a short overview of a sample command-line tool called \`greet\` that prints a configurable greeting (e.g. \"Hello, <name>!\"). $one" \
-    "Create the file \`samples/greet/config.md\` documenting the configuration schema for \`greet\`: greeting template, default name, and locale. $one" \
-    "Create the file \`samples/greet/messages.md\` with a small i18n message catalog for \`greet\`: sample greetings in English, Spanish, and French. $one" \
-    "Create the file \`samples/greet/flags.md\` documenting the \`greet\` CLI flags: \`--name\`, \`--locale\`, and \`--loud\`. $one" \
-    "Create the file \`samples/greet/core.md\` describing the greeter core: how the config and message catalog combine to produce a greeting. $one" \
-    "Create the file \`samples/greet/format.md\` describing the \`greet\` output formatter: plain, loud (uppercase), and JSON output modes. $one" \
-    "Create the file \`samples/greet/tests.md\` with an integration test plan for \`greet\` covering flags, locales, and output formats. $one" \
-    "Create the file \`samples/greet/usage.md\` with a usage guide and example invocations for \`greet\`. $one" \
-    "Create the file \`samples/greet/ci.md\` describing a CI workflow outline for building and testing \`greet\`. $one" \
-    "Create the file \`samples/greet/release.md\` with a release checklist for \`greet\`. $one")
-
-  T_DEPS=(_ "" "1" "1" "1" "2 3" "3" "4 5 6" "5 6" "7" "8 9")
+# _dag_app loads the curated 10-ticket greet app DAG from scripts/smoke/dag/:
+# manifest.tsv (idx / title / files / deps / tags, tab-separated) plus one
+# TNN.md spec file per ticket (the verbatim Linear issue body).
+_dag_app() {
+  local manifest="$DAG_DIR/manifest.tsv"
+  [[ -f "$manifest" ]] || die "missing app DAG manifest: $manifest"
+  N=0
+  local idx title files deps tags spec
+  while IFS=$'\t' read -r idx title files deps tags; do
+    [[ -n "$idx" && "$idx" != \#* ]] || continue
+    spec="$DAG_DIR/$(printf 'T%02d.md' "$idx")"
+    [[ -f "$spec" ]] || die "missing ticket spec: $spec"
+    T_TITLE[idx]="$title"
+    T_FILE[idx]="$files"
+    T_DESC[idx]="$(cat "$spec")"
+    T_DEPS[idx]="$deps"
+    T_TAGS[idx]="$tags"
+    N="$idx"
+  done < "$manifest"
+  [[ "$N" -gt 0 ]] || die "no tickets found in $manifest"
 }
 
 seed() {
