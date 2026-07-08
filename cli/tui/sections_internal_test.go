@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/xlyk/clipse/internal/store"
 )
@@ -88,6 +89,49 @@ func TestRowDetail_StaleHeartbeat(t *testing.T) {
 	}
 	if got := m.rowDetail(fresh, section{}, 1000); strings.Contains(got, "♥") {
 		t.Errorf("rowDetail with fresh heartbeat = %q, want no ♥ warning", got)
+	}
+}
+
+// TestRenderRow_BoundedWidth asserts the composed row line never exceeds the
+// panel's inner width, even when every detail chip is active at once — turn,
+// ⟳ rework/recover, tokens, retry countdown, ⇅ linear pending — exactly the
+// stack a Linear outage plus a transient burst produces on a narrow terminal.
+// A row wider than the panel would also wrap, drifting orderedLineIndex's
+// line geometry.
+func TestRenderRow_BoundedWidth(t *testing.T) {
+	m := NewModel()
+	allChips := Row{
+		Identifier: "CLI-1", LaneLabel: "coder", Status: "ready",
+		Run:         &store.Run{RunID: "r1", Lane: "coder", TurnCount: 3},
+		TokensIn:    123456,
+		TokensOut:   654321,
+		ReworkCount: 2, RecoverAttempts: 3,
+		BlockedUntil: 1040,
+		Unmirrored:   true,
+	}
+	staleLive := Row{
+		Identifier: "CLI-2", LaneLabel: "coder", Status: "running", Live: true,
+		Run:       &store.Run{RunID: "r2", Lane: "coder", StartedAt: 900, HeartbeatAt: 900},
+		TokensIn:  1000,
+		TokensOut: 2000, Unmirrored: true,
+	}
+	tests := []struct {
+		name  string
+		row   Row
+		s     section
+		inner int
+	}{
+		{"all chips, narrow", allChips, section{}, 40},
+		{"all chips, medium", allChips, section{}, 60},
+		{"live stale heartbeat, narrow", staleLive, section{dimIdle: true}, 40},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := m.renderRow(tt.row, tt.s, tt.inner, 1000)
+			if w := lipgloss.Width(got); w > tt.inner {
+				t.Errorf("renderRow width = %d, want <= %d (line %q)", w, tt.inner, got)
+			}
+		})
 	}
 }
 

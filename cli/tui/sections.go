@@ -130,13 +130,20 @@ func (m Model) renderRow(row Row, s section, inner int, now int64) string {
 	badgeCell := lipgloss.NewStyle().Width(15).Render(laneBadge(badgeLane))
 	statusCell := lipgloss.NewStyle().Width(13).Render(statusChip(row.Status))
 
-	return mark + lipgloss.JoinHorizontal(lipgloss.Center,
+	line := mark + lipgloss.JoinHorizontal(lipgloss.Center,
 		lead, " ",
 		badgeCell, " ",
 		idCell, " ",
 		statusCell, "  ",
 		m.rowDetail(row, s, now),
 	)
+	// Bound the composed line to the panel's text width: a non-live row can
+	// stack turn + ⟳ rework + tokens + retry countdown + ⇅ linear pending —
+	// wider than a narrow panel exactly when a Linear outage plus a transient
+	// burst lights every chip at once. MaxWidth truncates ANSI-aware (never
+	// splitting a styled chip's escape sequence), and keeping the row to one
+	// line also protects orderedLineIndex's wrap-free geometry.
+	return lipgloss.NewStyle().MaxWidth(inner).Render(line)
 }
 
 // rowDetail renders the trailing metadata. For a QUEUED row with unmet
