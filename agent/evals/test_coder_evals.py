@@ -2,6 +2,7 @@
 see docs/plans/2026-07-06-agent-evals-implementation-plan.md's incident index."""
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -36,11 +37,13 @@ def test_c1_smoke_small_fix(tmp_path: Path, eval_env: Path, record_result) -> No
             "README.md": "# calc\n`total(xs)` sums a list.\n",
         },
     )
+    transcript_path = tmp_path / "calc.transcript.jsonl"
     result = run_coder_turn(
         repo,
         "EVAL-1: total() returns the wrong sum.\n\n"
         "`calc.total([1, 2, 3])` returns 3, expected 6 — the loop drops the "
         "last element. Fix `total` in calc.py so it sums every element.",
+        transcript_path=str(transcript_path),
     )
     record_result(result)
 
@@ -58,6 +61,21 @@ def test_c1_smoke_small_fix(tmp_path: Path, eval_env: Path, record_result) -> No
     assert git_out(repo.worktree, "rev-parse", "HEAD") == git_out(
         repo.worktree, "rev-parse", f"origin/{repo.branch}"
     )
+    # Transcript logging (clipse feature D): the coding turn's own graph
+    # wrote a real transcript file with at least one full turn's worth of
+    # events, straight from the live model's real tool use.
+    events = [json.loads(line) for line in transcript_path.read_text().splitlines() if line.strip()]
+    assert sum(1 for e in events if e["event"] == "turn_start") >= 1
+    assert sum(1 for e in events if e["event"] == "turn_end") >= 1
+    assert sum(1 for e in events if e["event"] == "tool_call") >= 1
+    # The clean path always runs a best-effort docs sub-turn after the coder
+    # turn (`run_docs`, lane "coder_docs" -- see graphs/coder.py), so
+    # turn_start/turn_end legitimately appear for BOTH lanes, not just
+    # "coder"; assert the lane set is exactly the two the graph can emit,
+    # with "coder" always present.
+    turn_lanes = {e["lane"] for e in events if e["event"] in ("turn_start", "turn_end")}
+    assert turn_lanes <= {"coder", "coder_docs"}
+    assert "coder" in turn_lanes
 
 
 # REF-1 regression: a trivial scaffold task once burned 2.02M input tokens.

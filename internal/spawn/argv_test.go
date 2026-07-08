@@ -283,6 +283,34 @@ func TestWorkerArgs(t *testing.T) {
 				"--workspace=",
 			},
 		},
+		{
+			name: "transcript appended when set",
+			spec: WorkerSpec{
+				Lane:           "coder",
+				TranscriptPath: "/board/logs/CLP-1.transcript.jsonl",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+				"--transcript=/board/logs/CLP-1.transcript.jsonl",
+			},
+		},
+		{
+			name: "transcript omitted when empty",
+			spec: WorkerSpec{
+				Lane: "coder",
+			},
+			want: []string{
+				"--issue=",
+				"--lane=coder",
+				"--run=",
+				"--thread=",
+				"--workspace=",
+			},
+		},
 	}
 
 	for _, tt := range tests {
