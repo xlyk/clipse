@@ -691,7 +691,7 @@ verify() {
   local id blockers
   local status done_ts start_ts tokens wall merged_yn branch
   local total_tokens=0
-  local tf itmp iclone out cruns tags
+  local tf itmp iclone out cruns tags markers
   # (a) + (c) + row rendering.
   while IFS=$'\t' read -r _ id _ blockers _tags; do
     [[ -n "$id" ]] || continue
@@ -774,11 +774,12 @@ verify() {
 
   # (d) integration: a fresh clone of merged main must actually work.
   info "verify: integration clone (pytest + CLI)"
-  itmp="$(mktemp -d)"
+  itmp="$(mktemp -d)" || die "mktemp -d failed for the integration clone"
   iclone="$itmp/clone"
-  if git clone -q --depth 1 "$REMOTE_URL" "$iclone" 2>/dev/null; then
-    if grep -rn '^<<<<<<< ' "$iclone" --exclude-dir=.git >/dev/null 2>&1; then
-      err "  merged main contains conflict markers"
+  if git clone -q --depth 1 "$REMOTE_URL" "$iclone" 2>"$itmp/clone.err"; then
+    markers="$(grep -rl '^<<<<<<< ' "$iclone" --exclude-dir=.git 2>/dev/null || true)"
+    if [[ -n "$markers" ]]; then
+      err "  merged main contains conflict markers in: ${markers//$'\n'/ }"
       fails=$((fails + 1))
     fi
     if (cd "$iclone" && uv run --quiet pytest -q >/dev/null 2>&1); then
@@ -810,6 +811,7 @@ verify() {
     fi
   else
     err "  could not clone $REMOTE_URL for the integration check"
+    sed 's/^/    /' "$itmp/clone.err" >&2 || true
     fails=$((fails + 1))
   fi
   rm -rf "$itmp"
