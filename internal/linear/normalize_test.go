@@ -177,6 +177,45 @@ func TestNormalizeCandidateIssues_CancelledStateTypeOverridesName(t *testing.T) 
 	}
 }
 
+func TestNormalizeCandidateIssues_CompletedStateTypeOverridesName(t *testing.T) {
+	// A completed-type state with a team-specific NAME ("Ready for Release",
+	// as on the Spacelift team) must read as done, not fall back to todo --
+	// the todo fallback would let a mislabeled, already-shipped ticket be
+	// claimed and re-run. Same type-over-name rationale as the cancelled
+	// case above; "completed" is equally fixed and unrenameable.
+	const raw = `{
+		"data": {
+			"issues": {
+				"nodes": [
+					{
+						"id": "shipped-1",
+						"identifier": "SPA-999",
+						"title": "Shipped thing",
+						"description": "",
+						"priority": 3,
+						"branchName": "spa-999-shipped",
+						"updatedAt": "2026-07-01T16:00:00.000Z",
+						"state": { "name": "Ready for Release", "type": "completed" },
+						"labels": { "nodes": [] },
+						"inverseRelations": { "nodes": [] }
+					}
+				]
+			}
+		}
+	}`
+
+	issues, err := linear.NormalizeCandidateIssues([]byte(raw), "agent:")
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: unexpected error: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("len(issues) = %d, want 1", len(issues))
+	}
+	if issues[0].Status != "done" {
+		t.Errorf("Status = %q, want %q (type-driven, not name-driven)", issues[0].Status, "done")
+	}
+}
+
 func TestNormalizeCandidateIssues_CustomLabelPrefix(t *testing.T) {
 	const raw = `{"data":{"issues":{"nodes":[{"id":"id-1","identifier":"CLI-1","title":"t","description":"","priority":0,"branchName":"b","updatedAt":"2026-07-01T00:00:00.000Z","state":{"name":"Todo"},"labels":{"nodes":[{"name":"clipse:reviewer"}]},"inverseRelations":{"nodes":[]}}]}}}`
 
