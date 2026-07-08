@@ -89,7 +89,7 @@ load_env() {
   : "${REPO_VISIBILITY:=private}"
   : "${REMOTE_URL:=git@github.com:${TARGET_REPO}.git}"
   : "${BASE_BRANCH:=main}"
-  : "${BASELINE_TAG:=smoke-baseline}"
+  : "${BASELINE_TAG:=smoke-baseline-py}"
 
   : "${TEAM_KEY:=CLI}"
   : "${TEAM_ID:=8b5b3301-8da3-4933-9b07-9efc027bc09d}"
@@ -100,6 +100,7 @@ load_env() {
   : "${PRIMARY_CLONE:=$SMOKE_HOME/primary}"
   : "${SMOKE_YAML:=$SMOKE_HOME/clipse.smoke.yaml}"
   : "${CLIPSE_REPO:=$REPO_ROOT}"
+  BASELINE_DIR="$SCRIPT_DIR/baseline"
 
   : "${LINEAR_KEY_SOURCE:=$HOME/.secrets}"
   : "${ANTHROPIC_KEY_SOURCE:=env}"
@@ -236,46 +237,29 @@ YAML
 # Setup (one-time, idempotent)
 # ---------------------------------------------------------------------------
 
-# ci_workflow prints the no-op CI workflow for the target repo. The three job
-# names (go, python, codegen-drift) are exactly the required status-check
-# contexts applied by apply_branch_protection, so PRs go green in seconds and
-# clipse's merge gate (gh pr checks --required) is satisfied.
-ci_workflow() {
-  cat <<'YAML'
-name: ci
-on:
-  push:
-    branches: [main]
-  pull_request:
-jobs:
-  go:
-    name: go
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "go ok"
-  python:
-    name: python
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "python ok"
-  codegen-drift:
-    name: codegen-drift
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "codegen-drift ok"
-YAML
-}
-
-baseline_readme() {
-  cat <<YAML
-# clipse-smoke-target
-
-Throwaway target repository for the clipse smoke test
-(scripts/smoke/smoke.sh in the clipse repo).
-
-Its \`$BASE_BRANCH\` branch is force-reset to the \`$BASELINE_TAG\` tag on
-every \`smoke.sh reset\`. Do not store anything here you want to keep.
-YAML
+# push_baseline publishes scripts/smoke/baseline/ as the target repo's
+# baseline commit and tags it. The tar copy excludes local dev droppings
+# (.venv, caches, uv.lock) so only the intended files are pushed.
+push_baseline() {
+  local tmp
+  tmp="$(mktemp -d)"
+  tar -C "$BASELINE_DIR" \
+    --exclude .venv --exclude __pycache__ --exclude .pytest_cache \
+    --exclude uv.lock --exclude '*.egg-info' \
+    -cf - . | tar -C "$tmp" -xf -
+  (
+    cd "$tmp"
+    git init -q -b "$BASE_BRANCH"
+    git add pyproject.toml .gitignore README.md src tests .github
+    # Local identity so the commit succeeds regardless of global git config.
+    git -c user.name="clipse-smoke" -c user.email="smoke@clipse.local" \
+      commit -q -m "chore: smoke baseline (greet project)"
+    git remote add origin "$REMOTE_URL"
+    git push -q --force -u origin "$BASE_BRANCH"
+    git tag "$BASELINE_TAG"
+    git push -q --force origin "refs/tags/$BASELINE_TAG"
+  )
+  rm -rf "$tmp"
 }
 
 # apply_branch_protection PUTs classic branch protection matching clipse's
@@ -316,25 +300,8 @@ setup() {
   if gh api "repos/$TARGET_REPO/git/ref/tags/$BASELINE_TAG" >/dev/null 2>&1; then
     info "baseline tag $BASELINE_TAG already present -- skipping baseline push"
   else
-    info "pushing baseline commit + $BASELINE_TAG tag"
-    local tmp
-    tmp="$(mktemp -d)"
-    (
-      cd "$tmp"
-      git init -q -b "$BASE_BRANCH"
-      baseline_readme > README.md
-      mkdir -p .github/workflows
-      ci_workflow > .github/workflows/ci.yml
-      git add README.md .github/workflows/ci.yml
-      # Local identity so the commit succeeds regardless of global git config.
-      git -c user.name="clipse-smoke" -c user.email="smoke@clipse.local" \
-        commit -q -m "chore: smoke baseline"
-      git remote add origin "$REMOTE_URL"
-      git push -q --force -u origin "$BASE_BRANCH"
-      git tag "$BASELINE_TAG"
-      git push -q --force origin "refs/tags/$BASELINE_TAG"
-    )
-    rm -rf "$tmp"
+    info "pushing baseline project + $BASELINE_TAG tag"
+    push_baseline
   fi
 
   apply_branch_protection
