@@ -45,7 +45,10 @@ type issueNode struct {
 		Nodes []struct {
 			Type  string `json:"type"`
 			Issue struct {
-				ID string `json:"id"`
+				ID    string `json:"id"`
+				State struct {
+					Type string `json:"type"`
+				} `json:"state"`
 			} `json:"issue"`
 		} `json:"nodes"`
 	} `json:"inverseRelations"`
@@ -85,11 +88,21 @@ func normalizeIssueNode(n issueNode, labelPrefix string) (Issue, error) {
 	// is a dependency; "related"/"duplicate"/"similar" links are not and must
 	// not gate promotion. r.Issue is the blocker (the source of the blocks
 	// relation), which is exactly the issue this one must wait on.
+	// A blocker already completed or canceled in Linear is satisfied at
+	// ingest and dropped from Deps: blockers outside the candidate set
+	// (unlabeled teammates' tickets, shipped work) are never ingested, so a
+	// dep on one could never become terminal on the board and promote would
+	// hold the child in todo forever. A blocker with no state in the payload
+	// stays -- unknown is conservatively live.
 	deps := make([]string, 0, len(n.InverseRelations.Nodes))
 	for _, r := range n.InverseRelations.Nodes {
-		if r.Type == "blocks" {
-			deps = append(deps, r.Issue.ID)
+		if r.Type != "blocks" {
+			continue
 		}
+		if t := r.Issue.State.Type; t == "completed" || t == "canceled" {
+			continue
+		}
+		deps = append(deps, r.Issue.ID)
 	}
 
 	updatedAt, err := time.Parse(time.RFC3339, n.UpdatedAt)
