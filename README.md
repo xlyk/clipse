@@ -7,11 +7,11 @@ Autonomous coding-agent orchestrator: Linear issues to merged PRs via typed work
 <!-- managed:readme-agents-doc:section=WHY:BEGIN -->
 ## Why
 
-Most coding-agent loops mix scheduling, prompts, Git, Linear writes, and merge logic in one fragile path. Clipse splits the work: a deterministic Go kernel owns local state, claims, retries, board transitions, and merge gates, while Python LangGraph + Deep Agents Code workers handle the LLM turns inside isolated git worktrees. That split keeps the control plane testable without a model and lets each issue move from Linear intent to PR review and merge with bounded recovery rules.
+Most coding-agent loops tangle scheduling, prompts, Git, Linear writes, and merge logic into one fragile path. Clipse splits them: a deterministic, LLM-free Go kernel owns local state, claims, retries, board transitions, and merge gates, while Python LangGraph + Deep Agents Code workers run the model turns inside isolated git worktrees. The payoff is unattended throughput you can trust — point it at a Linear board and it ships merged PRs while you sleep, with every transition auditable in local SQLite.
 
-**Use it when:** you want a personal Linear-to-PR automation loop for one repo; you need deterministic board state, typed worker results, and local auditability; you want separate coder, reviewer, and git-operator behavior.
+**Use it when:** you want autonomous, unattended agent work — a queue of Linear issues turned into merged PRs while you sleep; you need a deterministic, auditable control plane where local SQLite is runtime truth and board transitions and merge gates stay LLM-free; you want distinct coder, reviewer, and git-operator lanes, each in an isolated worktree with bounded retry, rework, and recovery.
 
-**Don't use it for:** multi-tenant hosted agent infrastructure; repos where untrusted issue text must never reach a shell-capable coding worker; casual one-off code generation.
+**Don't use it for:** a replacement for interactive assistants like Claude Code or Codex — clipse orchestrates unattended batch work, it isn't hands-on pair-programming; multi-tenant hosted agent infrastructure; repos where untrusted issue text must never reach a shell-capable worker (the default shell is unrestricted).
 <!-- managed:readme-agents-doc:section=WHY:END -->
 
 <!-- managed:readme-agents-doc:section=QUICKSTART:BEGIN -->
