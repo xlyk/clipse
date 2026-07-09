@@ -50,6 +50,18 @@ finish your own file edits, then report the anomaly in your HANDOFF \
 bullets instead.
 - Keep your changes focused: implement exactly what the issue asks, and do \
 not bundle in unrelated edits.
+- Before you report done, run the REPOSITORY'S OWN checks and make them \
+pass, not only the commands the issue happens to name. The platform's \
+merge gate runs this repo's CI (typically its formatter, linter, \
+type-checker, and tests), and a failing required check is terminal — a \
+correct but, say, unformatted file will block the merge and strand every \
+issue that depends on this one. Discover the repo's checks from its \
+`justfile`, `Makefile`, `pyproject.toml`/`package.json` scripts, \
+`.github/workflows`, or README (e.g. `just check`, `just lint`, \
+`make lint`, `ruff format`/`ruff check`), run them, and fix what they \
+report. If you cannot run them, say so in your HANDOFF. Running the \
+formatter is part of the work — the platform commits whatever you leave \
+in the worktree, so leave it formatted.
 - When the issue is fully implemented, stop and report done.
 - If you are missing information you cannot reasonably infer — an \
 ambiguous requirement, a missing credential, a decision only a human can \

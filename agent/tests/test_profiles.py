@@ -31,6 +31,23 @@ def test_coder_prompt_forbids_history_rewrites():
     assert "handoff" in prompt
 
 
+def test_coder_prompt_runs_repo_checks_before_done():
+    # Spacelift M4 (SPA-854, 2026-07-08): the coder ran only the ticket's
+    # stated `pytest` and reported done; the repo's lint gate also runs
+    # `ruff format --check`, which failed on one unformatted file. The
+    # merge gate treats a failing required check as terminal, so a
+    # correct, reviewer-approved PR parked in blocked and stalled the whole
+    # dependent chain. The prompt must make the coder discover and run the
+    # repository's OWN checks (formatter/linter/tests, via justfile /
+    # Makefile / pyproject / README) and make them pass before reporting
+    # done -- the merge gate runs that same CI.
+    prompt = get_coder_profile().system_prompt.lower()
+    assert "format" in prompt
+    assert "lint" in prompt
+    # Names the discovery surfaces so the instruction is actionable, not vague.
+    assert "justfile" in prompt or "makefile" in prompt
+
+
 def test_coder_profile_is_frozen():
     profile = get_coder_profile()
 
