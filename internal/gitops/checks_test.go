@@ -124,6 +124,26 @@ func TestFetchChecks_NoChecksReportedIsAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchChecks_NoRequiredChecksReportedIsAbsent asserts the message gh
+// actually emits with the `--required` flag fetchChecks always passes: on a
+// conflicting/draft PR (no CI merge commit) gh exits 1 with empty stdout and
+// "no required checks reported on the '<branch>' branch". The prior parser
+// matched only "no checks reported" (a DIFFERENT string -- "no required
+// checks" never contains "no checks"), so it fell through to a hard error
+// and the dispatcher retried the merging claim every poll forever
+// (2026-07-09 Spacelift: SPA-857/859 conflicted with the advanced base;
+// gitops errored before conflictBeforeCIWait could route them to rework).
+func TestFetchChecks_NoRequiredChecksReportedIsAbsent(t *testing.T) {
+	runner := fakeRunner(CommandResult{ExitCode: 1, Stdout: "", Stderr: "no required checks reported on the 'kyle/spa-857-x' branch"}, nil)
+	checks, err := fetchChecks(context.Background(), Spec{Branch: "spa-857"}, runner)
+	if err != nil {
+		t.Fatalf("fetchChecks: expected no error for 'no required checks reported', got: %v", err)
+	}
+	if len(checks) != 0 {
+		t.Errorf("fetchChecks() = %+v, want zero checks", checks)
+	}
+}
+
 // TestFetchChecks_EmptyStdoutOtherErrorStillFails asserts any other
 // empty-stdout failure (without the no-checks marker) is still surfaced as an
 // error, so a genuine gh outage isn't silently read as "no checks".
