@@ -85,14 +85,20 @@ func fetchChecks(ctx context.Context, spec Spec, runner CommandRunner) ([]ghChec
 
 	stdout := strings.TrimSpace(res.Stdout)
 	if stdout == "" {
-		// gh prints "no checks reported on the '<branch>' branch" to stderr
-		// with exit 1 and NO stdout when a branch has zero checks -- distinct
-		// from the documented "[]" stdout case, but the same meaning: no
-		// required checks exist (yet). Observed on every PR of a repo whose CI
-		// registers late; treating it as an error loops the merging claim
-		// forever (Reflex retro, failure category 1). Any other empty-stdout
-		// failure (a real gh outage) still errors.
-		if strings.Contains(res.Stderr, "no checks reported") {
+		// gh exits 1 with NO stdout and a "no [required ]checks reported on
+		// the '<branch>' branch" stderr when a branch has zero (required)
+		// checks -- distinct from the documented "[]" stdout case, same
+		// meaning: no required checks exist yet. TWO phrasings, and we must
+		// match BOTH: plain "no checks reported" (bare `gh pr checks`), and
+		// "no required checks reported" (the `--required` flag we ALWAYS
+		// pass -- so this is the phrasing the live path actually hits). The
+		// two strings don't overlap ("no required checks" never contains "no
+		// checks"), so matching only the former left the required path
+		// looping the merging claim forever on a conflicting/draft PR whose
+		// CI never produced a merge commit (2026-07-09 Spacelift SPA-857/859).
+		// Matching "checks reported" covers both without over-broadening.
+		// Any other empty-stdout failure (a real gh outage) still errors.
+		if strings.Contains(res.Stderr, "checks reported") {
 			return []ghCheck{}, nil
 		}
 		return nil, fmt.Errorf("gh pr checks %s: exit %d: %s", spec.Branch, res.ExitCode, strings.TrimSpace(res.Stderr))
