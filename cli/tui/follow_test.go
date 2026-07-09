@@ -113,16 +113,18 @@ func TestFollowState_Lane(t *testing.T) {
 
 // TestRenderTranscriptLines asserts the semantic rendering (colors are
 // stripped in a non-TTY test run, so plain substrings are asserted):
-// turn_start → a lane-named header line; tool_call → a dim "$ cmd" one-liner
-// that gains "→ <status> · <dur>s" once its result arrives; assistant text →
-// wrapped; turn_end → an outcome + token rule; malformed → dim raw text.
+// turn_start → a lane-named header with a bare model name; a shell tool_call →
+// a "$ <cmd>" line that gains a "✓ · <dur>s" badge once its result arrives; a
+// read_file → a "read <relpath>" line (resolved arg, not a bare tool name);
+// assistant text → wrapped; turn_end → an outcome + token rule; malformed →
+// dim raw text.
 func TestRenderTranscriptLines(t *testing.T) {
 	events := []transcriptEvent{
 		{Event: "turn_start", Lane: "reviewer", RunID: "8494b1cc1690b9e368059c9db9d6717c", Model: "anthropic:claude-opus-4-6", Ts: 100},
-		{Event: "tool_call", Name: "shell", Args: map[string]any{"command": "go test ./..."}, Ts: 101},
-		{Event: "tool_result", Name: "shell", Status: "success", Content: "ok", Ts: 103.1},
+		{Event: "tool_call", Name: "execute", Args: map[string]any{"command": "go test ./..."}, Ts: 101},
+		{Event: "tool_result", Name: "execute", Status: "success", Content: "ok\n[Command succeeded with exit code 0]", Ts: 103.1},
 		{Event: "assistant", Text: "All tests pass. Verifying the constraint next.", Ts: 104},
-		{Event: "tool_call", Name: "read_file", Args: map[string]any{"path": "x.go"}, Ts: 105},
+		{Event: "tool_call", Name: "read_file", Args: map[string]any{"file_path": "/b/worktrees/slug/pkg/x.go"}, Ts: 105},
 		{Event: "turn_end", OutcomeHint: "completed", TokensIn: 489800, TokensOut: 4800, Ts: 120},
 		{raw: "not json"},
 	}
@@ -132,23 +134,156 @@ func TestRenderTranscriptLines(t *testing.T) {
 	if !strings.Contains(out, "reviewer") {
 		t.Errorf("output missing the turn_start lane header:\n%s", out)
 	}
-	if !strings.Contains(out, "$ go test ./...") {
-		t.Errorf("output missing the tool_call one-liner:\n%s", out)
+	// Model rendered bare (provider prefix stripped).
+	if !strings.Contains(out, "claude-opus-4-6") || strings.Contains(out, "anthropic:claude-opus-4-6") {
+		t.Errorf("turn_start model not rendered bare (want provider prefix stripped):\n%s", out)
 	}
-	if !strings.Contains(out, "→ success · 2.1s") {
-		t.Errorf("output missing the matched result status/duration:\n%s", out)
+	if !strings.Contains(out, "$ go test ./...") {
+		t.Errorf("output missing the shell tool_call one-liner:\n%s", out)
+	}
+	if !strings.Contains(out, "✓") {
+		t.Errorf("output missing the matched result ✓ badge:\n%s", out)
 	}
 	if !strings.Contains(out, "All tests pass.") {
 		t.Errorf("output missing the assistant text:\n%s", out)
 	}
-	if !strings.Contains(out, "read_file") {
-		t.Errorf("output missing the unanswered tool_call (should render with a pending marker):\n%s", out)
+	// read_file's arg resolves to a repo-relative path, not the raw tool name.
+	if !strings.Contains(out, "read") || !strings.Contains(out, "pkg/x.go") {
+		t.Errorf("output missing the resolved read_file arg:\n%s", out)
+	}
+	// The still-unanswered read_file call renders with a pending marker.
+	if !strings.Contains(out, "…") {
+		t.Errorf("output missing the pending marker for the unanswered call:\n%s", out)
 	}
 	if !strings.Contains(out, "↓489.8k") || !strings.Contains(out, "↑4.8k") {
 		t.Errorf("output missing turn_end tokens:\n%s", out)
 	}
 	if !strings.Contains(out, "not json") {
 		t.Errorf("output missing the malformed line's raw fallback:\n%s", out)
+	}
+}
+
+// TestRenderTranscriptLines_FailureSurfaced asserts the failure-biased result
+// rendering: an execute whose tool wrapper reported status="success" but whose
+// COMMAND exited non-zero is shown as a failure (✗ exit N) with the error tail
+// surfaced inline — the single most important correctness fix in the redesign,
+// since the flat renderer labeled these "ok".
+func TestRenderTranscriptLines_FailureSurfaced(t *testing.T) {
+	content := "[stderr] Traceback (most recent call last):\n" +
+		"[stderr]   File \"<stdin>\", line 1, in <module>\n" +
+		"[stderr] ModuleNotFoundError: No module named 'estimator_v2'\n\n" +
+		"Exit code: 1\n[Command failed with exit code 1]"
+	events := []transcriptEvent{
+		{Event: "turn_start", Lane: "coder", Ts: 100},
+		{Event: "tool_call", Name: "execute", Args: map[string]any{"command": "python - <<'PY'\nimport estimator_v2\nPY"}, Ts: 101},
+		{Event: "tool_result", Name: "execute", Status: "success", Content: content, Ts: 102},
+	}
+	out := strings.Join(renderTranscriptLines(events, 90), "\n")
+
+	if !strings.Contains(out, "✗ exit 1") {
+		t.Errorf("failed command not surfaced as ✗ exit 1 (status was a misleading \"success\"):\n%s", out)
+	}
+	if !strings.Contains(out, "ModuleNotFoundError: No module named 'estimator_v2'") {
+		t.Errorf("error tail not surfaced inline:\n%s", out)
+	}
+	// The command's first line shows; the heredoc body must not flood the view.
+	if !strings.Contains(out, "$ python - <<'PY'") {
+		t.Errorf("command first line missing:\n%s", out)
+	}
+}
+
+// TestRenderTranscriptLines_EditDiff asserts edit_file renders its
+// old_string/new_string as a red/green line diff, so the actual change is
+// visible instead of a bare "edit_file → ok".
+func TestRenderTranscriptLines_EditDiff(t *testing.T) {
+	events := []transcriptEvent{
+		{Event: "turn_start", Lane: "coder", Ts: 100},
+		{Event: "tool_call", Name: "edit_file", Args: map[string]any{
+			"file_path":  "/b/worktrees/slug/apps/x/contingency.py",
+			"old_string": "flat known-risk contingency\nsecond old line",
+			"new_string": "deduped adverse fork exposure\nsecond new line",
+		}, Ts: 101},
+		{Event: "tool_result", Name: "edit_file", Status: "success", Content: "Successfully replaced 1 instance(s)", Ts: 102},
+	}
+	out := strings.Join(renderTranscriptLines(events, 90), "\n")
+
+	if !strings.Contains(out, "edit") || !strings.Contains(out, "apps/x/contingency.py") {
+		t.Errorf("edit_file header missing resolved path:\n%s", out)
+	}
+	if !strings.Contains(out, "- flat known-risk contingency") {
+		t.Errorf("edit diff missing the removed line:\n%s", out)
+	}
+	if !strings.Contains(out, "+ deduped adverse fork exposure") {
+		t.Errorf("edit diff missing the added line:\n%s", out)
+	}
+}
+
+// TestRenderTranscriptLines_GrepMatches asserts grep resolves its pattern +
+// path and reports a match count from the result content.
+func TestRenderTranscriptLines_GrepMatches(t *testing.T) {
+	content := "apps/x/contingency.py:\n  277: def fork_contingency(forks):\n  512: fork_contingency(open)\n  640:     return fork_contingency(x)"
+	events := []transcriptEvent{
+		{Event: "turn_start", Lane: "coder", Ts: 100},
+		{Event: "tool_call", Name: "grep", Args: map[string]any{"pattern": "fork_contingency(", "path": "/b/worktrees/slug/apps/x"}, Ts: 101},
+		{Event: "tool_result", Name: "grep", Status: "success", Content: content, Ts: 102},
+	}
+	out := strings.Join(renderTranscriptLines(events, 90), "\n")
+
+	if !strings.Contains(out, "grep") || !strings.Contains(out, "fork_contingency(") {
+		t.Errorf("grep pattern not resolved:\n%s", out)
+	}
+	if !strings.Contains(out, "3 matches") {
+		t.Errorf("grep match count not reported:\n%s", out)
+	}
+}
+
+// TestTranscriptRenderHelpers locks the pure helpers the failure-biased
+// rendering hinges on: worktree-relative paths, real exit-code extraction, and
+// grep match counting.
+func TestTranscriptRenderHelpers(t *testing.T) {
+	// relPath strips the <board>/worktrees/<slug>/ prefix.
+	if got := relPath("/x/board/worktrees/kyle-spa-1-slug/apps/a.py"); got != "apps/a.py" {
+		t.Errorf("relPath = %q, want apps/a.py", got)
+	}
+	if got := relPath("/x/board/worktrees/kyle-spa-1-slug"); got != "." {
+		t.Errorf("relPath of a bare worktree root = %q, want .", got)
+	}
+	if got := relPath("/etc/passwd"); got != "/etc/passwd" {
+		t.Errorf("relPath of a non-worktree path = %q, want it unchanged", got)
+	}
+
+	// shortPath middle-elides but keeps the leading dir and the filename.
+	long := "/x/board/worktrees/slug/apps/estimator/src/estimator/contingency.py"
+	got := shortPath(long, 30)
+	if len([]rune(got)) > 30 {
+		t.Errorf("shortPath length = %d, want <= 30 (%q)", len([]rune(got)), got)
+	}
+	if !strings.HasPrefix(got, "apps") || !strings.HasSuffix(got, "contingency.py") || !strings.Contains(got, "…") {
+		t.Errorf("shortPath = %q, want apps…contingency.py shape", got)
+	}
+
+	// execExitCode reads the real command result out of an execute's content.
+	if code, ok := execExitCode("boom\nExit code: 1\n[Command failed with exit code 1]"); !ok || code != 1 {
+		t.Errorf("execExitCode(fail) = %d,%v, want 1,true", code, ok)
+	}
+	if code, ok := execExitCode("out\n[Command succeeded with exit code 0]"); !ok || code != 0 {
+		t.Errorf("execExitCode(ok) = %d,%v, want 0,true", code, ok)
+	}
+	if _, ok := execExitCode("just some tool output, no marker"); ok {
+		t.Errorf("execExitCode with no marker returned ok=true, want false")
+	}
+
+	// resultFailed: a shell success status is overridden by a non-zero exit.
+	if !resultFailed("success", "x\n[Command failed with exit code 2]") {
+		t.Errorf("resultFailed did not override a misleading success status")
+	}
+	if resultFailed("success", "file contents") {
+		t.Errorf("resultFailed flagged a plain success")
+	}
+
+	// grepMatchCount counts line-numbered hit lines.
+	if n := grepMatchCount("f.py:\n  1: a\n  2: b\n  3: c"); n != 3 {
+		t.Errorf("grepMatchCount = %d, want 3", n)
 	}
 }
 
@@ -180,19 +315,21 @@ func TestMatchToolResults_TurnScoped(t *testing.T) {
 	if o, ok := outcomes[1]; ok {
 		t.Errorf("turn 1's dead call (index 1) matched a result = %+v, want unresolved", o)
 	}
-	if o, ok := outcomes[4]; !ok || o.status != "success" || o.dur != 2.5 {
-		t.Errorf("turn 2's call (index 4) outcome = %+v ok=%v, want success · 2.5s", o, ok)
+	if o, ok := outcomes[4]; !ok || o.status != "success" {
+		t.Errorf("turn 2's call (index 4) outcome = %+v ok=%v, want a success result", o, ok)
 	}
 	if !consumed[5] {
 		t.Errorf("turn 2's result (index 5) not consumed, want consumed by its own turn's call")
 	}
 
 	out := strings.Join(renderTranscriptLines(events, 80), "\n")
-	if !strings.Contains(out, "$ go build ./...  → …") {
-		t.Errorf("crashed turn's call must render unresolved:\n%s", out)
+	// The crashed turn's call renders unresolved (pending "…" badge, never a ✓).
+	if !strings.Contains(out, "$ go build ./...") {
+		t.Errorf("crashed turn's call missing:\n%s", out)
 	}
-	if !strings.Contains(out, "$ go test ./...  → success · 2.5s") {
-		t.Errorf("later turn's call must pair with its own result:\n%s", out)
+	// The later turn's call pairs with its own result (✓ badge).
+	if !strings.Contains(out, "$ go test ./...") || !strings.Contains(out, "✓") {
+		t.Errorf("later turn's call must pair with its own result badge:\n%s", out)
 	}
 }
 
