@@ -23,6 +23,9 @@
 # superpowers ledger (never commit)
 .superpowers/
 
+# isolated implementation worktrees
+/.worktrees/
+
 # readme-agents-doc local recon cache and GitHub PR intel
 .readme-agents-doc/
 
