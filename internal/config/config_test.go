@@ -371,6 +371,46 @@ agent_backend:
 	}
 }
 
+func TestLoad_RejectsDaytonaVariablesInGeneralEnvAllowlist(t *testing.T) {
+	for _, key := range []string{"DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET"} {
+		t.Run(key, func(t *testing.T) {
+			path := writeYAML(t, baseValidYAML+`
+env_allowlist:
+  - PATH
+  - `+key+`
+`)
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatal("Load error = nil")
+			}
+			if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "env_allowlist") {
+				t.Errorf("Load error = %q, want safe env_allowlist rejection naming %s", err, key)
+			}
+		})
+	}
+}
+
+func TestLoad_RejectsCredentialBearingRepoRemoteWithoutLeakingIt(t *testing.T) {
+	path := writeYAML(t, strings.Replace(
+		baseValidYAML,
+		"https://github.com/yourorg/yourrepo.git",
+		"https://user:token-secret@github.com/x/y.git",
+		1,
+	))
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load error = nil")
+	}
+	if !strings.Contains(err.Error(), "repo.remote") {
+		t.Errorf("Load error = %q, want repo.remote", err)
+	}
+	for _, forbidden := range []string{"user", "token-secret", "https://"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("Load error %q leaked rejected remote content %q", err, forbidden)
+		}
+	}
+}
+
 // TestLoad_RequireChecksExplicitFalse asserts an explicit repo.require_checks:
 // false is honored (a repo declaring it has no CI at all), distinct from the
 // absent-key default of true.

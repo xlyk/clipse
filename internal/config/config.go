@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/xlyk/clipse/internal/backend"
 )
 
 // Defaults applied to fields absent from the YAML document.
@@ -582,6 +584,9 @@ func validate(cfg *Config) error {
 	if cfg.Repo.Remote == "" {
 		return fmt.Errorf("repo.remote is required")
 	}
+	if _, _, err := backend.CanonicalGitHubRemote(cfg.Repo.Remote); err != nil {
+		return fmt.Errorf("repo.remote is invalid: %w", err)
+	}
 	if cfg.Repo.Path == "" {
 		return fmt.Errorf("repo.path is required")
 	}
@@ -638,6 +643,10 @@ func validate(cfg *Config) error {
 		// rather than let it silently ride along into every worker's env.
 		if key == "LINEAR_API_KEY" {
 			return fmt.Errorf("env_allowlist must not include LINEAR_API_KEY (kernel-only secret, never passed to a worker)")
+		}
+		switch key {
+		case "DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET":
+			return fmt.Errorf("env_allowlist must not include %s (Daytona controller-only variable)", key)
 		}
 	}
 	// team_key/team_id scope every Linear query/mutation the dispatcher

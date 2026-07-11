@@ -112,10 +112,14 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 	workerCommand := resolveWorkerCommand(flags.workerBin, cfg.Worker.Command)
 	var backendManager backend.Manager
 	if cfg.AgentBackend.Type == "daytona" {
+		_, repoSlug, err := backend.CanonicalGitHubRemote(cfg.Repo.Remote)
+		if err != nil {
+			return fmt.Errorf("preflighting daytona backend: invalid repo.remote: %w", err)
+		}
 		backendManager = backend.NewCommandManager(workerCommand, nil, os.Environ())
 		if _, err := backendManager.List(cmd.Context(), backend.ListRequest{
 			Provider: "daytona",
-			RepoSlug: backend.RepoSlug(cfg.Repo.Remote),
+			RepoSlug: repoSlug,
 			Target:   cfg.AgentBackend.Daytona.Target,
 		}); err != nil {
 			return fmt.Errorf("preflighting daytona backend: %w", err)

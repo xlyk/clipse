@@ -38,12 +38,15 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	var (
 		workspace       string
 		remoteWorkspace backend.Workspace
+		repoURL         string
 		repoSlug        string
 		err             error
 	)
 	if d.cfg.AgentBackend.Type == "daytona" {
-		repoSlug = backend.RepoSlug(d.cfg.Repo.Remote)
-		if d.backend == nil {
+		repoURL, repoSlug, err = backend.CanonicalGitHubRemote(d.cfg.Repo.Remote)
+		if err != nil {
+			err = &backend.ActionError{Kind: backend.ErrorKindNeedsInput, Op: "ensure", Msg: "repo remote is not a safe GitHub remote"}
+		} else if d.backend == nil {
 			err = &backend.ActionError{Kind: backend.ErrorKindCapability, Op: "ensure", Msg: "Daytona backend manager is not configured"}
 		} else {
 			remoteWorkspace, err = d.backend.Ensure(ctx, backend.EnsureRequest{
@@ -51,7 +54,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 				Role:                      lane,
 				IssueID:                   issue.ID,
 				RunID:                     runID,
-				RepoURL:                   d.cfg.Repo.Remote,
+				RepoURL:                   repoURL,
 				RepoSlug:                  repoSlug,
 				BaseBranch:                d.cfg.Repo.BaseBranch,
 				Branch:                    issue.BranchName,
@@ -66,9 +69,11 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		workspace, err = d.ws.Ensure(issue)
 	}
 	if err != nil {
-		// A workspace/spawn failure is transient by nature, so it is eligible
-		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
-		// to blockOnSpawnFailure once the budget is spent (or RecoverCap is 0).
+		// Local workspace failures are transient and consume the bounded recovery
+		// budget. Daytona lifecycle failures preserve ActionError's typed
+		// classification: transient retries, while needs_input/capability park
+		// immediately. parkOrRetry handles both policies and falls back to
+		// blockOnSpawnFailure when appropriate.
 		// Either way the store's claim on runID is being cleared right now, so
 		// any stale d.inflight[runID] left over from a "continue" respawn
 		// (this is the SAME runID as the turn that just finished -- see
@@ -117,6 +122,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	// dispatcher's full environment".
 	env := d.envFor(issue)
 	if d.cfg.AgentBackend.Type == "daytona" {
+		env = spawn.RemoveEnv(env, "GH_TOKEN", "GITHUB_TOKEN")
 		env = spawn.MergeEnv(env, daytonaWorkerEnv())
 	}
 
@@ -161,7 +167,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		TranscriptPath:     d.transcriptPath(issue),
 		Backend:            backendName(d.cfg.AgentBackend.Type),
 		SandboxID:          remoteWorkspace.ExternalID,
-		RepoURL:            daytonaOnly(d.cfg.AgentBackend.Type, d.cfg.Repo.Remote),
+		RepoURL:            daytonaOnly(d.cfg.AgentBackend.Type, repoURL),
 		RepoSlug:           repoSlug,
 		Branch:             daytonaOnly(d.cfg.AgentBackend.Type, issue.BranchName),
 	}

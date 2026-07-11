@@ -51,6 +51,17 @@ func TestAllowlistedEnv(t *testing.T) {
 			wantEnv:   []string{"PATH=/usr/bin"},
 		},
 		{
+			name: "Daytona controller variables never enter the general worker environment",
+			environ: []string{
+				"DAYTONA_API_KEY=secret",
+				"DAYTONA_API_URL=https://daytona.example",
+				"DAYTONA_TARGET=us",
+				"PATH=/usr/bin",
+			},
+			allowlist: []string{"DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET", "PATH"},
+			wantEnv:   []string{"PATH=/usr/bin"},
+		},
+		{
 			name:      "empty allowlist yields empty env",
 			environ:   []string{"PATH=/usr/bin", "HOME=/home/x"},
 			allowlist: nil,

@@ -4,6 +4,8 @@ package backend
 
 import (
 	"context"
+	"errors"
+	"net/url"
 	"strings"
 )
 
@@ -75,27 +77,36 @@ type Manager interface {
 	List(context.Context, ListRequest) ([]Workspace, error)
 }
 
-// RepoSlug normalizes a GitHub HTTPS or SCP-style remote to owner/repo for
-// provider labels and lifecycle scoping.
-func RepoSlug(remote string) string {
-	value := strings.TrimSuffix(strings.TrimSpace(remote), "/")
-	value = strings.TrimSuffix(value, ".git")
-	if scheme := strings.Index(value, "://"); scheme >= 0 {
-		afterHost := value[scheme+3:]
-		if slash := strings.IndexByte(afterHost, '/'); slash >= 0 {
-			value = afterHost[slash+1:]
+// CanonicalGitHubRemote validates a credential-free GitHub HTTPS or SCP-style
+// SSH remote and returns the credential-free HTTPS clone URL plus owner/repo.
+// Errors deliberately omit the rejected input because URL userinfo may carry
+// a token.
+func CanonicalGitHubRemote(remote string) (canonicalURL, slug string, err error) {
+	value := strings.TrimSpace(remote)
+	var repoPath string
+	if strings.HasPrefix(value, "git@github.com:") {
+		repoPath = strings.TrimPrefix(value, "git@github.com:")
+	} else {
+		parsed, parseErr := url.Parse(value)
+		if parseErr != nil {
+			return "", "", errors.New("remote is not a valid GitHub URL")
 		}
-	} else if at := strings.IndexByte(value, '@'); at >= 0 {
-		if colon := strings.IndexByte(value[at:], ':'); colon >= 0 {
-			value = value[at+colon+1:]
+		if parsed.User != nil {
+			return "", "", errors.New("remote must not contain credentials")
 		}
+		if parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return "", "", errors.New("remote must be credential-free GitHub HTTPS or SCP-style SSH")
+		}
+		repoPath = parsed.Path
 	}
-	value = strings.Trim(value, "/")
-	parts := strings.Split(value, "/")
-	if len(parts) >= 2 {
-		return strings.Join(parts[len(parts)-2:], "/")
+
+	repoPath = strings.TrimSuffix(strings.Trim(repoPath, "/"), ".git")
+	parts := strings.Split(repoPath, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", errors.New("remote must identify one GitHub owner and repository")
 	}
-	return value
+	slug = parts[0] + "/" + parts[1]
+	return "https://github.com/" + slug + ".git", slug, nil
 }
 
 // ActionError is safe to expose to the kernel. It contains only the typed

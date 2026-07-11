@@ -76,7 +76,7 @@ func TestSpawnAttempt_DaytonaProvisionsPersistsAndSanitizesWorkerSpec(t *testing
 	if request.Provider != "daytona" || request.Role != "coder" || request.IssueID != "issue-1" || request.RunID != "run-1" {
 		t.Errorf("Ensure request identity = %+v", request)
 	}
-	if request.RepoURL != "git@github.com:xlyk/clipse.git" || request.RepoSlug != "xlyk/clipse" || request.BaseBranch != "main" || request.Branch != "issue-1-branch" {
+	if request.RepoURL != "https://github.com/xlyk/clipse.git" || request.RepoSlug != "xlyk/clipse" || request.BaseBranch != "main" || request.Branch != "issue-1-branch" {
 		t.Errorf("Ensure request repo metadata = %+v", request)
 	}
 	if request.AutoStopMinutes != 60 || request.ReviewerAutoDeleteMinutes != 30 || request.Snapshot != "snapshot-1" || request.Target != "us" {
@@ -91,7 +91,7 @@ func TestSpawnAttempt_DaytonaProvisionsPersistsAndSanitizesWorkerSpec(t *testing
 	if spec.Workspace != "/home/daytona/workspace/clipse" || spec.Backend != "daytona" || spec.SandboxID != "sandbox-1" {
 		t.Errorf("Daytona worker spec = %+v", spec)
 	}
-	if spec.RepoURL != cfg.Repo.Remote || spec.RepoSlug != "xlyk/clipse" || spec.Branch != "issue-1-branch" {
+	if spec.RepoURL != "https://github.com/xlyk/clipse.git" || spec.RepoSlug != "xlyk/clipse" || spec.Branch != "issue-1-branch" {
 		t.Errorf("Daytona worker repo metadata = %+v", spec)
 	}
 	wantEnv := []string{
@@ -114,6 +114,43 @@ func TestSpawnAttempt_DaytonaProvisionsPersistsAndSanitizesWorkerSpec(t *testing
 	}
 	if got := recorded[0]; got.OwnerKey != manager.workspace.OwnerKey || got.RunID != "run-1" || got.Role != "coder" || got.State != store.WorkspaceActive || got.LastAction != "ensure" {
 		t.Errorf("recorded workspace = %+v", got)
+	}
+}
+
+func TestSpawnAttempt_DaytonaDefaultEnvDropsHostGitHubTokens(t *testing.T) {
+	t.Setenv("PATH", "/host/bin")
+	t.Setenv("HOME", "/host/home")
+	t.Setenv("GH_TOKEN", "gh-secret")
+	t.Setenv("GITHUB_TOKEN", "github-secret")
+	t.Setenv("DAYTONA_API_KEY", "daytona-secret")
+
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+	spawner := newFakeSpawner()
+	manager := &fakeBackendManager{workspace: backend.Workspace{
+		Provider: "daytona", OwnerKey: "daytona:xlyk/clipse:coder:issue-1", ExternalID: "sandbox-1",
+		WorkspacePath: "/home/daytona/workspace/clipse", State: "active",
+	}}
+	cfg := testConfig()
+	cfg.Repo.Remote = "https://github.com/xlyk/clipse.git"
+	cfg.AgentBackend = config.AgentBackend{Type: "daytona", Daytona: config.DaytonaBackend{AutoStopMinutes: 60, ReviewerAutoDeleteMinutes: 60}}
+	cfg.EnvAllowlist = []string{"PATH", "HOME", "GH_TOKEN", "GITHUB_TOKEN"}
+	d := dispatcher.New(cfg, s, &linear.MockClient{}, spawner, newStubWorkspacer(t.TempDir()),
+		dispatcher.WithClock(fixedClock(1000)), dispatcher.WithRunIDGenerator(sequentialRunIDs()), dispatcher.WithBackendManager(manager),
+	)
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	env := spawner.Specs()[0].Env
+	for _, key := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
+		if _, ok := envValue(env, key); ok {
+			t.Errorf("Daytona worker Env leaked %s: %v", key, env)
+		}
+	}
+	for _, key := range []string{"PATH", "HOME", "DAYTONA_API_KEY", "CLIPSE_ISSUE_TEXT"} {
+		if _, ok := envValue(env, key); !ok {
+			t.Errorf("Daytona worker Env missing %s: %v", key, env)
+		}
 	}
 }
 
@@ -165,6 +202,7 @@ func TestSpawnAttempt_DaytonaProvisionErrorsRespectKind(t *testing.T) {
 			spawner := newFakeSpawner()
 			cfg := testConfig()
 			cfg.AgentBackend.Type = "daytona"
+			cfg.Repo.Remote = "https://github.com/xlyk/clipse.git"
 			cfg.RecoverCap = 2
 			cfg.RecoverBackoffS = 1
 			manager := &fakeBackendManager{err: tt.err}

@@ -162,3 +162,55 @@ func TestCommandManagerRejectsMultipleJSONObjects(t *testing.T) {
 		t.Fatalf("error = %T %v, want capability ActionError", err, err)
 	}
 }
+
+func TestCanonicalGitHubRemote(t *testing.T) {
+	tests := []struct {
+		name          string
+		remote        string
+		wantURL       string
+		wantSlug      string
+		wantErr       bool
+		forbiddenText []string
+	}{
+		{
+			name:     "clean HTTPS",
+			remote:   "https://github.com/x/y.git",
+			wantURL:  "https://github.com/x/y.git",
+			wantSlug: "x/y",
+		},
+		{
+			name:     "GitHub SCP SSH",
+			remote:   "git@github.com:x/y.git",
+			wantURL:  "https://github.com/x/y.git",
+			wantSlug: "x/y",
+		},
+		{
+			name:          "credential-bearing HTTPS",
+			remote:        "https://user:token-secret@github.com/x/y.git",
+			wantErr:       true,
+			forbiddenText: []string{"user", "token-secret", "https://"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotURL, gotSlug, err := CanonicalGitHubRemote(tt.remote)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("CanonicalGitHubRemote error = nil")
+				}
+				for _, forbidden := range tt.forbiddenText {
+					if strings.Contains(err.Error(), forbidden) {
+						t.Errorf("error %q leaked rejected remote content %q", err, forbidden)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotURL != tt.wantURL || gotSlug != tt.wantSlug {
+				t.Errorf("CanonicalGitHubRemote() = %q, %q; want %q, %q", gotURL, gotSlug, tt.wantURL, tt.wantSlug)
+			}
+		})
+	}
+}
