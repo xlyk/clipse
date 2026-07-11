@@ -206,6 +206,7 @@ async def run_poc(model_spec: str) -> None:
             agent,
             {"configurable": {"thread_id": f"daytona-poc-{nonce}"}},
             task_text=task,
+            max_tokens=None,
         )
         if token in turn.final_text or token in turn.last_text:
             raise PocError("GitHub token appeared in agent output")
