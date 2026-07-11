@@ -2,6 +2,9 @@ package dispatcher_test
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,6 +13,48 @@ import (
 	"github.com/xlyk/clipse/internal/gitops"
 	"github.com/xlyk/clipse/internal/linear"
 )
+
+func runGitopsTestGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s (dir=%s): %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func newGitopsRemoteAndClone(t *testing.T) (origin, primary string) {
+	t.Helper()
+	seed := filepath.Join(t.TempDir(), "seed")
+	if err := os.MkdirAll(seed, 0o755); err != nil {
+		t.Fatalf("creating seed repo: %v", err)
+	}
+	runGitopsTestGit(t, seed, "init", "-b", "main")
+	runGitopsTestGit(t, seed, "config", "user.name", "Clipse Test")
+	runGitopsTestGit(t, seed, "config", "user.email", "clipse-test@example.com")
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("dispatcher gitops fixture\n"), 0o644); err != nil {
+		t.Fatalf("writing seed README: %v", err)
+	}
+	runGitopsTestGit(t, seed, "add", "README.md")
+	runGitopsTestGit(t, seed, "commit", "-m", "initial commit")
+
+	origin = filepath.Join(t.TempDir(), "origin.git")
+	runGitopsTestGit(t, filepath.Dir(origin), "clone", "--bare", seed, origin)
+	primary = filepath.Join(t.TempDir(), "primary")
+	runGitopsTestGit(t, filepath.Dir(primary), "clone", origin, primary)
+	return origin, primary
+}
+
+func cloneGitopsRemote(t *testing.T, origin, name string) string {
+	t.Helper()
+	clone := filepath.Join(t.TempDir(), name)
+	runGitopsTestGit(t, filepath.Dir(clone), "clone", origin, clone)
+	runGitopsTestGit(t, clone, "config", "user.name", "Clipse Test")
+	runGitopsTestGit(t, clone, "config", "user.email", "clipse-test@example.com")
+	return clone
+}
 
 // TestTick_MergingClaim_Mergeable_RoutesToDone asserts a claimed merging
 // card whose fake gitops run reports OutcomeMerged flows through the SAME
@@ -201,6 +246,63 @@ func TestTick_MergingClaim_OpenPR_PreCheckFallsThroughToWorktreeMerge(t *testing
 	}
 	if issue.BoardStatus != string(contract.ColumnDone) {
 		t.Errorf("BoardStatus = %q, want done", issue.BoardStatus)
+	}
+}
+
+// TestTick_MergingClaim_RemoteOnlyBranchRunsGitopsFromRemoteTip covers the
+// production Workspacer boundary: a Daytona coder publishes the issue branch
+// without creating a host-local branch, then the Git-operator must ensure a
+// worktree whose HEAD and contents come from that remote feature tip.
+func TestTick_MergingClaim_RemoteOnlyBranchRunsGitopsFromRemoteTip(t *testing.T) {
+	origin, primary := newGitopsRemoteAndClone(t)
+	daytona := cloneGitopsRemote(t, origin, "daytona")
+
+	const branch = "issue-1-branch"
+	runGitopsTestGit(t, daytona, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(daytona, "daytona.txt"), []byte("remote agent commit\n"), 0o644); err != nil {
+		t.Fatalf("writing Daytona change: %v", err)
+	}
+	runGitopsTestGit(t, daytona, "add", "daytona.txt")
+	runGitopsTestGit(t, daytona, "commit", "-m", "feat: remote change")
+	wantSHA := runGitopsTestGit(t, daytona, "rev-parse", "HEAD")
+	runGitopsTestGit(t, daytona, "push", "origin", "HEAD:refs/heads/"+branch)
+	if got := runGitopsTestGit(t, primary, "ls-remote", "--heads", "origin", "refs/heads/"+branch); !strings.Contains(got, wantSHA) {
+		t.Fatalf("precondition: remote feature ref = %q, want SHA %s", got, wantSHA)
+	}
+
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", "merging", 1, 100)
+	lc := &linear.MockClient{}
+	cfg := testConfig()
+	cfg.Repo.Path = primary
+	ws := dispatcher.NewGitWorkspacer(primary, cfg.Repo.BaseBranch, t.TempDir())
+
+	var gotSHA string
+	var gotContents []byte
+	var readErr error
+	gitOpsFn := func(_ context.Context, spec gitops.Spec) (gitops.Result, error) {
+		gotSHA = runGitopsTestGit(t, spec.Workspace, "rev-parse", "HEAD")
+		gotContents, readErr = os.ReadFile(filepath.Join(spec.Workspace, "daytona.txt"))
+		return gitops.Result{Outcome: gitops.OutcomeCIPending, PRURL: "https://github.com/x/y/pull/7", PRNumber: 7}, nil
+	}
+	d := dispatcher.New(cfg, s, lc, newFakeSpawner(), ws,
+		dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+		dispatcher.WithGitOpsRunner(gitOpsFn),
+		dispatcher.WithGitOpsPreChecker(fallThroughPreCheck),
+	)
+
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+	if gotSHA != wantSHA {
+		t.Errorf("gitops workspace HEAD = %s, want remote feature %s", gotSHA, wantSHA)
+	}
+	if readErr != nil {
+		t.Fatalf("reading Daytona commit from gitops workspace: %v", readErr)
+	}
+	if got := string(gotContents); got != "remote agent commit\n" {
+		t.Errorf("daytona.txt = %q, want remote agent commit", got)
 	}
 }
 
