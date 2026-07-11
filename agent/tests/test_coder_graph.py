@@ -209,6 +209,7 @@ class RecordingSession:
         sync_result: coder.CommandResult | None = None,
         unmerged_files: str = "",
         unresolved_markers: str = "",
+        merge_commit_result: coder.CommandResult | None = None,
         pr_url: str = "https://github.com/xlyk/clipse/pull/1",
     ) -> None:
         self.cwd = cwd
@@ -217,6 +218,7 @@ class RecordingSession:
         self.sync_result = sync_result or coder.CommandResult(0)
         self.unmerged_files = unmerged_files
         self.unresolved_markers = unresolved_markers
+        self.merge_commit_result = merge_commit_result or coder.CommandResult(0)
         self.pr_url = pr_url
         self.operations: list[tuple[Any, ...]] = []
 
@@ -246,6 +248,10 @@ class RecordingSession:
     def commit(self, message: str) -> coder.CommandResult:
         self.operations.append(("commit", message))
         return coder.CommandResult(0)
+
+    def commit_merge(self) -> coder.CommandResult:
+        self.operations.append(("commit_merge",))
+        return self.merge_commit_result
 
     def push(self, branch: str) -> coder.CommandResult:
         self.operations.append(("push", branch))
@@ -476,6 +482,41 @@ def test_remote_session_merge_conflict_reaches_dac() -> None:
     assert "src/a.py" in code_call["task_text"]
     assert "Implement the issue." not in code_call["task_text"]
     assert result.outcome == Outcome.needs_review
+    assert ("commit_merge",) in session.operations
+
+
+def test_remote_session_merge_commit_failure_blocks_push_and_pr() -> None:
+    session = RecordingSession(
+        sync_result=coder.CommandResult(1, "", "CONFLICT (content)"),
+        unmerged_files="src/a.py\n",
+        merge_commit_result=coder.CommandResult(1, "", "merge commit failed"),
+    )
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Resolved the conflict.",
+        tokens_in=1,
+        tokens_out=1,
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        session=session,
+    )
+    input_state: coder.CoderState = {
+        "issue_id": "CLI-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "workspace": session.cwd,
+        "branch": session.branch,
+        "base_branch": "main",
+        "issue_text": "Implement the issue.",
+    }
+
+    with pytest.raises(coder.CoderGraphError, match="merge commit failed"):
+        asyncio.run(graph.ainvoke(input_state, {"configurable": {"thread_id": "thread-1"}}))
+
+    assert ("commit_merge",) in session.operations
+    assert not any(operation[0] in {"push", "github"} for operation in session.operations)
 
 
 def test_remote_session_unresolved_markers_block_commit() -> None:

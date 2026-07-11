@@ -33,6 +33,11 @@ class AgentSession(Protocol):
     def commit(self, message: str) -> CommandResult:
         raise NotImplementedError
 
+    def commit_merge(self) -> CommandResult:
+        """Complete an in-progress merge with its existing merge message."""
+
+        raise NotImplementedError
+
     def push(self, branch: str) -> CommandResult:
         raise NotImplementedError
 

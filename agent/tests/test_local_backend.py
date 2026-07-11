@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from clipse_agent.backends import local
 from clipse_agent.backends.local import LocalSession
-from clipse_agent.backends.session import CommandResult
+from clipse_agent.backends.session import AgentSession, CommandResult
 from clipse_agent.graphs import coder, reviewer
 
 
@@ -51,3 +51,21 @@ def test_local_session_github_owns_the_gh_executable(monkeypatch) -> None:
 
     assert session.github(["pr", "view", "feat/CLI-1"]) == CommandResult(0, "ok")
     assert calls == [["gh", "pr", "view", "feat/CLI-1"]]
+
+
+def test_agent_session_protocol_declares_merge_completion() -> None:
+    assert callable(AgentSession.__dict__["commit_merge"])
+
+
+def test_local_session_commit_merge_preserves_existing_merge_message(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(local.subprocess, "run", fake_run)
+    session = LocalSession("/work/issue-1", "xlyk/clipse")
+
+    assert session.commit_merge() == CommandResult(0)
+    assert calls == [["git", "commit", "--no-edit"]]

@@ -37,6 +37,9 @@ class LocalSession:
     def commit(self, message: str) -> CommandResult:
         return self.run(["git", "commit", "-m", message])
 
+    def commit_merge(self) -> CommandResult:
+        return self.run(["git", "commit", "--no-edit"])
+
     def push(self, branch: str) -> CommandResult:
         return self.run(["git", "push", "--set-upstream", "origin", branch])
 

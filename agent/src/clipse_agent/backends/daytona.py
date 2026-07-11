@@ -343,6 +343,19 @@ class DaytonaSession:
             return CommandResult(1, stderr=safe_error("git commit", exc))
         return CommandResult(0)
 
+    def commit_merge(self) -> CommandResult:
+        return self.run(
+            [
+                "git",
+                "-c",
+                f"user.name={GIT_AUTHOR_NAME}",
+                "-c",
+                f"user.email={GIT_AUTHOR_EMAIL}",
+                "commit",
+                "--no-edit",
+            ]
+        )
+
     def push(self, branch: str) -> CommandResult:
         token, failure = self._git_token("git push authentication")
         if failure is not None:

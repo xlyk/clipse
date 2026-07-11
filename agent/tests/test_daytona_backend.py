@@ -658,6 +658,23 @@ def test_daytona_session_commit_uses_sdk_git_and_github_stays_on_host() -> None:
     ]
 
 
+def test_daytona_session_commit_merge_preserves_message_and_supplies_author() -> None:
+    backend = _FakeDaytonaBackend()
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        backend,
+        _FakeSessionSandbox(),
+        token_reader=lambda: "unused",
+        host_runner=lambda _argv: "unused",
+    )
+
+    assert session.commit_merge() == CommandResult(0, stdout="remote output")
+    assert backend.calls == [
+        "git -c user.name=clipse -c user.email=clipse@users.noreply.github.com commit --no-edit"
+    ]
+
+
 class _RecordingBackend:
     """Pinned SandboxBackendProtocol surface used to verify full delegation."""
 

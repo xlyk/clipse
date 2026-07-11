@@ -881,7 +881,15 @@ def make_commit(
         committed = False
         if paths or merging:
             if merging:
-                _run(resolved_run_command, ["git", "commit", "--no-edit"], cwd)
+                if session is not None:
+                    committed_result = session.commit_merge()
+                    if committed_result.returncode != 0:
+                        raise CoderGraphError(
+                            f"command failed (exit {committed_result.returncode}): git commit --no-edit\n"
+                            f"stderr: {committed_result.stderr}"
+                        )
+                else:
+                    _run(run_command, ["git", "commit", "--no-edit"], cwd)
             elif session is not None:
                 committed_result = session.commit(_commit_message(state))
                 if committed_result.returncode != 0:
