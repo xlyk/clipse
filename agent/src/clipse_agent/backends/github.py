@@ -15,6 +15,42 @@ def _operation(argv: Sequence[str]) -> str:
     return " ".join(argv[:3]) or "host command"
 
 
+def canonical_github_command(argv: Sequence[str], repo_slug: str) -> list[str]:
+    """Return one host ``gh`` command pinned to the configured repository.
+
+    Repository-aware ``gh`` subcommands receive exactly one canonical
+    ``--repo`` argument. ``gh api`` has no ``--repo`` option, so its standard
+    owner/repository placeholders are expanded before the command reaches the
+    host instead of relying on whichever checkout happens to be current.
+    """
+
+    command = list(argv)
+    if not command or command[0] != "gh":
+        command.insert(0, "gh")
+
+    scoped: list[str] = []
+    skip_value = False
+    for arg in command:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg in {"--repo", "-R"}:
+            skip_value = True
+            continue
+        if arg.startswith("--repo="):
+            continue
+        scoped.append(arg)
+
+    if len(scoped) > 1 and scoped[1] == "api":
+        owner, repo = repo_slug.split("/", 1)
+        if len(scoped) > 2:
+            scoped[2] = scoped[2].replace("{owner}", owner).replace("{repo}", repo)
+        return scoped
+
+    scoped.extend(["--repo", repo_slug])
+    return scoped
+
+
 def subprocess_host_runner(argv: list[str]) -> str:
     """Run a host command without propagating its potentially secret output."""
 
@@ -22,10 +58,15 @@ def subprocess_host_runner(argv: list[str]) -> str:
     try:
         completed = subprocess.run(argv, capture_output=True, check=True, text=True)
     except subprocess.CalledProcessError as exc:
+        message = f"{operation} exited with status {exc.returncode}"
+        if "no pull requests found" in (exc.stderr or "").lower():
+            # Preserve the reviewer's intentional no-PR fallback without
+            # forwarding arbitrary stderr (which may contain credentials).
+            message = "no pull requests found"
         raise BackendActionError(
             "needs_input",
             operation,
-            f"{operation} exited with status {exc.returncode}",
+            message,
         ) from None
     except OSError:
         raise BackendActionError("needs_input", operation, f"{operation} could not be executed") from None
@@ -58,6 +99,7 @@ __all__ = [
     "AuthPreflight",
     "BackendActionError",
     "HostRunner",
+    "canonical_github_command",
     "github_auth_preflight",
     "github_token",
     "safe_error",

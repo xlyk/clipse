@@ -36,7 +36,13 @@ from clipse_agent.backends.contracts import (
     BackendWorkspace,
     WorkspaceState,
 )
-from clipse_agent.backends.github import AuthPreflight, github_auth_preflight, github_token, safe_error
+from clipse_agent.backends.github import (
+    AuthPreflight,
+    canonical_github_command,
+    github_auth_preflight,
+    github_token,
+    safe_error,
+)
 from clipse_agent.backends.github import HostRunner, subprocess_host_runner
 from clipse_agent.backends.session import CommandResult
 
@@ -374,11 +380,7 @@ class DaytonaSession:
         return CommandResult(0)
 
     def github(self, argv: Sequence[str]) -> CommandResult:
-        command = list(argv)
-        if not command or command[0] != "gh":
-            command.insert(0, "gh")
-        if len(command) > 1 and command[1] != "api" and not ({"--repo", "-R"} & set(command)):
-            command.extend(["--repo", self.repo_slug])
+        command = canonical_github_command(argv, self.repo_slug)
         try:
             stdout = self.host_runner(command)
         except BackendActionError as exc:

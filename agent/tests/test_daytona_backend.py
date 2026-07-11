@@ -258,7 +258,10 @@ def test_ensure_creates_reviewer_with_auto_delete_and_run_scoped_labels() -> Non
     assert params.labels == labels_for(request)
     assert params.auto_stop_interval == 60
     assert params.auto_delete_interval == 45
+    assert params.env_vars == {}
     assert client.sandboxes[0].git.clone_calls[0]["branch"] == request.branch
+    assert "ghp_clone_secret" not in repr(client.sandboxes[0].env)
+    assert "ghp_clone_secret" not in repr(client.sandboxes[0].git.config)
 
 
 def test_list_returns_only_matching_typed_workspaces() -> None:
@@ -655,6 +658,34 @@ def test_daytona_session_commit_uses_sdk_git_and_github_stays_on_host() -> None:
             "--repo",
             "xlyk/clipse",
         ]
+    ]
+
+
+def test_daytona_session_github_replaces_caller_scope_and_expands_api_repository() -> None:
+    host_calls: list[list[str]] = []
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        _FakeDaytonaBackend(),
+        _FakeSessionSandbox(),
+        token_reader=lambda: "unused",
+        host_runner=lambda argv: host_calls.append(argv) or "",
+    )
+
+    assert session.github(["pr", "diff", "feat/CLI-1", "--repo", "other/repo"]) == CommandResult(0)
+    assert session.github(
+        ["api", "repos/{owner}/{repo}/pulls/7/comments", "-f", "body=keep {owner}/{repo} literal"]
+    ) == CommandResult(0)
+
+    assert host_calls == [
+        ["gh", "pr", "diff", "feat/CLI-1", "--repo", "xlyk/clipse"],
+        [
+            "gh",
+            "api",
+            "repos/xlyk/clipse/pulls/7/comments",
+            "-f",
+            "body=keep {owner}/{repo} literal",
+        ],
     ]
 
 

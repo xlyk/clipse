@@ -24,6 +24,7 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from clipse_agent import dac
+from clipse_agent.backends.daytona import DaytonaSession, REMOTE_REPO_ABS
 from clipse_agent.contract import BlockKind, Lane, Outcome, WorkerResult
 from clipse_agent.dac import DacTurnResult
 from clipse_agent.graphs import coder, reviewer
@@ -87,6 +88,71 @@ class FakeRunner:
             if predicate(argv_list):
                 return result
         return self.default
+
+
+class _RecordingDaytonaBackend:
+    """Sandbox command surface that must stay unused by reviewer GitHub I/O."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def execute(self, command: str) -> Any:
+        self.calls.append(command)
+        raise AssertionError("reviewer GitHub operations must stay on the host")
+
+
+class _RecordingReviewerSession:
+    provider = "daytona"
+    cwd = REMOTE_REPO_ABS
+    sandbox_type = "daytona"
+
+    def __init__(self) -> None:
+        self.sandbox = _RecordingDaytonaBackend()
+        self.run_calls: list[tuple[str, ...]] = []
+        self.github_calls: list[tuple[str, ...]] = []
+        self.token_reads = 0
+        self.diff = "diff --git a/README.md b/README.md\n+provided by GitHub\n"
+        self.names = "README.md\n"
+        self.pr_info = json.dumps(
+            {
+                "number": 7,
+                "headRefOid": "deadbeef",
+                "url": "https://github.com/xlyk/clipse/pull/7",
+            }
+        )
+
+        def read_token() -> str:
+            self.token_reads += 1
+            return "reviewer-token-must-not-be-read"
+
+        def run_host(argv: list[str]) -> str:
+            self.github_calls.append(tuple(argv))
+            if argv[:3] == ["gh", "pr", "diff"]:
+                return self.names if "--name-only" in argv else self.diff
+            if argv[:3] == ["gh", "pr", "view"]:
+                return self.pr_info
+            return ""
+
+        self._session = DaytonaSession(
+            REMOTE_REPO_ABS,
+            "xlyk/clipse",
+            self.sandbox,
+            object(),
+            token_reader=read_token,
+            host_runner=run_host,
+        )
+
+    def github(self, argv: Sequence[str]) -> coder.CommandResult:
+        return self._session.github(argv)
+
+    def run(self, argv: Sequence[str]) -> coder.CommandResult:
+        call = tuple(argv)
+        self.run_calls.append(call)
+        if call == ("git", "rev-parse", "--is-inside-work-tree"):
+            return coder.CommandResult(0, "true\n")
+        if call == ("git", "rev-parse", "--abbrev-ref", "HEAD"):
+            return coder.CommandResult(0, "feat/CLI-1\n")
+        return coder.CommandResult(1, stderr="unexpected sandbox command")
 
 
 def _base_runner(
@@ -190,6 +256,87 @@ def _assert_valid_result(result: WorkerResult, *, blocked: bool) -> None:
 # ---------------------------------------------------------------------------
 # Happy path: PASS verdict -> done, full node order, no gh calls at all
 # ---------------------------------------------------------------------------
+
+
+def test_reviewer_diff_comes_from_host_github() -> None:
+    session = _RecordingReviewerSession()
+    node = reviewer.make_load_diff(session)
+    state: reviewer.ReviewerState = {
+        "cwd": REMOTE_REPO_ABS,
+        "branch": "feat/CLI-1",
+        "task_text": "review",
+    }
+
+    result = node(state)
+
+    assert session.github_calls == [
+        ("gh", "pr", "diff", "feat/CLI-1", "--repo", "xlyk/clipse"),
+    ]
+    assert "provided for your review" in result["task_text"]
+    assert "provided by GitHub" in result["task_text"]
+    assert session.sandbox.calls == []
+    assert session.token_reads == 0
+
+
+def test_reviewer_truncated_diff_gets_changed_names_from_host_github() -> None:
+    session = _RecordingReviewerSession()
+    session.diff = (
+        "diff --git a/kept.py b/kept.py\n" + ("+line\n" * 12_000) + "diff --git a/omitted.py b/omitted.py\n"
+    )
+    session.names = "kept.py\nomitted.py\n"
+    node = reviewer.make_load_diff(session)
+
+    result = node(
+        {
+            "cwd": REMOTE_REPO_ABS,
+            "branch": "feat/CLI-1",
+            "base_branch": "main",
+            "task_text": "review",
+        }
+    )
+
+    assert session.github_calls == [
+        ("gh", "pr", "diff", "feat/CLI-1", "--repo", "xlyk/clipse"),
+        ("gh", "pr", "diff", "feat/CLI-1", "--name-only", "--repo", "xlyk/clipse"),
+    ]
+    assert "DIFF TRUNCATED" in result["task_text"]
+    assert "- omitted.py" in result["task_text"]
+    assert session.sandbox.calls == []
+    assert session.token_reads == 0
+
+
+def test_daytona_reviewer_graph_validates_remote_worktree_through_session() -> None:
+    session = _RecordingReviewerSession()
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Looks good.\n\nVERDICT: PASS",
+        tokens_in=1,
+        tokens_out=1,
+    )
+    graph = reviewer.build_reviewer_graph(
+        session=session,
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=FakeRunner(default=coder.CommandResult(1, stderr="host runner must stay unused")),
+    )
+
+    _, result = asyncio.run(
+        _drive(
+            graph,
+            {
+                "issue_id": "CLI-1",
+                "run_id": "run-1",
+                "thread_id": "thread-1",
+                "workspace": REMOTE_REPO_ABS,
+                "branch": "feat/CLI-1",
+                "issue_text": "review",
+            },
+            {"configurable": {"thread_id": "thread-1"}},
+        )
+    )
+
+    assert result.outcome == Outcome.done
+    assert session.run_calls == [("git", "rev-parse", "--is-inside-work-tree")]
 
 
 def test_pass_verdict_runs_full_node_order_and_emits_done(tmp_path):
@@ -419,6 +566,63 @@ def test_load_diff_small_diff_has_no_truncation_note(tmp_path):
 # ---------------------------------------------------------------------------
 # changes_requested: inline comments posted via gh + a summary review
 # ---------------------------------------------------------------------------
+
+
+def test_reviewer_comments_use_host_github_with_canonical_repository_scope() -> None:
+    session = _RecordingReviewerSession()
+    node = reviewer.make_post_comments(session)
+
+    result = node(
+        {
+            "branch": "feat/CLI-1",
+            "cwd": REMOTE_REPO_ABS,
+            "dac_summary": "found a defect",
+            "review_comments": [
+                reviewer.InlineComment(path="agent.py", line=12, body="handle the error")
+            ],
+        }
+    )
+
+    assert result["comments_posted"] == 1
+    assert session.github_calls == [
+        (
+            "gh",
+            "pr",
+            "view",
+            "feat/CLI-1",
+            "--json",
+            "number,headRefOid,url",
+            "--repo",
+            "xlyk/clipse",
+        ),
+        (
+            "gh",
+            "api",
+            "repos/xlyk/clipse/pulls/7/comments",
+            "-f",
+            "body=handle the error",
+            "-f",
+            "commit_id=deadbeef",
+            "-f",
+            "path=agent.py",
+            "-F",
+            "line=12",
+            "-f",
+            "side=RIGHT",
+        ),
+        (
+            "gh",
+            "pr",
+            "comment",
+            "feat/CLI-1",
+            "--body",
+            "found a defect Posted 1 inline comment(s).",
+            "--repo",
+            "xlyk/clipse",
+        ),
+    ]
+    assert session.sandbox.calls == []
+    assert session.token_reads == 0
 
 
 def test_changes_requested_posts_inline_comments_and_a_summary_comment(tmp_path):

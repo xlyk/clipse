@@ -62,6 +62,10 @@ func (d *Dispatcher) applyResult(ctx context.Context, rr runResult) error {
 		return nil
 	}
 	inf.cancel()
+	if err := d.markReviewerWorkspaceCleanupPending(ctx, rr, inf); err != nil {
+		d.requeueResult(rr, "reviewer workspace cleanup mark failed")
+		return fmt.Errorf("marking reviewer workspace cleanup for run %s: %w", rr.runID, err)
+	}
 
 	issue, err := d.store.GetIssue(ctx, rr.issueID)
 	if err != nil {
@@ -87,12 +91,7 @@ func (d *Dispatcher) applyResult(ctx context.Context, rr runResult) error {
 		// never deleted on this path), so reconcile's Heartbeat loop keeps
 		// its claim alive and the run stays visible for a later retry,
 		// instead of vanishing silently.
-		select {
-		case d.results <- rr:
-		default:
-			d.logger.Error("results channel full, could not requeue result; leaving run inflight for a later retry",
-				"run_id", rr.runID, "issue_id", rr.issueID, "buffer_cap", cap(d.results))
-		}
+		d.requeueResult(rr, "issue load failed")
 		return fmt.Errorf("loading issue %s for run %s: %w", rr.issueID, rr.runID, err)
 	}
 
@@ -116,6 +115,49 @@ func (d *Dispatcher) applyResult(ctx context.Context, rr runResult) error {
 
 	delete(d.inflight, rr.runID)
 	return d.applyTerminalWorkerOutcome(ctx, *issue, rr.runID, inf.lane, rr.res.Worker)
+}
+
+// markReviewerWorkspaceCleanupPending durably queues only the fresh,
+// run-scoped reviewer sandbox after its process has exited. Coder sandboxes
+// are issue-scoped and persistent, so neither local runs nor any other lane
+// enters this path. Task 8 owns draining the durable cleanup queue.
+func (d *Dispatcher) markReviewerWorkspaceCleanupPending(ctx context.Context, rr runResult, inf inflightRun) error {
+	if d.cfg.AgentBackend.Type != "daytona" || inf.lane != string(contract.LaneReviewer) {
+		return nil
+	}
+	workspaces, err := d.store.AgentWorkspacesByIssue(ctx, rr.issueID)
+	if err != nil {
+		return fmt.Errorf("loading agent workspaces: %w", err)
+	}
+	var ownerKey string
+	for _, workspace := range workspaces {
+		if workspace.Role != string(contract.LaneReviewer) || workspace.RunID != rr.runID {
+			continue
+		}
+		if ownerKey != "" {
+			return fmt.Errorf("multiple reviewer workspaces recorded for run %s", rr.runID)
+		}
+		ownerKey = workspace.OwnerKey
+	}
+	if ownerKey == "" {
+		return fmt.Errorf("no reviewer workspace recorded for run %s", rr.runID)
+	}
+	if err := d.store.MarkWorkspaceCleanupPending(ctx, ownerKey, d.now()); err != nil {
+		return fmt.Errorf("marking %s cleanup pending: %w", ownerKey, err)
+	}
+	return nil
+}
+
+// requeueResult follows the reconciliation discipline for a durable side
+// effect that failed after Wait returned: retain the one-shot worker result
+// for the next tick, never silently apply or discard it.
+func (d *Dispatcher) requeueResult(rr runResult, reason string) {
+	select {
+	case d.results <- rr:
+	default:
+		d.logger.Error("results channel full, could not requeue result; leaving run inflight for a later retry",
+			"run_id", rr.runID, "issue_id", rr.issueID, "reason", reason, "buffer_cap", cap(d.results))
+	}
 }
 
 // blockReasonFor renders a human-readable reason for a Spawner/RunHandle

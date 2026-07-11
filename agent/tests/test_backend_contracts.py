@@ -246,3 +246,22 @@ def test_subprocess_host_runner_discards_sensitive_process_output(monkeypatch) -
     assert raised.value.operation == "gh auth token"
     assert str(raised.value) == "gh auth token exited with status 17"
     assert token not in str(raised.value)
+
+
+def test_subprocess_host_runner_preserves_only_safe_no_pr_signal(monkeypatch) -> None:
+    token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"
+
+    def fail(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(
+            1,
+            ["gh", "pr", "view", "feat/CLI-1", "--repo", "xlyk/clipse"],
+            stderr=f"no pull requests found for branch; authorization: bearer {token}",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail)
+
+    with pytest.raises(BackendActionError) as raised:
+        subprocess_host_runner(["gh", "pr", "view", "feat/CLI-1", "--repo", "xlyk/clipse"])
+
+    assert str(raised.value) == "no pull requests found"
+    assert token not in str(raised.value)
