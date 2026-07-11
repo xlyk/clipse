@@ -14,6 +14,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/xlyk/clipse/internal/board"
@@ -32,6 +34,13 @@ type Client struct {
 	baseURL    string
 	teamKey    string
 	httpClient *http.Client
+
+	// mu guards the lazily-resolved team metadata (see resolve).
+	mu          sync.Mutex
+	resolved    bool
+	teamID      string
+	stateByName map[string]string // lowercased state name -> id
+	labelByName map[string]string // label name -> id
 }
 
 // NewClient builds a Client scoped to teamKey against Linear's real API,
@@ -99,6 +108,220 @@ func (c *Client) TeamIssues(ctx context.Context) ([]board.BoardIssue, error) {
 		out = append(out, bi)
 	}
 	return out, nil
+}
+
+// resolve lazily fetches and caches the team's id, workflow states, and
+// labels. Safe to call repeatedly; the network fetch happens once.
+func (c *Client) resolve(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.resolved {
+		return nil
+	}
+	reqBody, err := marshalGraphQL(TeamMetaQuery, map[string]any{"teamKey": c.teamKey})
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(ctx, reqBody)
+	if err != nil {
+		return err
+	}
+	var payload struct {
+		Data struct {
+			Team struct {
+				ID     string `json:"id"`
+				States struct {
+					Nodes []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+						Type string `json:"type"`
+					} `json:"nodes"`
+				} `json:"states"`
+				Labels struct {
+					Nodes []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"nodes"`
+				} `json:"labels"`
+			} `json:"team"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &payload); err != nil {
+		return fmt.Errorf("decoding team meta: %w", err)
+	}
+	t := payload.Data.Team
+	if t.ID == "" {
+		return fmt.Errorf("team %q not found", c.teamKey)
+	}
+	c.teamID = t.ID
+	c.stateByName = make(map[string]string, len(t.States.Nodes))
+	for _, s := range t.States.Nodes {
+		c.stateByName[strings.ToLower(s.Name)] = s.ID
+	}
+	c.labelByName = make(map[string]string, len(t.Labels.Nodes))
+	for _, l := range t.Labels.Nodes {
+		c.labelByName[l.Name] = l.ID
+	}
+	c.resolved = true
+	return nil
+}
+
+// EnsureLabels creates any of names not already present on the team, caching
+// each new label's id. Implements board.Linear.
+func (c *Client) EnsureLabels(ctx context.Context, names []string) error {
+	if err := c.resolve(ctx); err != nil {
+		return err
+	}
+	for _, name := range names {
+		c.mu.Lock()
+		_, exists := c.labelByName[name]
+		teamID := c.teamID
+		c.mu.Unlock()
+		if exists {
+			continue
+		}
+		reqBody, err := marshalGraphQL(IssueLabelCreateMutation, map[string]any{"name": name, "teamId": teamID})
+		if err != nil {
+			return err
+		}
+		resp, err := c.do(ctx, reqBody)
+		if err != nil {
+			return fmt.Errorf("creating label %q: %w", name, err)
+		}
+		var payload struct {
+			Data struct {
+				IssueLabelCreate struct {
+					IssueLabel struct {
+						ID string `json:"id"`
+					} `json:"issueLabel"`
+				} `json:"issueLabelCreate"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(resp, &payload); err != nil {
+			return fmt.Errorf("decoding label create %q: %w", name, err)
+		}
+		c.mu.Lock()
+		c.labelByName[name] = payload.Data.IssueLabelCreate.IssueLabel.ID
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+// StartStateID returns the id of the state new issues start in: the "todo"
+// state (falling back to "backlog"), which clipse's dispatcher promotes to
+// "ready" once an issue's dependencies clear. Implements board.Linear.
+func (c *Client) StartStateID(ctx context.Context) (string, error) {
+	if err := c.resolve(ctx); err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, name := range []string{"todo", "backlog"} {
+		if id, ok := c.stateByName[name]; ok {
+			return id, nil
+		}
+	}
+	names := make([]string, 0, len(c.stateByName))
+	for n := range c.stateByName {
+		names = append(names, n)
+	}
+	return "", fmt.Errorf("no start state (todo/backlog) on team %q; states: %v", c.teamKey, names)
+}
+
+// labelIDs maps label names to their cached ids, erroring on any unknown name
+// (EnsureLabels should have created them first).
+func (c *Client) labelIDs(names []string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ids := make([]string, 0, len(names))
+	for _, n := range names {
+		id, ok := c.labelByName[n]
+		if !ok {
+			return nil, fmt.Errorf("label %q not resolved (ensure it first)", n)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// CreateIssue creates an issue and returns its Linear id. Implements
+// board.Linear.
+func (c *Client) CreateIssue(ctx context.Context, in board.CreateInput) (string, error) {
+	if err := c.resolve(ctx); err != nil {
+		return "", err
+	}
+	labelIDs, err := c.labelIDs(in.Labels)
+	if err != nil {
+		return "", err
+	}
+	reqBody, err := marshalGraphQL(IssueCreateMutation, map[string]any{
+		"teamId":      c.teamID,
+		"title":       in.Title,
+		"description": in.Description,
+		"stateId":     in.StateID,
+		"labelIds":    labelIDs,
+	})
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(ctx, reqBody)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		Data struct {
+			IssueCreate struct {
+				Issue struct {
+					ID string `json:"id"`
+				} `json:"issue"`
+			} `json:"issueCreate"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &payload); err != nil {
+		return "", fmt.Errorf("decoding issue create: %w", err)
+	}
+	return payload.Data.IssueCreate.Issue.ID, nil
+}
+
+// UpdateIssue updates an existing issue. Implements board.Linear.
+func (c *Client) UpdateIssue(ctx context.Context, id string, in board.UpdateInput) error {
+	if err := c.resolve(ctx); err != nil {
+		return err
+	}
+	labelIDs, err := c.labelIDs(in.Labels)
+	if err != nil {
+		return err
+	}
+	reqBody, err := marshalGraphQL(IssueUpdateMutation, map[string]any{
+		"id":          id,
+		"title":       in.Title,
+		"description": in.Description,
+		"labelIds":    labelIDs,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := c.do(ctx, reqBody); err != nil {
+		return err
+	}
+	return nil
+}
+
+// AddBlockedBy records that dependentID is blocked by blockerID. The relation
+// is created on the blocker's side (issueId=blocker) as type "blocks", so the
+// dependent sees it in inverseRelations. Implements board.Linear.
+func (c *Client) AddBlockedBy(ctx context.Context, dependentID, blockerID string) error {
+	reqBody, err := marshalGraphQL(IssueRelationCreateMutation, map[string]any{
+		"issueId":        blockerID,
+		"relatedIssueId": dependentID,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := c.do(ctx, reqBody); err != nil {
+		return err
+	}
+	return nil
 }
 
 // marshalGraphQL marshals a query/mutation and its variables into a request

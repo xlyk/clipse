@@ -330,4 +330,3 @@ func (c *HTTPClient) IssueComments(ctx context.Context, issueID string) ([]Comme
 	}
 	return comments, nil
 }
-

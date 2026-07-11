@@ -23,6 +23,7 @@ them. Re-runs are idempotent, matched by a hidden ref marker written into
 each issue's description.`,
 	}
 	cmd.AddCommand(newBoardPlanCmd())
+	cmd.AddCommand(newBoardApplyCmd())
 	return cmd
 }
 
@@ -38,17 +39,39 @@ func newBoardPlanCmd() *cobra.Command {
 	}
 }
 
+// newBoardApplyCmd builds `clipse board apply <spec.yaml>`: reconcile for real.
+func newBoardApplyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "apply <spec.yaml>",
+		Short: "Reconcile a board.yaml onto Linear (creates/updates issues)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runBoardApply(cmd, args[0])
+		},
+	}
+}
+
+// loadSpecAndClient parses+validates the spec and builds a bootstrap client
+// scoped to its team.
+func loadSpecAndClient(specPath string) (*board.Spec, *bootstrap.Client, error) {
+	spec, err := board.Parse(specPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := spec.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("invalid board spec: %w", err)
+	}
+	client, err := bootstrap.NewClient(spec.Team)
+	if err != nil {
+		return nil, nil, err
+	}
+	return spec, client, nil
+}
+
 // runBoardPlan parses+validates the spec, reads the team's current issues,
 // and prints the reconciliation plan. It mutates nothing.
 func runBoardPlan(cmd *cobra.Command, specPath string) error {
-	spec, err := board.Parse(specPath)
-	if err != nil {
-		return err
-	}
-	if err := spec.Validate(); err != nil {
-		return fmt.Errorf("invalid board spec: %w", err)
-	}
-	client, err := bootstrap.NewClient(spec.Team)
+	spec, client, err := loadSpecAndClient(specPath)
 	if err != nil {
 		return err
 	}
@@ -57,6 +80,26 @@ func runBoardPlan(cmd *cobra.Command, specPath string) error {
 		return fmt.Errorf("reading team issues: %w", err)
 	}
 	fmt.Fprint(cmd.OutOrStdout(), planText(spec, issues))
+	return nil
+}
+
+// runBoardApply builds the plan, prints it, then executes it against Linear.
+func runBoardApply(cmd *cobra.Command, specPath string) error {
+	spec, client, err := loadSpecAndClient(specPath)
+	if err != nil {
+		return err
+	}
+	ctx := cmd.Context()
+	issues, err := client.TeamIssues(ctx)
+	if err != nil {
+		return fmt.Errorf("reading team issues: %w", err)
+	}
+	plan := board.BuildPlan(spec, issues)
+	fmt.Fprint(cmd.OutOrStdout(), plan.Render())
+	if err := board.Apply(ctx, client, spec, plan); err != nil {
+		return fmt.Errorf("applying plan: %w", err)
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), "\napplied.")
 	return nil
 }
 

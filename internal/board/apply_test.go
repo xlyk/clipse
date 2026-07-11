@@ -77,6 +77,49 @@ func TestApplyCreatesInDepOrderWithMarkersAndRelations(t *testing.T) {
 	}
 }
 
+// TestApplyThenReplanIsAllSkip proves idempotency: after applying to a fresh
+// board, reconstructing the board from what was created and re-planning
+// yields all-skip and no new relations.
+func TestApplyThenReplanIsAllSkip(t *testing.T) {
+	spec := &Spec{Team: "CLI", DefaultLabels: []string{"agent:coder"}, Issues: []Issue{
+		{Ref: "a", Title: "A", Body: "aa"},
+		{Ref: "b", Title: "B", Body: "bb", Deps: []string{"a"}},
+	}}
+	f := newFakeLinear()
+	if err := Apply(context.Background(), f, spec, BuildPlan(spec, nil)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Reconstruct the board: each create in order got L1, L2, ...
+	idByRef := map[string]string{}
+	var reconstructed []BoardIssue
+	for i, in := range f.created {
+		id := fmt.Sprintf("L%d", i+1)
+		ref, _, _ := ParseMarker(in.Description)
+		idByRef[ref] = id
+		reconstructed = append(reconstructed, BoardIssue{ID: id, Description: in.Description})
+	}
+	// Fold the wired relations into the reconstructed issues' BlockedBy.
+	byID := map[string]*BoardIssue{}
+	for i := range reconstructed {
+		byID[reconstructed[i].ID] = &reconstructed[i]
+	}
+	for _, rel := range f.relations {
+		dep, blk := rel[0], rel[1]
+		byID[dep].BlockedBy = append(byID[dep].BlockedBy, blk)
+	}
+
+	p2 := BuildPlan(spec, reconstructed)
+	for _, op := range p2.Issues {
+		if op.Action != Skip {
+			t.Errorf("re-plan op %q = %v, want skip", op.Ref, op.Action)
+		}
+	}
+	if len(p2.Relations) != 0 {
+		t.Errorf("re-plan relations = %v, want none", p2.Relations)
+	}
+}
+
 func TestApplyUpdatesChangedIssue(t *testing.T) {
 	spec := &Spec{Team: "CLI", Issues: []Issue{{Ref: "a", Title: "A", Body: "new"}}}
 	board := []BoardIssue{{ID: "LA", Description: "old\n\n" + RenderMarker("a", "stale000")}}

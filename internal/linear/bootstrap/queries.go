@@ -22,3 +22,45 @@ const TeamIssuesQuery = `query TeamIssues($teamKey: String!) {
     }
   }
 }`
+
+// TeamMetaQuery resolves the team's id plus its workflow states and labels
+// (id + name), so the applier can create issues in the start state, set
+// labels by id, and know which labels already exist.
+const TeamMetaQuery = `query TeamMeta($teamKey: String!) {
+  team(key: $teamKey) {
+    id
+    states { nodes { id name type } }
+    labels { nodes { id name } }
+  }
+}`
+
+// IssueLabelCreateMutation creates a team label by name.
+const IssueLabelCreateMutation = `mutation IssueLabelCreate($name: String!, $teamId: String!) {
+  issueLabelCreate(input: { name: $name, teamId: $teamId }) {
+    issueLabel { id }
+  }
+}`
+
+// IssueCreateMutation creates an issue in a given team, state, and label set,
+// returning its id and human identifier.
+const IssueCreateMutation = `mutation IssueCreate($teamId: String!, $title: String!, $description: String!, $stateId: String!, $labelIds: [String!]) {
+  issueCreate(input: { teamId: $teamId, title: $title, description: $description, stateId: $stateId, labelIds: $labelIds }) {
+    issue { id identifier }
+  }
+}`
+
+// IssueUpdateMutation updates an existing issue's title, description, labels.
+const IssueUpdateMutation = `mutation IssueUpdate($id: String!, $title: String!, $description: String!, $labelIds: [String!]) {
+  issueUpdate(id: $id, input: { title: $title, description: $description, labelIds: $labelIds }) {
+    success
+  }
+}`
+
+// IssueRelationCreateMutation records a blocking relation. It is created on
+// the blocker's side as type "blocks", so the blocked (dependent) issue sees
+// it in inverseRelations — matching TeamIssuesQuery's decode.
+const IssueRelationCreateMutation = `mutation IssueRelationCreate($issueId: String!, $relatedIssueId: String!) {
+  issueRelationCreate(input: { issueId: $issueId, relatedIssueId: $relatedIssueId, type: blocks }) {
+    success
+  }
+}`
