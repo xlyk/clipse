@@ -1,0 +1,24 @@
+# Example clipse board spec. `clipse board plan board.yaml` previews the
+# reconciliation; `clipse board apply board.yaml` executes it. Re-runs are
+# idempotent — only what changed is created/updated, matched by a hidden
+# ref marker written into each Linear issue's description.
+team: CLI
+base_branch: main
+default_labels: [agent:coder]
+issues:
+  - ref: core-1
+    title: Greeter core
+    labels: [agent:coder]
+    deps: []
+    body: |
+      Implement the core greeting function with a unit test.
+  - ref: cfg-1
+    title: Config dataclass
+    deps: [core-1]
+    body_file: specs/cfg-1.md
+  - ref: docs-1
+    title: Write the README usage section
+    human: true
+    deps: [core-1, cfg-1]
+    body: |
+      Human-authored: document usage once the CLI stabilizes.
