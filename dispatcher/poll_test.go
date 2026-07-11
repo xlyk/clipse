@@ -3,6 +3,7 @@ package dispatcher_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -395,6 +396,49 @@ func TestTick_OutboxFailureBlocksOnlySameIssue(t *testing.T) {
 	}
 }
 
+func TestTick_OutboxFairnessAdmitsHealthyIssueAfterFailedBatch(t *testing.T) {
+	const batchLimit = 100 // dispatcher.drainOutboxLimit
+	ctx := context.Background()
+	s := openTestStore(t)
+	for i := range batchLimit {
+		issueID := fmt.Sprintf("issue-fail-%03d", i)
+		if err := s.EnqueueLinearSetState(ctx, issueID, "ready", int64(i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.EnqueueLinearSetState(ctx, "issue-healthy", "done", 1000); err != nil {
+		t.Fatal(err)
+	}
+	lc := &failAllButHealthyLinear{}
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, newFakeSpawner(), newStubWorkspacer(t.TempDir()), fixedClock(2000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(lc.calls) != batchLimit {
+		t.Fatalf("tick 1 calls = %d, want saturated batch %d", len(lc.calls), batchLimit)
+	}
+	if slices.Contains(lc.calls, "issue-healthy:done") {
+		t.Fatal("healthy issue unexpectedly fit in saturated first batch")
+	}
+	firstTickCalls := len(lc.calls)
+	if err := d.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(lc.calls[firstTickCalls:], "issue-healthy:done") {
+		t.Fatalf("tick 2 retried only failed heads; calls=%v", lc.calls[firstTickCalls:])
+	}
+	pending, err := s.DrainPendingLinearWrites(ctx, batchLimit+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, write := range pending {
+		if write.IssueID == "issue-healthy" {
+			t.Fatalf("healthy issue remained pending after tick 2: %+v", write)
+		}
+	}
+}
+
 type failFirstSetStateLinear struct {
 	status string
 	failed bool
@@ -403,6 +447,28 @@ type failFirstSetStateLinear struct {
 type failIssueLinear struct {
 	failIssue string
 	calls     []string
+}
+
+type failAllButHealthyLinear struct {
+	calls []string
+}
+
+func (*failAllButHealthyLinear) CandidateIssues(context.Context) ([]linear.Issue, error) {
+	return nil, nil
+}
+
+func (c *failAllButHealthyLinear) SetState(_ context.Context, issueID, target string) error {
+	c.calls = append(c.calls, issueID+":"+target)
+	if issueID != "issue-healthy" {
+		return errors.New("permanent failure")
+	}
+	return nil
+}
+
+func (*failAllButHealthyLinear) Comment(context.Context, string, string) error { return nil }
+
+func (*failAllButHealthyLinear) IssueComments(context.Context, string) ([]linear.Comment, error) {
+	return nil, nil
 }
 
 func (*failIssueLinear) CandidateIssues(context.Context) ([]linear.Issue, error) { return nil, nil }

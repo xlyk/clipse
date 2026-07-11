@@ -324,9 +324,10 @@ func (s *Store) DrainPendingLinearWrites(ctx context.Context, limit int) ([]Line
 }
 
 // DrainPendingLinearWriteHeads returns the oldest pending write for each
-// issue, ordered globally by id and limited by distinct issue count. The
-// dispatcher uses this view so one issue's failed head cannot be overtaken by
-// its later writes or monopolize the batch ahead of unrelated issues.
+// issue. Across issue heads, fewer prior attempts sort first, then lifecycle
+// timestamps and id for deterministic fairness. An issue's failed head cannot
+// be overtaken by its later writes, while an unattempted independent head can
+// enter the next batch ahead of repeatedly failing heads.
 func (s *Store) DrainPendingLinearWriteHeads(ctx context.Context, limit int) ([]LinearWrite, error) {
 	const q = `
 		SELECT lw.id, lw.issue_id, lw.kind, lw.target, lw.body, lw.status, lw.attempts,
@@ -339,7 +340,7 @@ func (s *Store) DrainPendingLinearWriteHeads(ctx context.Context, limit int) ([]
 					AND earlier.status = 'pending'
 					AND earlier.id < lw.id
 			)
-		ORDER BY lw.id
+		ORDER BY lw.attempts, lw.updated_at, lw.created_at, lw.id
 		LIMIT ?
 	`
 	rows, err := s.db.QueryContext(ctx, q, limit)

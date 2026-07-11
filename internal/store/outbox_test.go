@@ -290,6 +290,35 @@ func TestDrainPendingLinearWriteHeadsReturnsOldestPerIssue(t *testing.T) {
 	}
 }
 
+func TestDrainPendingLinearWriteHeadsKeepsSameIssueBlockedUntilHeadSucceeds(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.EnqueueLinearSetState(ctx, "issue-a", "ready", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueLinearSetState(ctx, "issue-a", "done", 11); err != nil {
+		t.Fatal(err)
+	}
+	heads, err := s.DrainPendingLinearWriteHeads(ctx, 10)
+	if err != nil || len(heads) != 1 || heads[0].Target != "ready" {
+		t.Fatalf("initial heads = %+v, err=%v", heads, err)
+	}
+	if err := s.MarkLinearWriteFailed(ctx, heads[0].ID, "still failing", 100); err != nil {
+		t.Fatal(err)
+	}
+	heads, err = s.DrainPendingLinearWriteHeads(ctx, 10)
+	if err != nil || len(heads) != 1 || heads[0].Target != "ready" {
+		t.Fatalf("failed head was overtaken: heads=%+v err=%v", heads, err)
+	}
+	if err := s.MarkLinearWriteDone(ctx, heads[0].ID, 200); err != nil {
+		t.Fatal(err)
+	}
+	heads, err = s.DrainPendingLinearWriteHeads(ctx, 10)
+	if err != nil || len(heads) != 1 || heads[0].Target != "done" {
+		t.Fatalf("next write did not become head after success: heads=%+v err=%v", heads, err)
+	}
+}
+
 func TestTransition_CoderCleanupFailureRollsBackTerminalTransition(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
