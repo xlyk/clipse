@@ -30,8 +30,13 @@ import traceback
 from collections.abc import Sequence
 from typing import Any
 
+from daytona import DaytonaAuthenticationError, DaytonaAuthorizationError, DaytonaConnectionError, DaytonaTimeoutError
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from pydantic import ValidationError
 
+from clipse_agent.backends.contracts import BackendActionError, BackendActionRequest, BackendActionResult
+from clipse_agent.backends.daytona import DaytonaLifecycle
+from clipse_agent.backends.github import safe_error
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs.coder import build_coder_graph
 from clipse_agent.graphs.reviewer import build_reviewer_graph
@@ -49,8 +54,10 @@ _MAX_TOKENS_ENV_VAR = "CLIPSE_MAX_TOKENS"
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="clipse-worker")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--backend-action", default="")
+    mode.add_argument("--lane", default="coder")
     parser.add_argument("--issue", default="")
-    parser.add_argument("--lane", default="coder")
     parser.add_argument("--run", default="")
     parser.add_argument("--thread", default="")
     parser.add_argument("--workspace", default="")
@@ -64,7 +71,128 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--docs-shell-allow-list", default="")
     parser.add_argument("--transcript", default="")
     parser.add_argument("--base-branch", default="")
+    parser.add_argument("--backend-provider", default="daytona")
+    parser.add_argument("--backend-role", default="coder")
+    parser.add_argument("--repo-url", default="")
+    parser.add_argument("--repo-slug", default="")
+    parser.add_argument("--branch", default="")
+    parser.add_argument("--sandbox-id", default="")
+    parser.add_argument("--auto-stop-minutes", type=int, default=60)
+    parser.add_argument("--reviewer-auto-delete-minutes", type=int, default=60)
+    parser.add_argument("--snapshot", default="")
+    parser.add_argument("--target", default="")
     return parser
+
+
+def _backend_result_identity(args: argparse.Namespace) -> tuple[str, str]:
+    """Return contract-valid identity values even for unsupported input."""
+
+    action = args.backend_action if args.backend_action in {"ensure", "delete", "list"} else "ensure"
+    provider = args.backend_provider if args.backend_provider == "daytona" else "daytona"
+    return action, provider
+
+
+def _backend_failure(
+    args: argparse.Namespace,
+    *,
+    kind: str,
+    operation: str,
+    message: str,
+) -> BackendActionResult:
+    action, provider = _backend_result_identity(args)
+    return BackendActionResult(
+        action=action,
+        provider=provider,
+        ok=False,
+        error_kind=kind,
+        error_operation=operation,
+        error_message=message,
+    )
+
+
+def _backend_request(args: argparse.Namespace) -> BackendActionRequest:
+    return BackendActionRequest(
+        action=args.backend_action,
+        provider=args.backend_provider,
+        repo_url=args.repo_url,
+        repo_slug=args.repo_slug,
+        base_branch=args.base_branch,
+        branch=args.branch,
+        issue_id=args.issue,
+        run_id=args.run,
+        role=args.backend_role,
+        auto_stop_minutes=args.auto_stop_minutes,
+        reviewer_auto_delete_minutes=args.reviewer_auto_delete_minutes,
+        sandbox_id=args.sandbox_id or None,
+        snapshot=args.snapshot or None,
+        target=args.target or None,
+    )
+
+
+def _dispatch_backend_action(args: argparse.Namespace) -> BackendActionResult:
+    """Run one lifecycle action and always return a parseable typed result."""
+
+    if args.backend_provider != "daytona" or args.backend_action not in {"ensure", "delete", "list"}:
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="backend_action",
+            message="unsupported backend provider or action",
+        )
+    if args.backend_role not in {"coder", "reviewer"}:
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="backend_action",
+            message="unsupported backend role",
+        )
+
+    try:
+        request = _backend_request(args)
+        lifecycle = DaytonaLifecycle()
+        if request.action == "ensure":
+            workspace = lifecycle.ensure(request)
+            return BackendActionResult(action=request.action, provider=request.provider, ok=True, workspace=workspace)
+        if request.action == "delete":
+            workspace = lifecycle.delete(request)
+            return BackendActionResult(action=request.action, provider=request.provider, ok=True, workspace=workspace)
+        workspaces = lifecycle.list(request)
+        return BackendActionResult(action=request.action, provider=request.provider, ok=True, workspaces=workspaces)
+    except BackendActionError as exc:
+        return _backend_failure(
+            args,
+            kind=exc.kind,
+            operation=exc.operation,
+            message=str(exc),
+        )
+    except (DaytonaAuthenticationError, DaytonaAuthorizationError):
+        return _backend_failure(
+            args,
+            kind="needs_input",
+            operation="daytona_auth",
+            message="Daytona authentication is required",
+        )
+    except (DaytonaTimeoutError, DaytonaConnectionError, TimeoutError) as exc:
+        return _backend_failure(
+            args,
+            kind="transient",
+            operation="daytona",
+            message=safe_error("daytona", exc),
+        )
+    except ValidationError:
+        return _backend_failure(
+            args,
+            kind="needs_input",
+            operation="backend_action",
+            message="invalid backend action request",
+        )
+    except Exception as exc:  # noqa: BLE001 - provider failures must remain typed and secret-safe
+        return _backend_failure(
+            args,
+            kind="transient",
+            operation="daytona",
+            message=safe_error("daytona", exc),
+        )
 
 
 def _resolve_max_tokens(args: argparse.Namespace) -> int | None:
@@ -274,6 +402,11 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+
+    if args.backend_action:
+        result = _dispatch_backend_action(args)
+        print(result.model_dump_json(exclude_none=True))
+        return 0
 
     try:
         result = asyncio.run(_dispatch(args))

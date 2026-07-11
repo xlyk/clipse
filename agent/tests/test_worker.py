@@ -23,9 +23,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from daytona import DaytonaAuthenticationError, DaytonaTimeoutError
 
 from clipse_agent import worker
+from clipse_agent.backends.contracts import (
+    BackendActionError,
+    BackendActionRequest,
+    BackendActionResult,
+    BackendWorkspace,
+)
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.transcript import TranscriptWriter
 
@@ -1028,3 +1036,149 @@ def test_clipse_worker_module_emits_exactly_one_valid_json_line_with_no_args():
     result = WorkerResult.model_validate_json(lines[0])
     assert result.outcome == Outcome.blocked
     assert result.block_kind == BlockKind.transient
+
+
+# ---------------------------------------------------------------------------
+# Backend lifecycle mode: typed JSON before any lane parsing or graph work.
+# ---------------------------------------------------------------------------
+
+
+def _backend_argv(action: str = "ensure", provider: str = "daytona") -> list[str]:
+    return [
+        f"--backend-action={action}",
+        f"--backend-provider={provider}",
+        "--backend-role=coder",
+        "--repo-url=https://github.com/xlyk/clipse.git",
+        "--repo-slug=xlyk/clipse",
+        "--base-branch=main",
+        "--branch=feat/CLI-1",
+        "--issue=issue-1",
+        "--run=run-1",
+        "--auto-stop-minutes=60",
+        "--reviewer-auto-delete-minutes=45",
+        "--snapshot=clipse-snapshot",
+        "--target=us",
+    ]
+
+
+class _FakeLifecycle:
+    def __init__(self, *, raises: BaseException | None = None) -> None:
+        self.raises = raises
+        self.calls: list[tuple[str, BackendActionRequest]] = []
+
+    def _record(self, action: str, request: BackendActionRequest) -> None:
+        self.calls.append((action, request))
+        if self.raises is not None:
+            raise self.raises
+
+    def ensure(self, request: BackendActionRequest) -> BackendWorkspace:
+        self._record("ensure", request)
+        return BackendWorkspace(
+            id="sandbox-1",
+            state="started",
+            path="repo",
+            owner="daytona:xlyk/clipse:coder:issue-1",
+        )
+
+    def delete(self, request: BackendActionRequest) -> BackendWorkspace:
+        self._record("delete", request)
+        return BackendWorkspace(
+            id=request.sandbox_id or "sandbox-1",
+            state="destroyed",
+            path="repo",
+            owner="daytona:xlyk/clipse:coder:issue-1",
+        )
+
+    def list(self, request: BackendActionRequest) -> list[BackendWorkspace]:
+        self._record("list", request)
+        return [
+            BackendWorkspace(
+                id="sandbox-1",
+                state="stopped",
+                path="repo",
+                owner="daytona:xlyk/clipse:coder:issue-1",
+            )
+        ]
+
+
+def _run_backend_main(monkeypatch, capsys, lifecycle: _FakeLifecycle, argv: list[str]) -> BackendActionResult:
+    monkeypatch.setattr(worker, "DaytonaLifecycle", lambda: lifecycle)
+
+    assert worker.main(argv) == 0
+
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert len(lines) == 1
+    return BackendActionResult.model_validate_json(lines[0])
+
+
+def test_backend_action_ensure_prints_one_typed_success_before_lane_dispatch(monkeypatch, capsys) -> None:
+    lifecycle = _FakeLifecycle()
+    monkeypatch.setattr(worker, "build_coder_graph", lambda **_kwargs: pytest.fail("lane graph must not build"))
+
+    result = _run_backend_main(monkeypatch, capsys, lifecycle, _backend_argv())
+
+    assert result.ok is True
+    assert result.workspace is not None
+    assert result.workspace.id == "sandbox-1"
+    assert result.error_kind is None
+    assert lifecycle.calls[0][0] == "ensure"
+    request = lifecycle.calls[0][1]
+    assert request.target == "us"
+    assert request.snapshot == "clipse-snapshot"
+
+
+def test_backend_action_list_prints_typed_workspace_list(monkeypatch, capsys) -> None:
+    lifecycle = _FakeLifecycle()
+
+    result = _run_backend_main(monkeypatch, capsys, lifecycle, _backend_argv("list"))
+
+    assert result.ok is True
+    assert result.workspace is None
+    assert result.workspaces is not None
+    assert [item.id for item in result.workspaces] == ["sandbox-1"]
+
+
+def test_backend_action_failure_is_typed_and_still_exits_zero(monkeypatch, capsys) -> None:
+    lifecycle = _FakeLifecycle(raises=BackendActionError("needs_input", "ensure", "authenticate GitHub first"))
+
+    result = _run_backend_main(monkeypatch, capsys, lifecycle, _backend_argv())
+
+    assert result.ok is False
+    assert result.error_kind == "needs_input"
+    assert result.error_operation == "ensure"
+    assert result.error_message == "authenticate GitHub first"
+
+
+@pytest.mark.parametrize("exc", [DaytonaAuthenticationError("no API key"), BackendActionError("needs_input", "github_auth", "no auth")])
+def test_backend_action_maps_missing_api_or_github_auth_to_needs_input(monkeypatch, capsys, exc) -> None:
+    result = _run_backend_main(monkeypatch, capsys, _FakeLifecycle(raises=exc), _backend_argv())
+
+    assert result.ok is False
+    assert result.error_kind == "needs_input"
+
+
+def test_backend_action_maps_provider_timeout_to_transient(monkeypatch, capsys) -> None:
+    token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"
+    lifecycle = _FakeLifecycle(raises=DaytonaTimeoutError(f"timed out with {token}"))
+
+    result = _run_backend_main(monkeypatch, capsys, lifecycle, _backend_argv())
+
+    assert result.ok is False
+    assert result.error_kind == "transient"
+    assert result.error_operation == "daytona"
+    assert token not in (result.error_message or "")
+
+
+@pytest.mark.parametrize(
+    ("action", "provider"),
+    [("explode", "daytona"), ("ensure", "not-supported")],
+)
+def test_backend_action_maps_unsupported_provider_or_action_to_capability(
+    monkeypatch, capsys, action: str, provider: str
+) -> None:
+    result = _run_backend_main(monkeypatch, capsys, _FakeLifecycle(), _backend_argv(action, provider))
+
+    assert result.ok is False
+    assert result.error_kind == "capability"
+    assert result.error_operation == "backend_action"
