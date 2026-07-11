@@ -128,6 +128,10 @@ func (d *Dispatcher) runGitopsClaim(ctx context.Context, claim store.Claim) erro
 		d.logger.Error("gitops workspace prep failed, leaving merging claim in place", "issue_id", issue.ID, "run_id", claim.Run.RunID, "error", err)
 		return nil
 	}
+	if err := d.recordLocalWorkspace(ctx, issue, workspace); err != nil {
+		d.logger.Error("gitops workspace state persistence failed, leaving merging claim in place", "issue_id", issue.ID, "run_id", claim.Run.RunID, "error", err)
+		return nil
+	}
 
 	spec := gitops.Spec{
 		Branch:           issue.BranchName,

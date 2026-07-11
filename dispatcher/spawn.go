@@ -114,6 +114,15 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
 			})
 		}
+	} else {
+		now := d.now()
+		if err := d.recordLocalWorkspace(ctx, issue, workspace); err != nil {
+			delete(d.inflight, runID)
+			cause := err
+			return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, now, retryPayload{}, func() error {
+				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+			})
+		}
 	}
 
 	// d.envFor is always set (New defaults it to defaultEnvFor;

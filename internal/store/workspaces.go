@@ -100,6 +100,20 @@ func (s *Store) MarkWorkspaceDeleted(ctx context.Context, ownerKey string, now i
 	return s.updateAgentWorkspace(ctx, q, ownerKey, "marking deleted", WorkspaceDeleted, now, ownerKey)
 }
 
+// MarkWorkspaceReconcileNeedsInput durably removes an ambiguous workspace
+// identity from automatic cleanup. Reconciliation uses this when the provider
+// reports duplicate coder sandboxes for one owner key; state=error keeps the
+// row out of the delete queue while the event/detail tells an operator which
+// provider objects require manual resolution.
+func (s *Store) MarkWorkspaceReconcileNeedsInput(ctx context.Context, ownerKey, detail string, now int64) error {
+	const q = `
+		UPDATE agent_workspaces
+		SET state = ?, last_action = 'reconcile_needs_input', last_error = ?, updated_at = ?
+		WHERE owner_key = ?
+	`
+	return s.updateAgentWorkspace(ctx, q, ownerKey, "marking reconciliation needs input", WorkspaceError, detail, now, ownerKey)
+}
+
 // AgentWorkspacesByIssue returns every recorded workspace for issueID in
 // stable creation order.
 func (s *Store) AgentWorkspacesByIssue(ctx context.Context, issueID string) ([]AgentWorkspace, error) {
@@ -113,6 +127,22 @@ func (s *Store) AgentWorkspacesByIssue(ctx context.Context, issueID string) ([]A
 		return nil, fmt.Errorf("listing agent workspaces for issue %s: %w", issueID, err)
 	}
 	return scanAgentWorkspaces(rows, "by issue")
+}
+
+// ListAgentWorkspaces returns every durable workspace row. Startup
+// reconciliation compares this inventory with the provider's scoped List
+// result so a remote workspace that disappeared while Clipse was stopped is
+// recorded as deleted rather than left active forever.
+func (s *Store) ListAgentWorkspaces(ctx context.Context) ([]AgentWorkspace, error) {
+	const q = `SELECT ` + agentWorkspaceColumns + `
+		FROM agent_workspaces
+		ORDER BY created_at, owner_key
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("listing agent workspaces: %w", err)
+	}
+	return scanAgentWorkspaces(rows, "all")
 }
 
 func (s *Store) updateAgentWorkspace(ctx context.Context, query, ownerKey, action string, args ...any) error {

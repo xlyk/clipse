@@ -104,6 +104,9 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 	}
 
 	if issue.BoardStatus == linearStatus {
+		if linearStatus == "cancelled" {
+			return d.removeLocalWorkspace(*issue)
+		}
 		return nil
 	}
 
@@ -146,11 +149,16 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 // bearing on.
 func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, priorStatus, linearStatus string, now int64) error {
 	humanRequeueFromBlocked := priorStatus == string(contract.ColumnBlocked) && isHumanRequeueTarget(linearStatus)
+	cleanupCoderWorkspace, err := d.cleanupCoderWorkspaceRequested(ctx, issueID, linearStatus)
+	if err != nil {
+		return fmt.Errorf("preparing terminal workspace cleanup for issue %s: %w", issueID, err)
+	}
 	req := store.TransitionReq{
-		IssueID:              issueID,
-		NewStatus:            linearStatus,
-		ResetReworkCount:     humanRequeueFromBlocked,
-		ResetRecoverAttempts: humanRequeueFromBlocked,
+		IssueID:               issueID,
+		NewStatus:             linearStatus,
+		CleanupCoderWorkspace: cleanupCoderWorkspace,
+		ResetReworkCount:      humanRequeueFromBlocked,
+		ResetRecoverAttempts:  humanRequeueFromBlocked,
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),
@@ -160,6 +168,15 @@ func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, priorStatus, 
 	}
 	if err := d.store.Transition(ctx, req); err != nil {
 		return fmt.Errorf("adopting linear move for issue %s: %w", issueID, err)
+	}
+	if linearStatus == "cancelled" {
+		issue, err := d.store.GetIssue(ctx, issueID)
+		if err != nil {
+			return fmt.Errorf("loading cancelled issue %s for local cleanup: %w", issueID, err)
+		}
+		if err := d.removeLocalWorkspace(*issue); err != nil {
+			return err
+		}
 	}
 	return nil
 }

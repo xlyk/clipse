@@ -155,6 +155,104 @@ func TestTransition_HappyPath(t *testing.T) {
 	}
 }
 
+func TestTransition_TerminalStatusAtomicallyQueuesCoderCleanup(t *testing.T) {
+	for _, status := range []string{"done", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			s := openTestStore(t)
+			ctx := context.Background()
+			seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+			coder := store.AgentWorkspace{
+				OwnerKey: "daytona:xlyk/clipse:coder:issue-1", IssueID: "issue-1", RunID: "run-1",
+				Provider: "daytona", Role: "coder", ExternalID: "sb-coder", WorkspacePath: "/workspace",
+				State: store.WorkspaceActive, LastAction: "ensure", CreatedAt: 10, UpdatedAt: 10,
+			}
+			reviewer := store.AgentWorkspace{
+				OwnerKey: "daytona:xlyk/clipse:reviewer:issue-1:review-1", IssueID: "issue-1", RunID: "review-1",
+				Provider: "daytona", Role: "reviewer", ExternalID: "sb-reviewer", WorkspacePath: "/workspace",
+				State: store.WorkspaceActive, LastAction: "ensure", CreatedAt: 11, UpdatedAt: 11,
+			}
+			for _, workspace := range []store.AgentWorkspace{coder, reviewer} {
+				if err := s.UpsertAgentWorkspace(ctx, workspace); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := s.Transition(ctx, store.TransitionReq{
+				IssueID: "issue-1", NewStatus: status, ClearClaim: true,
+				CloseRunID: "run-1", RunStatus: "done", CleanupCoderWorkspace: true,
+				Event: store.Event{Ts: 500, Kind: "terminal"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			issue, err := s.GetIssue(ctx, "issue-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if issue.BoardStatus != status {
+				t.Fatalf("board status = %q, want %q", issue.BoardStatus, status)
+			}
+			rows, err := s.AgentWorkspacesByIssue(ctx, "issue-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rows[0].State != store.WorkspaceCleanupPending || rows[0].UpdatedAt != 500 {
+				t.Fatalf("coder workspace = %+v", rows[0])
+			}
+			if rows[1].State != store.WorkspaceActive {
+				t.Fatalf("reviewer workspace changed = %+v", rows[1])
+			}
+		})
+	}
+}
+
+func TestTransition_CoderCleanupFailureRollsBackTerminalTransition(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+	workspace := store.AgentWorkspace{
+		OwnerKey: "daytona:xlyk/clipse:coder:issue-1", IssueID: "issue-1", RunID: "run-1",
+		Provider: "daytona", Role: "coder", ExternalID: "sb-1", WorkspacePath: "/workspace",
+		State: store.WorkspaceActive, LastAction: "ensure", CreatedAt: 10, UpdatedAt: 10,
+	}
+	if err := s.UpsertAgentWorkspace(ctx, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_cleanup BEFORE UPDATE OF state ON agent_workspaces
+		WHEN NEW.state = 'cleanup_pending'
+		BEGIN SELECT RAISE(ABORT, 'reject cleanup'); END
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.Transition(ctx, store.TransitionReq{
+		IssueID: "issue-1", NewStatus: "done", ClearClaim: true,
+		CloseRunID: "run-1", RunStatus: "done", CleanupCoderWorkspace: true,
+		Event: store.Event{Ts: 500, Kind: "terminal"},
+	})
+	if err == nil {
+		t.Fatal("Transition succeeded despite cleanup scheduling failure")
+	}
+	issue, getErr := s.GetIssue(ctx, "issue-1")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if issue.BoardStatus != "running" || !issue.ClaimLock.Valid {
+		t.Fatalf("terminal issue update was not rolled back: %+v", issue)
+	}
+	rows, getErr := s.AgentWorkspacesByIssue(ctx, "issue-1")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if rows[0].State != store.WorkspaceActive {
+		t.Fatalf("workspace update was not rolled back: %+v", rows[0])
+	}
+	if events, getErr := s.ListEvents(ctx); getErr != nil || len(events) != 0 {
+		t.Fatalf("events after rollback = %+v, err=%v", events, getErr)
+	}
+}
+
 // TestTransition_WithoutCloseRunOrOutbox asserts optional fields (CloseRunID,
 // EnqueueSetState, Comment) are all skippable: a transition that only moves
 // board_status and clears no claim must not touch runs or linear_writes.

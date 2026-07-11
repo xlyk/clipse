@@ -15,6 +15,13 @@ type TransitionReq struct {
 	NewStatus  string // target board column
 	ClearClaim bool   // null out claim_lock/claim_expires (terminal/blocked/requeue)
 
+	// CleanupCoderWorkspace atomically moves the issue's sole non-deleted
+	// coder workspace to cleanup_pending. Dispatchers set it only for a
+	// done/cancelled transition when the configured remote backend owns that
+	// workspace. Keeping this update inside Transition prevents a crash from
+	// committing the terminal board state without durably scheduling cleanup.
+	CleanupCoderWorkspace bool
+
 	// SkipReworkBump suppresses the automatic rework_count increment that
 	// NewStatus=="rework" would otherwise apply (see applyIssueTransition).
 	// Set only by dispatcher.requeueOrphan: an orphaned claim's release
@@ -90,6 +97,11 @@ func (s *Store) Transition(ctx context.Context, req TransitionReq) error {
 	if err := applyIssueTransition(ctx, tx, req); err != nil {
 		return err
 	}
+	if req.CleanupCoderWorkspace {
+		if err := applyCoderWorkspaceCleanup(ctx, tx, req); err != nil {
+			return err
+		}
+	}
 	if req.CloseRunID != "" {
 		if err := applyRunClose(ctx, tx, req); err != nil {
 			return err
@@ -111,6 +123,35 @@ func (s *Store) Transition(ctx context.Context, req TransitionReq) error {
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("transitioning issue %s: committing: %w", req.IssueID, err)
+	}
+	return nil
+}
+
+func applyCoderWorkspaceCleanup(ctx context.Context, tx *sql.Tx, req TransitionReq) error {
+	if req.NewStatus != "done" && req.NewStatus != "cancelled" {
+		return fmt.Errorf("transitioning issue %s: coder workspace cleanup requires a terminal status", req.IssueID)
+	}
+	const q = `
+		UPDATE agent_workspaces
+		SET state = ?, last_error = '', updated_at = ?
+		WHERE owner_key = (
+			SELECT owner_key
+			FROM agent_workspaces
+			WHERE issue_id = ? AND provider = 'daytona' AND role = 'coder' AND state <> ? AND last_action <> 'reconcile_needs_input'
+			GROUP BY issue_id
+			HAVING COUNT(*) = 1
+		)
+	`
+	res, err := tx.ExecContext(ctx, q, WorkspaceCleanupPending, req.Event.Ts, req.IssueID, WorkspaceDeleted)
+	if err != nil {
+		return fmt.Errorf("transitioning issue %s: scheduling coder workspace cleanup: %w", req.IssueID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("transitioning issue %s: scheduling coder workspace cleanup: reading rows affected: %w", req.IssueID, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("transitioning issue %s: scheduling coder workspace cleanup: expected one owned coder workspace, updated %d", req.IssueID, n)
 	}
 	return nil
 }

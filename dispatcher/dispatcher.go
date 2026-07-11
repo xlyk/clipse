@@ -30,6 +30,10 @@ type Workspacer interface {
 	// (Documentation is written inside the Coder lane's own turn, in this
 	// same worktree, so there is no separate docs-branch workspace.)
 	Ensure(issue store.Issue) (string, error)
+
+	// Remove idempotently removes issue's worktree and local branch. Terminal
+	// local cleanup may be retried after a partial failure or restart.
+	Remove(issue store.Issue) error
 }
 
 // inflightRun tracks one runID the dispatcher has spawned but not yet
@@ -304,6 +308,9 @@ func (d *Dispatcher) Tick(ctx context.Context) error {
 	}
 	if err := d.reconcile(ctx); err != nil {
 		return fmt.Errorf("tick: reconcile: %w", err)
+	}
+	if err := d.drainWorkspaceCleanup(ctx); err != nil {
+		return fmt.Errorf("tick: drain workspace cleanup: %w", err)
 	}
 	if err := d.promote(ctx); err != nil {
 		return fmt.Errorf("tick: promote: %w", err)

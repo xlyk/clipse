@@ -360,6 +360,10 @@ func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store
 
 	now := d.now()
 	comment := commentFor(outcome, lane, result)
+	cleanupCoderWorkspace, err := d.cleanupCoderWorkspaceRequested(ctx, issue.ID, next)
+	if err != nil {
+		return fmt.Errorf("preparing terminal workspace cleanup for issue %s: %w", issue.ID, err)
+	}
 	// Post the lane's structured handoff note on this terminal outcome (the
 	// write side of the per-run handoff loop). When the outcome already has a
 	// dispatcher comment (a gitops stale-base changes_requested, a block
@@ -376,16 +380,17 @@ func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store
 	}
 
 	req := store.TransitionReq{
-		IssueID:         issue.ID,
-		NewStatus:       next,
-		ClearClaim:      true,
-		CloseRunID:      runID,
-		RunStatus:       outcome,
-		ResultJSON:      resultJSON,
-		TokensIn:        result.Tokens.In,
-		TokensOut:       result.Tokens.Out,
-		EnqueueSetState: true,
-		Comment:         comment,
+		IssueID:               issue.ID,
+		NewStatus:             next,
+		ClearClaim:            true,
+		CloseRunID:            runID,
+		RunStatus:             outcome,
+		ResultJSON:            resultJSON,
+		TokensIn:              result.Tokens.In,
+		TokensOut:             result.Tokens.Out,
+		CleanupCoderWorkspace: cleanupCoderWorkspace,
+		EnqueueSetState:       true,
+		Comment:               comment,
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),
@@ -418,6 +423,14 @@ func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store
 	req.ResetRecoverAttempts = true
 	if err := d.store.Transition(ctx, req); err != nil {
 		return fmt.Errorf("transitioning issue %s: %w", issue.ID, err)
+	}
+	if next == string(contract.ColumnDone) {
+		if err := d.removeLocalWorkspace(issue); err != nil {
+			// The terminal transition is already committed. Surface the cleanup
+			// failure for visibility without reopening or otherwise mutating the
+			// completed issue.
+			return err
+		}
 	}
 	return nil
 }

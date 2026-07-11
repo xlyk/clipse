@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
@@ -41,6 +43,19 @@ func (w *gitWorkspacer) Ensure(issue store.Issue) (string, error) {
 		return "", fmt.Errorf("ensuring workspace for issue %s: %w", issue.ID, err)
 	}
 	return path, nil
+}
+
+// Remove idempotently removes issue's deterministic worktree path and local
+// branch through the same spawn primitive used by Git-operator cleanup.
+func (w *gitWorkspacer) Remove(issue store.Issue) error {
+	if issue.BranchName == "" {
+		return fmt.Errorf("removing workspace for issue %s: no branch name set", issue.ID)
+	}
+	path := filepath.Join(w.worktreeRoot, strings.ReplaceAll(issue.BranchName, "/", "-"))
+	if err := spawn.RemoveWorktree(context.Background(), w.primaryClonePath, path, issue.BranchName); err != nil {
+		return fmt.Errorf("removing workspace for issue %s: %w", issue.ID, err)
+	}
+	return nil
 }
 
 // marshalWorkerResult is a small helper shared by applyResult so both the
