@@ -16,6 +16,7 @@ from clipse_agent.backends.contracts import (
 from clipse_agent.backends.daytona import labels_for, owner_key, repo_label
 from clipse_agent.backends.github import (
     BackendActionError,
+    github_auth_preflight,
     github_token,
     safe_error,
     subprocess_host_runner,
@@ -68,8 +69,8 @@ def test_reviewer_owner_and_labels_are_scoped_to_the_run() -> None:
 def test_success_result_omits_absent_error_fields() -> None:
     workspace = BackendWorkspace(
         external_id="sandbox-1",
-        state="started",
-        workspace_path="repo",
+        state="active",
+        workspace_path="/home/daytona/workspace/clipse",
         owner_key="daytona:xlyk/clipse:coder:issue-1",
     )
     result = BackendActionResult(
@@ -83,8 +84,8 @@ def test_success_result_omits_absent_error_fields() -> None:
 
     assert dumped["external_id"] == "sandbox-1"
     assert dumped["owner_key"] == "daytona:xlyk/clipse:coder:issue-1"
-    assert dumped["workspace_path"] == "repo"
-    assert dumped["state"] == "started"
+    assert dumped["workspace_path"] == "/home/daytona/workspace/clipse"
+    assert dumped["state"] == "active"
     assert "workspace" not in dumped
     assert "error_kind" not in dumped
     assert "error_operation" not in dumped
@@ -145,12 +146,19 @@ def test_delete_request_requires_scope_and_sandbox_id() -> None:
             "ok": True,
             "owner_key": "daytona:xlyk/clipse:coder:issue-1",
             "external_id": "sandbox-1",
-            "workspace_path": "repo",
-            "state": "started",
+            "workspace_path": "/home/daytona/workspace/clipse",
+            "state": "active",
             "error_kind": "transient",
             "error": "failed",
         },
         {"action": "ensure", "provider": "daytona", "ok": False},
+        {
+            "action": "ensure",
+            "provider": "daytona",
+            "ok": False,
+            "error_kind": "transient",
+            "error": "failed",
+        },
         {
             "action": "ensure",
             "provider": "daytona",
@@ -164,6 +172,16 @@ def test_delete_request_requires_scope_and_sandbox_id() -> None:
 def test_result_rejects_mixed_or_incomplete_success_and_error_states(values: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         BackendActionResult(**values)
+
+
+def test_workspace_rejects_raw_provider_state() -> None:
+    with pytest.raises(ValidationError):
+        BackendWorkspace(
+            external_id="sandbox-1",
+            state="started",
+            workspace_path="/home/daytona/workspace/clipse",
+            owner_key="daytona:xlyk/clipse:coder:issue-1",
+        )
 
 
 def test_safe_error_never_echoes_token_looking_exception_text() -> None:
@@ -189,6 +207,14 @@ def test_github_token_checks_auth_then_reads_token() -> None:
         ["gh", "auth", "status", "--hostname", "github.com"],
         ["gh", "auth", "token", "--hostname", "github.com"],
     ]
+
+
+def test_github_auth_preflight_checks_status_without_materializing_token() -> None:
+    calls: list[list[str]] = []
+
+    github_auth_preflight(lambda argv: calls.append(argv) or "")
+
+    assert calls == [["gh", "auth", "status", "--hostname", "github.com"]]
 
 
 def test_github_token_empty_result_is_needs_input() -> None:

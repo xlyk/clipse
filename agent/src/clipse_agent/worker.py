@@ -191,14 +191,14 @@ def _dispatch_backend_action(args: argparse.Namespace) -> BackendActionResult:
             operation="daytona_auth",
             message="Daytona authentication is required",
         )
-    except (DaytonaValidationError, DaytonaNotFoundError) as exc:
+    except DaytonaValidationError as exc:
         return _backend_failure(
             args,
             kind="needs_input",
             operation="daytona_config",
             message=safe_error("daytona configuration", exc),
         )
-    except (DaytonaTimeoutError, DaytonaConnectionError, DaytonaRateLimitError, TimeoutError) as exc:
+    except (DaytonaTimeoutError, DaytonaConnectionError, DaytonaRateLimitError, DaytonaNotFoundError, TimeoutError) as exc:
         return _backend_failure(
             args,
             kind="transient",

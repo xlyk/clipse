@@ -1075,8 +1075,8 @@ class _FakeLifecycle:
         self._record("ensure", request)
         return BackendWorkspace(
             external_id="sandbox-1",
-            state="started",
-            workspace_path="repo",
+            state="active",
+            workspace_path="/home/daytona/workspace/clipse",
             owner_key="daytona:xlyk/clipse:coder:issue-1",
         )
 
@@ -1084,8 +1084,8 @@ class _FakeLifecycle:
         self._record("delete", request)
         return BackendWorkspace(
             external_id=request.sandbox_id or "sandbox-1",
-            state="destroyed",
-            workspace_path="repo",
+            state="deleted",
+            workspace_path="/home/daytona/workspace/clipse",
             owner_key="daytona:xlyk/clipse:coder:issue-1",
         )
 
@@ -1095,7 +1095,7 @@ class _FakeLifecycle:
             BackendWorkspace(
                 external_id="sandbox-1",
                 state="stopped",
-                workspace_path="repo",
+                workspace_path="/home/daytona/workspace/clipse",
                 owner_key="daytona:xlyk/clipse:coder:issue-1",
             )
         ]
@@ -1120,9 +1120,9 @@ def test_backend_action_ensure_prints_one_typed_success_before_lane_dispatch(mon
 
     assert result.ok is True
     assert result.external_id == "sandbox-1"
-    assert result.workspace_path == "repo"
+    assert result.workspace_path == "/home/daytona/workspace/clipse"
     assert result.owner_key == "daytona:xlyk/clipse:coder:issue-1"
-    assert result.state == "started"
+    assert result.state == "active"
     assert result.error_kind is None
     assert lifecycle.calls[0][0] == "ensure"
     request = lifecycle.calls[0][1]
@@ -1186,13 +1186,30 @@ def test_backend_action_maps_unsupported_provider_or_action_to_capability(
     assert result.error_operation == "backend_action"
 
 
-@pytest.mark.parametrize("exc", [DaytonaValidationError("invalid target"), DaytonaNotFoundError("snapshot missing")])
-def test_backend_action_maps_invalid_target_or_snapshot_to_needs_input(monkeypatch, capsys, exc) -> None:
-    result = _run_backend_main(monkeypatch, capsys, _FakeLifecycle(raises=exc), _backend_argv())
+def test_backend_action_maps_invalid_configuration_to_needs_input(monkeypatch, capsys) -> None:
+    result = _run_backend_main(
+        monkeypatch,
+        capsys,
+        _FakeLifecycle(raises=DaytonaValidationError("invalid target")),
+        _backend_argv(),
+    )
 
     assert result.ok is False
     assert result.error_kind == "needs_input"
     assert result.error_operation == "daytona_config"
+
+
+def test_backend_action_maps_unscoped_not_found_to_transient(monkeypatch, capsys) -> None:
+    result = _run_backend_main(
+        monkeypatch,
+        capsys,
+        _FakeLifecycle(raises=DaytonaNotFoundError("sandbox vanished")),
+        _backend_argv(),
+    )
+
+    assert result.ok is False
+    assert result.error_kind == "transient"
+    assert result.error_operation == "daytona"
 
 
 @pytest.mark.parametrize("exc", [ImportError("missing Daytona symbol"), AttributeError("SDK method missing")])

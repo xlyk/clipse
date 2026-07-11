@@ -10,30 +10,7 @@ BackendAction = Literal["ensure", "delete", "list"]
 BackendProvider = Literal["daytona"]
 BackendRole = Literal["coder", "reviewer"]
 ErrorKind = Literal["transient", "capability", "needs_input"]
-WorkspaceState = Literal[
-    "creating",
-    "restoring",
-    "destroyed",
-    "destroying",
-    "started",
-    "stopped",
-    "starting",
-    "stopping",
-    "error",
-    "build_failed",
-    "pending_build",
-    "building_snapshot",
-    "unknown",
-    "pulling_snapshot",
-    "archived",
-    "archiving",
-    "resizing",
-    "snapshotting",
-    "forking",
-    "pausing",
-    "paused",
-    "resuming",
-]
+WorkspaceState = Literal["active", "stopped", "cleanup_pending", "deleted", "error"]
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 PositiveInt = Annotated[int, Field(gt=0)]
 
@@ -131,8 +108,8 @@ class BackendActionResult(BaseModel):
             elif self.workspaces is not None or any(value is None for value in success_fields):
                 raise ValueError("successful lifecycle result requires top-level workspace fields")
             return self
-        if self.error_kind is None or self.error is None:
-            raise ValueError("failed backend result requires error_kind and error")
+        if self.error_kind is None or self.error_operation is None or self.error is None:
+            raise ValueError("failed backend result requires error_kind, error_operation, and error")
         if self.workspaces is not None or any(value is not None for value in success_fields):
             raise ValueError("failed backend result cannot contain workspace fields")
         return self

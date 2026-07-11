@@ -6,7 +6,14 @@ import hashlib
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 
-from daytona import CreateSandboxFromSnapshotParams, Daytona, DaytonaConfig, DaytonaNotFoundError, ListSandboxesQuery
+from daytona import (
+    CreateSandboxFromSnapshotParams,
+    Daytona,
+    DaytonaConfig,
+    DaytonaNotFoundError,
+    DaytonaValidationError,
+    ListSandboxesQuery,
+)
 
 from clipse_agent.backends.contracts import (
     BackendActionError,
@@ -14,9 +21,10 @@ from clipse_agent.backends.contracts import (
     BackendWorkspace,
     WorkspaceState,
 )
-from clipse_agent.backends.github import github_token, safe_error
+from clipse_agent.backends.github import AuthPreflight, github_auth_preflight, github_token, safe_error
 
-REMOTE_REPO_REL = "repo"
+REMOTE_REPO_REL = "workspace/clipse"
+REMOTE_REPO_ABS = "/home/daytona/workspace/clipse"
 
 
 class _Git(Protocol):
@@ -86,12 +94,15 @@ def labels_for(request: BackendActionRequest) -> dict[str, str]:
 
 def _state_value(state: Any) -> WorkspaceState:
     value = getattr(state, "value", state)
-    if not isinstance(value, str):
-        return "unknown"
-    allowed = BackendWorkspace.model_fields["state"].annotation
-    if value not in getattr(allowed, "__args__", ()):
-        return "unknown"
-    return value  # type: ignore[return-value]
+    if value == "started":
+        return "active"
+    if value in {"stopped", "stopping", "archived", "paused", "pausing"}:
+        return "stopped"
+    if value in {"destroying", "archiving"}:
+        return "cleanup_pending"
+    if value == "destroyed":
+        return "deleted"
+    return "error"
 
 
 def workspace_from(
@@ -105,7 +116,7 @@ def workspace_from(
     return BackendWorkspace(
         external_id=sandbox.id,
         state=state or _state_value(sandbox.state),
-        workspace_path=REMOTE_REPO_REL,
+        workspace_path=REMOTE_REPO_ABS,
         owner_key=owner_key(request),
     )
 
@@ -129,7 +140,7 @@ def workspace_from_labels(sandbox: _Sandbox, repo_slug: str) -> BackendWorkspace
     return BackendWorkspace(
         external_id=sandbox.id,
         state=_state_value(sandbox.state),
-        workspace_path=REMOTE_REPO_REL,
+        workspace_path=REMOTE_REPO_ABS,
         owner_key=_owner_from_labels(sandbox, repo_slug),
     )
 
@@ -145,13 +156,22 @@ class DaytonaLifecycle:
         self,
         client_factory: ClientFactory = _default_client_factory,
         token_reader: TokenReader = github_token,
+        auth_preflight: AuthPreflight = github_auth_preflight,
     ) -> None:
         self._client_factory = client_factory
         self._token_reader = token_reader
+        self._auth_preflight = auth_preflight
         self._client: _DaytonaClient | None = None
 
     def _prepare(self, request: BackendActionRequest) -> None:
-        self._client = self._client_factory(request)
+        try:
+            self._client = self._client_factory(request)
+        except (DaytonaNotFoundError, DaytonaValidationError) as exc:
+            raise BackendActionError(
+                "needs_input",
+                "daytona_config",
+                safe_error("daytona configuration", exc),
+            ) from None
 
     def _matching(self, request: BackendActionRequest) -> list[_Sandbox]:
         assert self._client is not None
@@ -164,7 +184,14 @@ class DaytonaLifecycle:
     def _repo_ready(self, sandbox: _Sandbox) -> bool:
         try:
             sandbox.fs.get_file_info(f"{REMOTE_REPO_REL}/.git")
-        except (DaytonaNotFoundError, FileNotFoundError):
+        except DaytonaNotFoundError:
+            assert self._client is not None
+            try:
+                self._client.get(sandbox.id)
+            except DaytonaNotFoundError:
+                raise BackendActionError("transient", "ensure", "sandbox vanished during ensure") from None
+            return False
+        except FileNotFoundError:
             return False
         return True
 
@@ -185,7 +212,14 @@ class DaytonaLifecycle:
             auto_stop_interval=request.auto_stop_minutes,
             auto_delete_interval=auto_delete,
         )
-        sandbox = self._client.create(params)
+        try:
+            sandbox = self._client.create(params)
+        except (DaytonaNotFoundError, DaytonaValidationError) as exc:
+            raise BackendActionError(
+                "needs_input",
+                "daytona_config",
+                safe_error("daytona configuration", exc),
+            ) from None
         clone_branch = request.branch if request.role == "reviewer" else request.base_branch
         try:
             sandbox.git.clone(
@@ -209,7 +243,10 @@ class DaytonaLifecycle:
 
     def ensure(self, request: BackendActionRequest) -> BackendWorkspace:
         self._prepare(request)
-        matches = self._matching(request)
+        try:
+            matches = self._matching(request)
+        except DaytonaNotFoundError:
+            raise BackendActionError("transient", "ensure", "sandbox vanished during ensure") from None
         if len(matches) > 1:
             ids = ", ".join(sorted(item.id for item in matches))
             raise BackendActionError("needs_input", "ensure", f"multiple matching sandboxes: {ids}")
@@ -217,7 +254,10 @@ class DaytonaLifecycle:
             sandbox = matches[0]
             if sandbox.state != "started":
                 assert self._client is not None
-                self._client.start(sandbox)
+                try:
+                    self._client.start(sandbox)
+                except DaytonaNotFoundError:
+                    raise BackendActionError("transient", "ensure", "sandbox vanished during ensure") from None
             if not self._repo_ready(sandbox):
                 token = self._token_reader()
                 self._client.delete(sandbox)
@@ -232,18 +272,30 @@ class DaytonaLifecycle:
         if not request.sandbox_id:
             raise BackendActionError("needs_input", "delete", "sandbox id is required")
         assert self._client is not None
-        sandbox = self._client.get(request.sandbox_id)
-        self._client.delete(sandbox)
-        return workspace_from(sandbox, request, state="destroyed")
+        try:
+            sandbox = self._client.get(request.sandbox_id)
+        except DaytonaNotFoundError:
+            return BackendWorkspace(
+                external_id=request.sandbox_id,
+                state="deleted",
+                workspace_path=REMOTE_REPO_ABS,
+                owner_key=owner_key(request),
+            )
+        try:
+            self._client.delete(sandbox)
+        except DaytonaNotFoundError:
+            pass
+        return workspace_from(sandbox, request, state="deleted")
 
     def list(self, request: BackendActionRequest) -> list[BackendWorkspace]:
         self._prepare(request)
         matches = self._matching_repo(request)
-        self._token_reader()
+        self._auth_preflight()
         return [workspace_from_labels(sandbox, request.repo_slug) for sandbox in matches]
 
 
 __all__ = [
+    "REMOTE_REPO_ABS",
     "REMOTE_REPO_REL",
     "BackendActionError",
     "DaytonaLifecycle",

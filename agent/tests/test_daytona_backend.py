@@ -6,9 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from daytona import DaytonaNotFoundError
 
 from clipse_agent.backends.contracts import BackendActionRequest, BackendWorkspace
 from clipse_agent.backends.daytona import (
+    REMOTE_REPO_ABS,
     REMOTE_REPO_REL,
     BackendActionError,
     DaytonaLifecycle,
@@ -55,9 +57,12 @@ class _FakeGit:
 @dataclass
 class _FakeFs:
     repo_present: bool = True
+    raises: BaseException | None = None
 
     def get_file_info(self, path: str) -> object:
         assert path == f"{REMOTE_REPO_REL}/.git"
+        if self.raises is not None:
+            raise self.raises
         if not self.repo_present:
             raise FileNotFoundError(path)
         return object()
@@ -79,12 +84,20 @@ class _FakeClient:
         sandboxes: list[_FakeSandbox] | None = None,
         *,
         clone_error: BaseException | None = None,
+        create_error: BaseException | None = None,
         delete_error: BaseException | None = None,
+        get_error: BaseException | None = None,
+        list_error: BaseException | None = None,
+        start_error: BaseException | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.sandboxes = list(sandboxes or [])
         self.clone_error = clone_error
+        self.create_error = create_error
         self.delete_error = delete_error
+        self.get_error = get_error
+        self.list_error = list_error
+        self.start_error = start_error
         self.events = events
         self.list_queries: list[Any] = []
         self.create_params: list[Any] = []
@@ -94,6 +107,8 @@ class _FakeClient:
 
     def list(self, query: Any) -> list[_FakeSandbox]:
         self.list_queries.append(query)
+        if self.list_error is not None:
+            raise self.list_error
         return [
             sandbox
             for sandbox in self.sandboxes
@@ -103,6 +118,8 @@ class _FakeClient:
     def create(self, params: Any) -> _FakeSandbox:
         if self.events is not None:
             self.events.append("create")
+        if self.create_error is not None:
+            raise self.create_error
         self.create_params.append(params)
         sandbox = _FakeSandbox(
             id=f"sandbox-{len(self.sandboxes) + 1}",
@@ -114,11 +131,15 @@ class _FakeClient:
         return sandbox
 
     def start(self, sandbox: _FakeSandbox) -> None:
+        if self.start_error is not None:
+            raise self.start_error
         self.started.append(sandbox)
         sandbox.state = "started"
 
     def get(self, sandbox_id: str) -> _FakeSandbox:
         self.gotten.append(sandbox_id)
+        if self.get_error is not None:
+            raise self.get_error
         return next(sandbox for sandbox in self.sandboxes if sandbox.id == sandbox_id)
 
     def delete(self, sandbox: _FakeSandbox) -> None:
@@ -133,6 +154,7 @@ def _lifecycle(
     client: _FakeClient,
     tokens: list[str] | None = None,
     *,
+    preflights: list[str] | None = None,
     token_error: BaseException | None = None,
 ) -> DaytonaLifecycle:
     token_reads = tokens if tokens is not None else []
@@ -145,7 +167,15 @@ def _lifecycle(
             raise token_error
         return "ghp_clone_secret"
 
-    return DaytonaLifecycle(client_factory=lambda _request: client, token_reader=read_token)
+    def preflight() -> None:
+        if preflights is not None:
+            preflights.append("status")
+
+    return DaytonaLifecycle(
+        client_factory=lambda _request: client,
+        token_reader=read_token,
+        auth_preflight=preflight,
+    )
 
 
 def test_ensure_reuses_and_starts_single_stopped_match_without_reading_token() -> None:
@@ -157,8 +187,8 @@ def test_ensure_reuses_and_starts_single_stopped_match_without_reading_token() -
     workspace = _lifecycle(client, token_reads).ensure(request)
 
     assert workspace.external_id == "sandbox-1"
-    assert workspace.state == "started"
-    assert workspace.workspace_path == REMOTE_REPO_REL
+    assert workspace.state == "active"
+    assert workspace.workspace_path == REMOTE_REPO_ABS
     assert workspace.owner_key == owner_key(request)
     assert client.started == [sandbox]
     assert client.create_params == []
@@ -189,6 +219,8 @@ def test_ensure_creates_coder_without_auto_delete_and_clones_secret_safely() -> 
     workspace = _lifecycle(client).ensure(request)
 
     assert workspace.external_id == "sandbox-1"
+    assert workspace.state == "active"
+    assert workspace.workspace_path == REMOTE_REPO_ABS
     params = client.create_params[0]
     assert params.name == owner_key(request)
     assert params.labels == labels_for(request)
@@ -238,6 +270,7 @@ def test_list_returns_only_matching_typed_workspaces() -> None:
     assert [workspace.external_id for workspace in workspaces] == ["sandbox-1"]
     assert workspaces[0].owner_key == owner_key(scoped)
     assert workspaces[0].state == "stopped"
+    assert workspaces[0].workspace_path == REMOTE_REPO_ABS
     assert client.list_queries[0].labels == {
         "created-by": "clipse",
         "repo": labels_for(scoped)["repo"],
@@ -252,7 +285,8 @@ def test_delete_uses_explicit_sandbox_id() -> None:
     workspace = _lifecycle(client).delete(request)
 
     assert workspace.external_id == "sandbox-1"
-    assert workspace.state == "destroyed"
+    assert workspace.state == "deleted"
+    assert workspace.workspace_path == REMOTE_REPO_ABS
     assert client.gotten == ["sandbox-1"]
     assert client.deleted == [sandbox]
 
@@ -316,16 +350,102 @@ def test_repository_list_preflights_daytona_and_github_auth() -> None:
     sandbox = _FakeSandbox(id="sandbox-1", labels=labels_for(scoped))
     client = _FakeClient([sandbox])
     token_reads: list[str] = []
+    preflights: list[str] = []
     request = BackendActionRequest(action="list", provider="daytona", repo_slug="xlyk/clipse")
 
-    workspaces = _lifecycle(client, token_reads).list(request)
+    workspaces = _lifecycle(client, token_reads, preflights=preflights).list(request)
 
-    assert token_reads == ["read"]
+    assert preflights == ["status"]
+    assert token_reads == []
     assert workspaces == [
         BackendWorkspace(
             external_id="sandbox-1",
-            state="started",
-            workspace_path=REMOTE_REPO_REL,
+            state="active",
+            workspace_path=REMOTE_REPO_ABS,
             owner_key="daytona:xlyk/clipse:reviewer:issue-1:run-1",
         )
     ]
+
+
+def test_ensure_maps_missing_snapshot_to_needs_input() -> None:
+    client = _FakeClient(create_error=DaytonaNotFoundError("snapshot missing"))
+
+    with pytest.raises(BackendActionError) as raised:
+        _lifecycle(client).ensure(_request())
+
+    assert raised.value.kind == "needs_input"
+    assert raised.value.operation == "daytona_config"
+
+
+def test_ensure_maps_invalid_target_during_client_setup_to_needs_input() -> None:
+    def invalid_target(_request: BackendActionRequest) -> _FakeClient:
+        raise DaytonaNotFoundError("target missing")
+
+    lifecycle = DaytonaLifecycle(client_factory=invalid_target, token_reader=lambda: "token")
+
+    with pytest.raises(BackendActionError) as raised:
+        lifecycle.ensure(_request())
+
+    assert raised.value.kind == "needs_input"
+    assert raised.value.operation == "daytona_config"
+
+
+def test_ensure_maps_sandbox_vanishing_during_start_to_transient() -> None:
+    request = _request()
+    stopped = _FakeSandbox(id="sandbox-1", state="stopped", labels=labels_for(request))
+    client = _FakeClient([stopped], start_error=DaytonaNotFoundError("sandbox gone"))
+
+    with pytest.raises(BackendActionError) as raised:
+        _lifecycle(client).ensure(request)
+
+    assert raised.value.kind == "transient"
+    assert raised.value.operation == "ensure"
+
+
+def test_ensure_maps_sandbox_vanishing_during_match_to_transient() -> None:
+    client = _FakeClient(list_error=DaytonaNotFoundError("sandbox gone"))
+
+    with pytest.raises(BackendActionError) as raised:
+        _lifecycle(client).ensure(_request())
+
+    assert raised.value.kind == "transient"
+    assert raised.value.operation == "ensure"
+
+
+def test_ensure_maps_sandbox_vanishing_during_attach_to_transient() -> None:
+    request = _request()
+    vanished = _FakeSandbox(
+        id="sandbox-1",
+        labels=labels_for(request),
+        fs=_FakeFs(raises=DaytonaNotFoundError("sandbox gone")),
+    )
+    client = _FakeClient([vanished], get_error=DaytonaNotFoundError("sandbox gone"))
+
+    with pytest.raises(BackendActionError) as raised:
+        _lifecycle(client).ensure(request)
+
+    assert raised.value.kind == "transient"
+    assert raised.value.operation == "ensure"
+
+
+def test_delete_already_missing_sandbox_is_successfully_deleted() -> None:
+    client = _FakeClient(get_error=DaytonaNotFoundError("sandbox gone"))
+    request = _request(action="delete", sandbox_id="sandbox-1")
+
+    workspace = _lifecycle(client).delete(request)
+
+    assert workspace.external_id == "sandbox-1"
+    assert workspace.state == "deleted"
+    assert client.deleted == []
+
+
+def test_delete_sandbox_vanishing_after_lookup_is_successfully_deleted() -> None:
+    sandbox = _FakeSandbox(id="sandbox-1")
+    client = _FakeClient([sandbox], delete_error=DaytonaNotFoundError("sandbox gone"))
+    request = _request(action="delete", sandbox_id="sandbox-1")
+
+    workspace = _lifecycle(client).delete(request)
+
+    assert workspace.external_id == "sandbox-1"
+    assert workspace.state == "deleted"
+    assert client.deleted == [sandbox]

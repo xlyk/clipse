@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from clipse_agent.backends.contracts import BackendActionError
 
 HostRunner = Callable[[list[str]], str]
+AuthPreflight = Callable[[], None]
 
 
 def _operation(argv: Sequence[str]) -> str:
@@ -31,10 +32,16 @@ def subprocess_host_runner(argv: list[str]) -> str:
     return completed.stdout.strip()
 
 
+def github_auth_preflight(run_host: HostRunner = subprocess_host_runner) -> None:
+    """Verify host GitHub auth without reading or materializing its token."""
+
+    run_host(["gh", "auth", "status", "--hostname", "github.com"])
+
+
 def github_token(run_host: HostRunner = subprocess_host_runner) -> str:
     """Read a GitHub token only after verifying the host CLI's auth state."""
 
-    run_host(["gh", "auth", "status", "--hostname", "github.com"])
+    github_auth_preflight(run_host)
     token = run_host(["gh", "auth", "token", "--hostname", "github.com"])
     if not token:
         raise BackendActionError("needs_input", "github_auth", "gh auth token returned empty")
@@ -47,4 +54,12 @@ def safe_error(operation: str, exc: BaseException) -> str:
     return f"{operation} failed ({type(exc).__name__})"
 
 
-__all__ = ["BackendActionError", "HostRunner", "github_token", "safe_error", "subprocess_host_runner"]
+__all__ = [
+    "AuthPreflight",
+    "BackendActionError",
+    "HostRunner",
+    "github_auth_preflight",
+    "github_token",
+    "safe_error",
+    "subprocess_host_runner",
+]
