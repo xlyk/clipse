@@ -9,7 +9,7 @@ Autonomous coding-agent orchestrator: Linear issues to merged PRs via typed work
 
 Most coding-agent loops tangle scheduling, prompts, Git, Linear writes, and merge logic into one fragile path. Clipse splits them: a deterministic, LLM-free Go kernel owns local state, claims, retries, board transitions, and merge gates, while Python LangGraph + Deep Agents Code workers run model turns. Daytona is the recommended agent backend; it isolates each worker's filesystem and shell tools while the controller and credentials stay on the host. Local git worktrees remain supported for compatibility.
 
-**Use it when:** you want autonomous, unattended agent work — a queue of Linear issues turned into merged PRs while you sleep; you need a deterministic, auditable control plane where local SQLite is runtime truth and board transitions and merge gates stay LLM-free; you want distinct coder, reviewer, and git-operator lanes, each in an isolated worktree with bounded retry, rework, and recovery.
+**Use it when:** you want autonomous, unattended agent work — a queue of Linear issues turned into merged PRs while you sleep; you need a deterministic, auditable control plane where local SQLite is runtime truth and board transitions and merge gates stay LLM-free; you want distinct coder, reviewer, and git-operator lanes with isolated execution, bounded retry, rework, and recovery.
 
 **Don't use it for:** a replacement for interactive assistants like Claude Code or Codex — clipse orchestrates unattended batch work, it isn't hands-on pair-programming; multi-tenant hosted agent infrastructure; repos where untrusted issue text must never reach a shell-capable worker (the default shell is unrestricted).
 <!-- managed:readme-agents-doc:section=WHY:END -->
@@ -55,7 +55,7 @@ $EDITOR configs/clipse.yaml
 ./bin/clipse dispatch --config configs/clipse.yaml
 ```
 
-The shipped example selects `agent_backend.type: daytona`. Its coder and docs turns reuse one issue-scoped sandbox; each reviewer run gets a fresh disposable sandbox. Both idle timers default to 60 minutes. Daytona setup or provider failures stop the run—Clipse never falls back silently to local execution.
+The shipped example selects `agent_backend.type: daytona`. Its coder and docs turns reuse one issue-scoped sandbox; each reviewer run gets a fresh disposable sandbox. Sandboxes stop after 60 idle minutes by default. Reviewers also request automatic deletion after 60 minutes as a fallback to explicit cleanup. Daytona setup or provider failures stop the run—Clipse never falls back silently to local execution.
 
 To keep the original host-worktree path, set `agent_backend.type: local` or omit the entire `agent_backend` block. Local mode is supported but is not recommended for new installations.
 
@@ -85,7 +85,7 @@ graph LR
   GitOps --> Linear
 ```
 
-**Request path (one trace):** Linear issue with an `agent:<lane>` label -> dispatcher poll -> SQLite CAS claim -> worker subprocess in a git worktree -> typed JSON result -> store transition plus outbox row -> Linear state/comment update -> reviewer or git-operator lane -> merged PR -> `done`.
+**Request path (one trace):** Linear issue with an `agent:<lane>` label -> dispatcher poll -> SQLite CAS claim -> worker subprocess using the configured agent backend -> typed JSON result -> store transition plus outbox row -> Linear state/comment update -> reviewer or git-operator lane -> merged PR -> `done`.
 
 Full rationale and decision log: [docs/design/2026-07-01-clipse-design.md](docs/design/2026-07-01-clipse-design.md).
 <!-- managed:readme-agents-doc:section=ARCHITECTURE:END -->

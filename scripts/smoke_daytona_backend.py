@@ -10,7 +10,8 @@ import secrets
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import Any
 from urllib.parse import quote
 
 from daytona import Daytona, DaytonaConfig
@@ -22,6 +23,7 @@ from clipse_agent.backends.daytona import (
     DaytonaLifecycle,
     DaytonaSession,
     RepositoryScopedDaytonaSandbox,
+    owner_key,
 )
 from clipse_agent.backends.github import (
     BackendActionError,
@@ -38,22 +40,133 @@ class SmokeError(RuntimeError):
     """Sanitized failure from the opt-in live smoke."""
 
 
-def wait_for_no_leftovers(
-    list_workspaces: Callable[[], list[BackendWorkspace]],
+@dataclass(frozen=True)
+class AgentTurnEvidence:
+    final_text: str
+    tool_calls: tuple[str, ...]
+
+
+_REMOTE_TOOL_NAMES = frozenset(
+    {"execute", "shell", "read_file", "write_file", "edit_file", "ls", "glob", "grep"}
+)
+
+
+def _open_pr_urls(run: Callable[[list[str]], str], slug: str, branch: str) -> list[str]:
+    raw = run(
+        ["gh", "pr", "list", "--repo", slug, "--state", "open", "--head", branch, "--json", "url"]
+    )
+    try:
+        rows = json.loads(raw)
+        return sorted(row["url"] for row in rows if isinstance(row, dict) and isinstance(row.get("url"), str))
+    except (json.JSONDecodeError, TypeError):
+        raise SmokeError("GitHub PR cleanup query returned invalid JSON") from None
+
+
+def _branch_refs(run: Callable[[list[str]], str], slug: str, branch: str) -> list[str]:
+    endpoint = f"repos/{slug}/git/matching-refs/heads/{quote(branch, safe='/')}"
+    try:
+        rows = json.loads(run(["gh", "api", endpoint]))
+        return sorted(row["ref"] for row in rows if isinstance(row, dict) and isinstance(row.get("ref"), str))
+    except (json.JSONDecodeError, TypeError):
+        raise SmokeError("GitHub branch cleanup query returned invalid JSON") from None
+
+
+def cleanup_github(
+    run: Callable[[list[str]], str],
+    slug: str,
+    branch: str,
+    *,
+    attempts: int = 5,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Discover and remove live GitHub resources even after lost responses."""
+
+    delete_endpoint = f"repos/{slug}/git/refs/heads/{quote(branch, safe='/')}"
+    for attempt in range(attempts):
+        try:
+            for url in _open_pr_urls(run, slug, branch):
+                try:
+                    run(["gh", "pr", "close", url, "--repo", slug])
+                except Exception:  # noqa: BLE001 - a lost response may still mean remote success
+                    pass
+        except Exception:  # noqa: BLE001 - retry boundedly, then verify authoritatively
+            pass
+
+        try:
+            if _branch_refs(run, slug, branch):
+                try:
+                    run(["gh", "api", "-X", "DELETE", delete_endpoint])
+                except Exception:  # noqa: BLE001 - verify the ref on the next observation
+                    pass
+        except Exception:  # noqa: BLE001 - retry boundedly, then verify authoritatively
+            pass
+
+        if attempt + 1 < attempts:
+            sleep(1)
+
+    try:
+        prs = _open_pr_urls(run, slug, branch)
+        refs = _branch_refs(run, slug, branch)
+    except Exception as exc:  # noqa: BLE001 - include only safe resource identity and type
+        raise SmokeError(f"GitHub cleanup could not verify {branch} ({type(exc).__name__})") from None
+    if prs or refs:
+        identities = sorted([*prs, *refs])
+        raise SmokeError(f"GitHub cleanup incomplete for {branch}: {', '.join(identities)}")
+
+
+def _delete_workspace(lifecycle: Any, request: BackendActionRequest, external_id: str) -> None:
+    lifecycle.delete(request.model_copy(update={"action": "delete", "sandbox_id": external_id}))
+
+
+def cleanup_sandboxes(
+    lifecycle: Any,
+    list_request: BackendActionRequest,
+    requests: list[BackendActionRequest],
     owner_fragment: str,
     *,
+    known: list[tuple[BackendWorkspace, BackendActionRequest]],
     attempts: int = 10,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Wait for Daytona's eventually consistent list to drop deleted objects."""
+    """Rediscover labeled sandboxes and retry delete by external ID."""
+
+    requests_by_owner = {owner_key(request): request for request in requests}
+    observed_ids = {workspace.external_id for workspace, _ in known}
+    for workspace, request in known:
+        try:
+            _delete_workspace(lifecycle, request, workspace.external_id)
+        except Exception:  # noqa: BLE001 - list is the authoritative cleanup verification
+            pass
 
     for attempt in range(attempts):
-        leftovers = [workspace for workspace in list_workspaces() if owner_fragment in workspace.owner_key]
-        if not leftovers:
-            return
+        try:
+            workspaces = lifecycle.list(list_request)
+        except Exception:  # noqa: BLE001 - retry boundedly, then surface only known IDs
+            workspaces = []
+        for workspace in workspaces:
+            if owner_fragment not in workspace.owner_key:
+                continue
+            observed_ids.add(workspace.external_id)
+            request = requests_by_owner.get(workspace.owner_key)
+            if request is None:
+                continue
+            try:
+                _delete_workspace(lifecycle, request, workspace.external_id)
+            except Exception:  # noqa: BLE001 - a lost response may still mean remote success
+                pass
         if attempt + 1 < attempts:
             sleep(1)
-    raise SmokeError("Daytona smoke sandboxes remain")
+
+    try:
+        leftovers = [
+            workspace for workspace in lifecycle.list(list_request) if owner_fragment in workspace.owner_key
+        ]
+    except Exception as exc:  # noqa: BLE001 - never forward provider response bodies
+        ids = ", ".join(sorted(observed_ids)) or "unknown"
+        raise SmokeError(f"Daytona cleanup could not verify sandbox IDs {ids} ({type(exc).__name__})") from None
+    if leftovers:
+        ids = ", ".join(sorted(workspace.external_id for workspace in leftovers))
+        raise SmokeError(f"Daytona cleanup incomplete; delete sandbox IDs manually: {ids}")
 
 
 def run_host(argv: list[str]) -> str:
@@ -121,7 +234,43 @@ def require_command_ok(label: str, result: object) -> None:
         raise SmokeError(f"{label} failed")
 
 
-async def run_agent_turn(*, profile: object, session: DaytonaSession, thread_id: str, task: str) -> str:
+def verify_reviewer_remote_state(
+    session: DaytonaSession,
+    branch: str,
+    marker_path: str,
+    marker: str,
+) -> None:
+    branch_result = session.run(["git", "branch", "--show-current"])
+    require_command_ok("reviewer branch verification", branch_result)
+    if branch_result.stdout.strip() != branch:
+        raise SmokeError("reviewer sandbox checked out the wrong branch")
+    marker_result = session.run(["cat", marker_path])
+    require_command_ok("reviewer marker verification", marker_result)
+    if marker_result.stdout.strip() != marker:
+        raise SmokeError("reviewer sandbox marker did not match")
+
+
+def validate_reviewer_evidence(evidence: AgentTurnEvidence) -> str:
+    if not _REMOTE_TOOL_NAMES.intersection(evidence.tool_calls):
+        raise SmokeError("reviewer did not use a Daytona filesystem or shell tool")
+    verdicts = []
+    for line in evidence.final_text.splitlines():
+        if line == "VERDICT: PASS":
+            verdicts.append("PASS")
+        elif line == "VERDICT: CHANGES_REQUESTED":
+            verdicts.append("CHANGES_REQUESTED")
+    if len(verdicts) != 1:
+        raise SmokeError("reviewer must emit exactly one allowed verdict line")
+    return verdicts[0]
+
+
+async def run_agent_turn(
+    *,
+    profile: object,
+    session: DaytonaSession,
+    thread_id: str,
+    task: str,
+) -> AgentTurnEvidence:
     profile = replace(
         profile,
         system_prompt=(
@@ -137,15 +286,22 @@ async def run_agent_turn(*, profile: object, session: DaytonaSession, thread_id:
         sandbox=session.sandbox,
         sandbox_type=session.sandbox_type,
     )
+    tool_calls: list[str] = []
+
+    def evidence_sink(event: dict[str, Any]) -> None:
+        if event.get("event") == "tool_call" and isinstance(event.get("name"), str):
+            tool_calls.append(event["name"])
+
     turn = await dac.drive_turn(
         agent,
         {"configurable": {"thread_id": thread_id}},
         task_text=task,
         max_tokens=None,
+        event_sink=evidence_sink,
     )
     if turn.outcome_hint != "completed" or turn.token_ceiling_exceeded:
         raise SmokeError(f"{profile.assistant_id} did not complete")
-    return turn.last_text or turn.final_text
+    return AgentTurnEvidence(turn.last_text or turn.final_text, tuple(tool_calls))
 
 
 async def run_smoke() -> None:
@@ -159,24 +315,32 @@ async def run_smoke() -> None:
     marker = f"clipse Daytona smoke {nonce}"
     title = f"test: daytona backend smoke {nonce}"
     lifecycle = DaytonaLifecycle()
+    coder_request = lifecycle_request(
+        action="ensure",
+        slug=slug,
+        repo_url=repo_url,
+        base=base,
+        branch=branch,
+        issue_id=issue_id,
+        run_id=f"coder-{nonce}",
+        role="coder",
+    )
+    reviewer_request = lifecycle_request(
+        action="ensure",
+        slug=slug,
+        repo_url=repo_url,
+        base=base,
+        branch=branch,
+        issue_id=issue_id,
+        run_id=reviewer_run_id,
+        role="reviewer",
+    )
+    list_request = lifecycle_request(action="list", slug=slug)
+    known: list[tuple[BackendWorkspace, BackendActionRequest]] = []
 
-    created: list[tuple[BackendWorkspace, BackendActionRequest]] = []
-    pr_url = ""
-    branch_pushed = False
-    cleanup_errors: list[str] = []
     try:
-        coder_request = lifecycle_request(
-            action="ensure",
-            slug=slug,
-            repo_url=repo_url,
-            base=base,
-            branch=branch,
-            issue_id=issue_id,
-            run_id=f"coder-{nonce}",
-            role="coder",
-        )
         coder_workspace = lifecycle.ensure(coder_request)
-        created.append((coder_workspace, coder_request))
+        known.append((coder_workspace, coder_request))
         print(f"coder sandbox: {coder_workspace.external_id}", flush=True)
         coder = attach(coder_workspace, slug)
         require_command_ok("feature branch checkout", coder.run(["git", "checkout", "-b", branch]))
@@ -197,7 +361,6 @@ async def run_smoke() -> None:
             raise SmokeError("coder marker content did not match")
         require_command_ok("Daytona SDK commit", coder.commit(title))
         require_command_ok("Daytona SDK push", coder.push(branch))
-        branch_pushed = True
 
         created_pr = coder.github(
             [
@@ -226,71 +389,49 @@ async def run_smoke() -> None:
         if marker_path not in diff_result.stdout or marker not in diff_result.stdout:
             raise SmokeError("authoritative PR diff did not contain the marker change")
 
-        reviewer_request = lifecycle_request(
-            action="ensure",
-            slug=slug,
-            repo_url=repo_url,
-            base=base,
-            branch=branch,
-            issue_id=issue_id,
-            run_id=reviewer_run_id,
-            role="reviewer",
-        )
         reviewer_workspace = lifecycle.ensure(reviewer_request)
-        created.append((reviewer_workspace, reviewer_request))
+        known.append((reviewer_workspace, reviewer_request))
         print(f"reviewer sandbox: {reviewer_workspace.external_id}", flush=True)
+        if reviewer_workspace.external_id == coder_workspace.external_id:
+            raise SmokeError("reviewer did not receive a fresh sandbox")
         reviewer = attach(reviewer_workspace, slug)
+        verify_reviewer_remote_state(reviewer, branch, marker_path, marker)
         reviewer_model = os.getenv("CLIPSE_SMOKE_REVIEWER_MODEL", DEFAULT_REVIEWER_MODEL)
-        verdict = await run_agent_turn(
+        evidence = await run_agent_turn(
             profile=get_reviewer_profile(model=reviewer_model),
             session=reviewer,
             thread_id=f"{issue_id}::reviewer",
             task=(
-                "Review this authoritative GitHub pull-request diff. Read surrounding repository files only if needed. "
-                "Do not edit, commit, push, or call gh. End with the profile's required verdict line.\n\n"
+                f"Review this authoritative GitHub pull-request diff. Before deciding, use the shell tool to run "
+                f"`git branch --show-current` and `cat {marker_path}` in the Daytona repository; verify the branch "
+                f"is `{branch}` and the marker is `{marker}`. Do not edit, commit, push, or call gh. End with the "
+                "profile's required verdict line.\n\n"
                 f"{diff_result.stdout}"
             ),
         )
-        if "VERDICT:" not in verdict:
-            raise SmokeError("reviewer did not emit a verdict")
-        print("verified: coder DAC, draft PR diff, and fresh reviewer DAC", flush=True)
+        verdict = validate_reviewer_evidence(evidence)
+        print(f"verified: coder DAC, draft PR diff, and fresh reviewer DAC ({verdict})", flush=True)
     finally:
-        if pr_url:
-            try:
-                run_host(["gh", "pr", "close", pr_url, "--delete-branch"])
-                print("closed draft PR and deleted branch", flush=True)
-            except Exception as exc:  # noqa: BLE001 - preserve remaining cleanup attempts
-                cleanup_errors.append(f"PR cleanup failed ({type(exc).__name__})")
-        elif branch_pushed:
-            try:
-                run_host(["gh", "api", "-X", "DELETE", f"repos/{slug}/git/refs/heads/{branch}"])
-                print("deleted smoke branch", flush=True)
-            except Exception as exc:  # noqa: BLE001 - preserve sandbox cleanup
-                cleanup_errors.append(f"branch cleanup failed ({type(exc).__name__})")
-
-        for workspace, request in reversed(created):
-            try:
-                lifecycle.delete(request.model_copy(update={"action": "delete", "sandbox_id": workspace.external_id}))
-                print(f"deleted sandbox: {workspace.external_id}", flush=True)
-            except Exception as exc:  # noqa: BLE001 - report type only
-                cleanup_errors.append(f"workspace cleanup failed ({type(exc).__name__})")
-
+        cleanup_errors: list[str] = []
         try:
-            list_request = lifecycle_request(action="list", slug=slug)
-            wait_for_no_leftovers(lambda: lifecycle.list(list_request), issue_id)
-            print("final Daytona smoke leftovers: 0", flush=True)
+            cleanup_github(run_host, slug, branch)
+            print("final GitHub open PRs: 0", flush=True)
+            print("final GitHub smoke branch refs: 0", flush=True)
         except Exception as exc:  # noqa: BLE001 - report type only
-            cleanup_errors.append(f"Daytona cleanup query failed ({type(exc).__name__})")
-
-        if branch_pushed:
-            try:
-                endpoint = f"repos/{slug}/git/matching-refs/heads/{quote(branch, safe='/')}"
-                refs = json.loads(run_host(["gh", "api", endpoint]))
-                print(f"final GitHub smoke branch refs: {len(refs)}", flush=True)
-                if refs:
-                    cleanup_errors.append("GitHub smoke branch remains")
-            except Exception as exc:  # noqa: BLE001 - report type only
-                cleanup_errors.append(f"GitHub cleanup query failed ({type(exc).__name__})")
+            cleanup_errors.append(str(exc) if isinstance(exc, SmokeError) else f"GitHub cleanup failed ({type(exc).__name__})")
+        try:
+            cleanup_sandboxes(
+                lifecycle,
+                list_request,
+                [coder_request, reviewer_request],
+                issue_id,
+                known=known,
+            )
+            print("final Daytona smoke leftovers: 0", flush=True)
+        except Exception as exc:  # noqa: BLE001 - preserve GitHub cleanup result
+            cleanup_errors.append(
+                str(exc) if isinstance(exc, SmokeError) else f"Daytona cleanup failed ({type(exc).__name__})"
+            )
 
         if cleanup_errors:
             raise SmokeError("; ".join(cleanup_errors))
