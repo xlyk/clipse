@@ -6,6 +6,7 @@ import json
 import subprocess
 
 import pytest
+from pydantic import ValidationError
 
 from clipse_agent.backends.contracts import (
     BackendActionRequest,
@@ -66,24 +67,103 @@ def test_reviewer_owner_and_labels_are_scoped_to_the_run() -> None:
 
 def test_success_result_omits_absent_error_fields() -> None:
     workspace = BackendWorkspace(
-        id="sandbox-1",
+        external_id="sandbox-1",
         state="started",
-        path="repo",
-        owner="daytona:xlyk/clipse:coder:issue-1",
+        workspace_path="repo",
+        owner_key="daytona:xlyk/clipse:coder:issue-1",
     )
     result = BackendActionResult(
         action="ensure",
         provider="daytona",
         ok=True,
-        workspace=workspace,
+        **workspace.model_dump(),
     )
 
     dumped = json.loads(result.model_dump_json(exclude_none=True))
 
-    assert dumped["workspace"]["id"] == "sandbox-1"
+    assert dumped["external_id"] == "sandbox-1"
+    assert dumped["owner_key"] == "daytona:xlyk/clipse:coder:issue-1"
+    assert dumped["workspace_path"] == "repo"
+    assert dumped["state"] == "started"
+    assert "workspace" not in dumped
     assert "error_kind" not in dumped
     assert "error_operation" not in dumped
-    assert "error_message" not in dumped
+    assert "error" not in dumped
+
+
+def test_repo_label_hashes_normalized_identity_without_sanitizer_collisions() -> None:
+    assert repo_label(" XLYK/CLIPSE.git ") == repo_label("xlyk/clipse")
+    assert repo_label("xlyk/clipse") != repo_label("xlyk-clipse")
+    assert len(repo_label("xlyk/clipse")) == 64
+
+
+def test_list_request_needs_repository_identity_only() -> None:
+    request = BackendActionRequest(action="list", provider="daytona", repo_slug="xlyk/clipse")
+
+    assert request.issue_id is None
+    assert request.run_id is None
+    assert request.role is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"repo_slug": ""},
+        {"issue_id": ""},
+        {"auto_stop_minutes": 0},
+        {"reviewer_auto_delete_minutes": -1},
+    ],
+)
+def test_ensure_request_rejects_empty_identity_or_nonpositive_lifecycle_values(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        _request(**overrides)
+
+
+def test_ensure_request_requires_scoped_fields() -> None:
+    with pytest.raises(ValidationError):
+        BackendActionRequest(action="ensure", provider="daytona", repo_slug="xlyk/clipse")
+
+
+def test_delete_request_requires_scope_and_sandbox_id() -> None:
+    with pytest.raises(ValidationError):
+        BackendActionRequest(
+            action="delete",
+            provider="daytona",
+            repo_slug="xlyk/clipse",
+            issue_id="issue-1",
+            run_id="run-1",
+            role="coder",
+        )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {
+            "action": "ensure",
+            "provider": "daytona",
+            "ok": True,
+            "owner_key": "daytona:xlyk/clipse:coder:issue-1",
+            "external_id": "sandbox-1",
+            "workspace_path": "repo",
+            "state": "started",
+            "error_kind": "transient",
+            "error": "failed",
+        },
+        {"action": "ensure", "provider": "daytona", "ok": False},
+        {
+            "action": "ensure",
+            "provider": "daytona",
+            "ok": False,
+            "error_kind": "transient",
+            "error": "failed",
+            "external_id": "sandbox-1",
+        },
+    ],
+)
+def test_result_rejects_mixed_or_incomplete_success_and_error_states(values: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        BackendActionResult(**values)
 
 
 def test_safe_error_never_echoes_token_looking_exception_text() -> None:

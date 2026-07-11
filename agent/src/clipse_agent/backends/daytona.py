@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import re
+import hashlib
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 
-from daytona import CreateSandboxFromSnapshotParams, Daytona, DaytonaConfig, ListSandboxesQuery
+from daytona import CreateSandboxFromSnapshotParams, Daytona, DaytonaConfig, DaytonaNotFoundError, ListSandboxesQuery
 
 from clipse_agent.backends.contracts import (
     BackendActionError,
@@ -27,6 +27,7 @@ class _Sandbox(Protocol):
     id: str
     state: Any
     git: _Git
+    fs: Any
 
 
 class _DaytonaClient(Protocol):
@@ -46,17 +47,22 @@ TokenReader = Callable[[], str]
 
 
 def repo_label(repo_slug: str) -> str:
-    """Return a stable Daytona-label-safe repository identity."""
+    """Return a collision-resistant hash of the normalized repository identity."""
 
-    normalized = re.sub(r"[^a-z0-9_.-]+", "-", repo_slug.lower()).strip("-.")
-    return normalized or "repo"
+    normalized = repo_slug.strip().lower()
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def owner_key(request: BackendActionRequest) -> str:
     """Return the stable ownership identity for a lifecycle request."""
 
+    assert request.role is not None
+    assert request.issue_id is not None
     base = f"{request.provider}:{request.repo_slug}:{request.role}:{request.issue_id}"
     if request.role == "reviewer":
+        assert request.run_id is not None
         return f"{base}:{request.run_id}"
     return base
 
@@ -64,6 +70,8 @@ def owner_key(request: BackendActionRequest) -> str:
 def labels_for(request: BackendActionRequest) -> dict[str, str]:
     """Return the complete label selector used for creation and matching."""
 
+    assert request.role is not None
+    assert request.issue_id is not None
     labels = {
         "created-by": "clipse",
         "repo": repo_label(request.repo_slug),
@@ -71,6 +79,7 @@ def labels_for(request: BackendActionRequest) -> dict[str, str]:
         "role": request.role,
     }
     if request.role == "reviewer":
+        assert request.run_id is not None
         labels["run"] = request.run_id
     return labels
 
@@ -94,10 +103,34 @@ def workspace_from(
     """Convert a Daytona SDK object into the stable public contract."""
 
     return BackendWorkspace(
-        id=sandbox.id,
+        external_id=sandbox.id,
         state=state or _state_value(sandbox.state),
-        path=REMOTE_REPO_REL,
-        owner=owner_key(request),
+        workspace_path=REMOTE_REPO_REL,
+        owner_key=owner_key(request),
+    )
+
+
+def _repo_labels(repo_slug: str) -> dict[str, str]:
+    return {"created-by": "clipse", "repo": repo_label(repo_slug)}
+
+
+def _owner_from_labels(sandbox: _Sandbox, repo_slug: str) -> str:
+    labels = getattr(sandbox, "labels", {})
+    role = labels.get("role")
+    issue_id = labels.get("issue")
+    run_id = labels.get("run")
+    if role not in {"coder", "reviewer"} or not issue_id or (role == "reviewer" and not run_id):
+        raise BackendActionError("needs_input", "list", f"sandbox {sandbox.id} has incomplete clipse labels")
+    base = f"daytona:{repo_slug}:{role}:{issue_id}"
+    return f"{base}:{run_id}" if role == "reviewer" else base
+
+
+def workspace_from_labels(sandbox: _Sandbox, repo_slug: str) -> BackendWorkspace:
+    return BackendWorkspace(
+        external_id=sandbox.id,
+        state=_state_value(sandbox.state),
+        workspace_path=REMOTE_REPO_REL,
+        owner_key=_owner_from_labels(sandbox, repo_slug),
     )
 
 
@@ -124,8 +157,25 @@ class DaytonaLifecycle:
         assert self._client is not None
         return list(self._client.list(ListSandboxesQuery(labels=labels_for(request))))
 
-    def _create_and_clone(self, request: BackendActionRequest) -> _Sandbox:
+    def _matching_repo(self, request: BackendActionRequest) -> list[_Sandbox]:
         assert self._client is not None
+        return list(self._client.list(ListSandboxesQuery(labels=_repo_labels(request.repo_slug))))
+
+    def _repo_ready(self, sandbox: _Sandbox) -> bool:
+        try:
+            sandbox.fs.get_file_info(f"{REMOTE_REPO_REL}/.git")
+        except (DaytonaNotFoundError, FileNotFoundError):
+            return False
+        return True
+
+    def _create_and_clone(self, request: BackendActionRequest, token: str) -> _Sandbox:
+        assert self._client is not None
+        assert request.role is not None
+        assert request.auto_stop_minutes is not None
+        assert request.reviewer_auto_delete_minutes is not None
+        assert request.repo_url is not None
+        assert request.branch is not None
+        assert request.base_branch is not None
         auto_delete = request.reviewer_auto_delete_minutes if request.role == "reviewer" else None
         params = CreateSandboxFromSnapshotParams(
             name=owner_key(request),
@@ -136,7 +186,6 @@ class DaytonaLifecycle:
             auto_delete_interval=auto_delete,
         )
         sandbox = self._client.create(params)
-        token = self._token_reader()
         clone_branch = request.branch if request.role == "reviewer" else request.base_branch
         try:
             sandbox.git.clone(
@@ -146,9 +195,15 @@ class DaytonaLifecycle:
                 username="x-access-token",
                 password=token,
             )
-        except BackendActionError:
-            raise
         except Exception as exc:
+            try:
+                self._client.delete(sandbox)
+            except Exception as cleanup_exc:
+                message = (
+                    f"clone failed and cleanup failed for sandbox {sandbox.id} "
+                    f"({type(cleanup_exc).__name__})"
+                )
+                raise BackendActionError("needs_input", "clone_cleanup", message) from None
             raise BackendActionError("transient", "clone", safe_error("clone", exc)) from None
         return sandbox
 
@@ -163,8 +218,13 @@ class DaytonaLifecycle:
             if sandbox.state != "started":
                 assert self._client is not None
                 self._client.start(sandbox)
+            if not self._repo_ready(sandbox):
+                token = self._token_reader()
+                self._client.delete(sandbox)
+                sandbox = self._create_and_clone(request, token)
         else:
-            sandbox = self._create_and_clone(request)
+            token = self._token_reader()
+            sandbox = self._create_and_clone(request, token)
         return workspace_from(sandbox, request)
 
     def delete(self, request: BackendActionRequest) -> BackendWorkspace:
@@ -178,7 +238,9 @@ class DaytonaLifecycle:
 
     def list(self, request: BackendActionRequest) -> list[BackendWorkspace]:
         self._prepare(request)
-        return [workspace_from(sandbox, request) for sandbox in self._matching(request)]
+        matches = self._matching_repo(request)
+        self._token_reader()
+        return [workspace_from_labels(sandbox, request.repo_slug) for sandbox in matches]
 
 
 __all__ = [
@@ -189,4 +251,5 @@ __all__ = [
     "owner_key",
     "repo_label",
     "workspace_from",
+    "workspace_from_labels",
 ]

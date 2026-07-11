@@ -30,7 +30,16 @@ import traceback
 from collections.abc import Sequence
 from typing import Any
 
-from daytona import DaytonaAuthenticationError, DaytonaAuthorizationError, DaytonaConnectionError, DaytonaTimeoutError
+from daytona import (
+    DaytonaAuthenticationError,
+    DaytonaAuthorizationError,
+    DaytonaConnectionError,
+    DaytonaError,
+    DaytonaNotFoundError,
+    DaytonaRateLimitError,
+    DaytonaTimeoutError,
+    DaytonaValidationError,
+)
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
@@ -72,13 +81,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript", default="")
     parser.add_argument("--base-branch", default="")
     parser.add_argument("--backend-provider", default="daytona")
-    parser.add_argument("--backend-role", default="coder")
+    parser.add_argument("--backend-role", default="")
     parser.add_argument("--repo-url", default="")
     parser.add_argument("--repo-slug", default="")
     parser.add_argument("--branch", default="")
     parser.add_argument("--sandbox-id", default="")
-    parser.add_argument("--auto-stop-minutes", type=int, default=60)
-    parser.add_argument("--reviewer-auto-delete-minutes", type=int, default=60)
+    parser.add_argument("--auto-stop-minutes", type=int, default=None)
+    parser.add_argument("--reviewer-auto-delete-minutes", type=int, default=None)
     parser.add_argument("--snapshot", default="")
     parser.add_argument("--target", default="")
     return parser
@@ -106,7 +115,7 @@ def _backend_failure(
         ok=False,
         error_kind=kind,
         error_operation=operation,
-        error_message=message,
+        error=message,
     )
 
 
@@ -114,13 +123,13 @@ def _backend_request(args: argparse.Namespace) -> BackendActionRequest:
     return BackendActionRequest(
         action=args.backend_action,
         provider=args.backend_provider,
-        repo_url=args.repo_url,
+        repo_url=args.repo_url or None,
         repo_slug=args.repo_slug,
-        base_branch=args.base_branch,
-        branch=args.branch,
-        issue_id=args.issue,
-        run_id=args.run,
-        role=args.backend_role,
+        base_branch=args.base_branch or None,
+        branch=args.branch or None,
+        issue_id=args.issue or None,
+        run_id=args.run or None,
+        role=args.backend_role or None,
         auto_stop_minutes=args.auto_stop_minutes,
         reviewer_auto_delete_minutes=args.reviewer_auto_delete_minutes,
         sandbox_id=args.sandbox_id or None,
@@ -139,7 +148,7 @@ def _dispatch_backend_action(args: argparse.Namespace) -> BackendActionResult:
             operation="backend_action",
             message="unsupported backend provider or action",
         )
-    if args.backend_role not in {"coder", "reviewer"}:
+    if args.backend_role and args.backend_role not in {"coder", "reviewer"}:
         return _backend_failure(
             args,
             kind="capability",
@@ -152,10 +161,20 @@ def _dispatch_backend_action(args: argparse.Namespace) -> BackendActionResult:
         lifecycle = DaytonaLifecycle()
         if request.action == "ensure":
             workspace = lifecycle.ensure(request)
-            return BackendActionResult(action=request.action, provider=request.provider, ok=True, workspace=workspace)
+            return BackendActionResult(
+                action=request.action,
+                provider=request.provider,
+                ok=True,
+                **workspace.model_dump(),
+            )
         if request.action == "delete":
             workspace = lifecycle.delete(request)
-            return BackendActionResult(action=request.action, provider=request.provider, ok=True, workspace=workspace)
+            return BackendActionResult(
+                action=request.action,
+                provider=request.provider,
+                ok=True,
+                **workspace.model_dump(),
+            )
         workspaces = lifecycle.list(request)
         return BackendActionResult(action=request.action, provider=request.provider, ok=True, workspaces=workspaces)
     except BackendActionError as exc:
@@ -172,7 +191,14 @@ def _dispatch_backend_action(args: argparse.Namespace) -> BackendActionResult:
             operation="daytona_auth",
             message="Daytona authentication is required",
         )
-    except (DaytonaTimeoutError, DaytonaConnectionError, TimeoutError) as exc:
+    except (DaytonaValidationError, DaytonaNotFoundError) as exc:
+        return _backend_failure(
+            args,
+            kind="needs_input",
+            operation="daytona_config",
+            message=safe_error("daytona configuration", exc),
+        )
+    except (DaytonaTimeoutError, DaytonaConnectionError, DaytonaRateLimitError, TimeoutError) as exc:
         return _backend_failure(
             args,
             kind="transient",
@@ -186,12 +212,26 @@ def _dispatch_backend_action(args: argparse.Namespace) -> BackendActionResult:
             operation="backend_action",
             message="invalid backend action request",
         )
-    except Exception as exc:  # noqa: BLE001 - provider failures must remain typed and secret-safe
+    except (ImportError, AttributeError, TypeError) as exc:
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="daytona_sdk",
+            message=safe_error("Daytona SDK", exc),
+        )
+    except DaytonaError as exc:
         return _backend_failure(
             args,
             kind="transient",
             operation="daytona",
-            message=safe_error("daytona", exc),
+            message=safe_error("daytona provider", exc),
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown failures are not safe to retry automatically
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="daytona_sdk",
+            message=safe_error("Daytona SDK", exc),
         )
 
 

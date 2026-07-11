@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from daytona import DaytonaAuthenticationError, DaytonaTimeoutError
+from daytona import DaytonaAuthenticationError, DaytonaNotFoundError, DaytonaTimeoutError, DaytonaValidationError
 
 from clipse_agent import worker
 from clipse_agent.backends.contracts import (
@@ -1074,29 +1074,29 @@ class _FakeLifecycle:
     def ensure(self, request: BackendActionRequest) -> BackendWorkspace:
         self._record("ensure", request)
         return BackendWorkspace(
-            id="sandbox-1",
+            external_id="sandbox-1",
             state="started",
-            path="repo",
-            owner="daytona:xlyk/clipse:coder:issue-1",
+            workspace_path="repo",
+            owner_key="daytona:xlyk/clipse:coder:issue-1",
         )
 
     def delete(self, request: BackendActionRequest) -> BackendWorkspace:
         self._record("delete", request)
         return BackendWorkspace(
-            id=request.sandbox_id or "sandbox-1",
+            external_id=request.sandbox_id or "sandbox-1",
             state="destroyed",
-            path="repo",
-            owner="daytona:xlyk/clipse:coder:issue-1",
+            workspace_path="repo",
+            owner_key="daytona:xlyk/clipse:coder:issue-1",
         )
 
     def list(self, request: BackendActionRequest) -> list[BackendWorkspace]:
         self._record("list", request)
         return [
             BackendWorkspace(
-                id="sandbox-1",
+                external_id="sandbox-1",
                 state="stopped",
-                path="repo",
-                owner="daytona:xlyk/clipse:coder:issue-1",
+                workspace_path="repo",
+                owner_key="daytona:xlyk/clipse:coder:issue-1",
             )
         ]
 
@@ -1119,8 +1119,10 @@ def test_backend_action_ensure_prints_one_typed_success_before_lane_dispatch(mon
     result = _run_backend_main(monkeypatch, capsys, lifecycle, _backend_argv())
 
     assert result.ok is True
-    assert result.workspace is not None
-    assert result.workspace.id == "sandbox-1"
+    assert result.external_id == "sandbox-1"
+    assert result.workspace_path == "repo"
+    assert result.owner_key == "daytona:xlyk/clipse:coder:issue-1"
+    assert result.state == "started"
     assert result.error_kind is None
     assert lifecycle.calls[0][0] == "ensure"
     request = lifecycle.calls[0][1]
@@ -1134,9 +1136,9 @@ def test_backend_action_list_prints_typed_workspace_list(monkeypatch, capsys) ->
     result = _run_backend_main(monkeypatch, capsys, lifecycle, _backend_argv("list"))
 
     assert result.ok is True
-    assert result.workspace is None
+    assert result.external_id is None
     assert result.workspaces is not None
-    assert [item.id for item in result.workspaces] == ["sandbox-1"]
+    assert [item.external_id for item in result.workspaces] == ["sandbox-1"]
 
 
 def test_backend_action_failure_is_typed_and_still_exits_zero(monkeypatch, capsys) -> None:
@@ -1147,7 +1149,7 @@ def test_backend_action_failure_is_typed_and_still_exits_zero(monkeypatch, capsy
     assert result.ok is False
     assert result.error_kind == "needs_input"
     assert result.error_operation == "ensure"
-    assert result.error_message == "authenticate GitHub first"
+    assert result.error == "authenticate GitHub first"
 
 
 @pytest.mark.parametrize("exc", [DaytonaAuthenticationError("no API key"), BackendActionError("needs_input", "github_auth", "no auth")])
@@ -1167,7 +1169,7 @@ def test_backend_action_maps_provider_timeout_to_transient(monkeypatch, capsys) 
     assert result.ok is False
     assert result.error_kind == "transient"
     assert result.error_operation == "daytona"
-    assert token not in (result.error_message or "")
+    assert token not in (result.error or "")
 
 
 @pytest.mark.parametrize(
@@ -1182,3 +1184,38 @@ def test_backend_action_maps_unsupported_provider_or_action_to_capability(
     assert result.ok is False
     assert result.error_kind == "capability"
     assert result.error_operation == "backend_action"
+
+
+@pytest.mark.parametrize("exc", [DaytonaValidationError("invalid target"), DaytonaNotFoundError("snapshot missing")])
+def test_backend_action_maps_invalid_target_or_snapshot_to_needs_input(monkeypatch, capsys, exc) -> None:
+    result = _run_backend_main(monkeypatch, capsys, _FakeLifecycle(raises=exc), _backend_argv())
+
+    assert result.ok is False
+    assert result.error_kind == "needs_input"
+    assert result.error_operation == "daytona_config"
+
+
+@pytest.mark.parametrize("exc", [ImportError("missing Daytona symbol"), AttributeError("SDK method missing")])
+def test_backend_action_maps_sdk_or_dependency_incompatibility_to_capability(monkeypatch, capsys, exc) -> None:
+    result = _run_backend_main(monkeypatch, capsys, _FakeLifecycle(raises=exc), _backend_argv())
+
+    assert result.ok is False
+    assert result.error_kind == "capability"
+    assert result.error_operation == "daytona_sdk"
+
+
+def test_backend_action_list_accepts_repo_identity_without_issue_scope(monkeypatch, capsys) -> None:
+    lifecycle = _FakeLifecycle()
+
+    result = _run_backend_main(
+        monkeypatch,
+        capsys,
+        lifecycle,
+        ["--backend-action=list", "--backend-provider=daytona", "--repo-slug=xlyk/clipse"],
+    )
+
+    assert result.ok is True
+    request = lifecycle.calls[0][1]
+    assert request.issue_id is None
+    assert request.run_id is None
+    assert request.role is None
