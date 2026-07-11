@@ -1,0 +1,12 @@
+team: CLI
+default_labels: [agent:coder]
+issues:
+  - ref: core-1
+    title: Greeter core
+    deps: []
+    body: |
+      inline core body
+  - ref: cfg-1
+    title: Config dataclass
+    deps: [core-1]
+    body_file: bodies/cfg-1.md
