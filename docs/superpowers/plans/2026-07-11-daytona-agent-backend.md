@@ -405,7 +405,7 @@ func TestCommandManagerEnsure_UsesSanitizedDaytonaEnv(t *testing.T) {
 }
 ```
 
-Add tests for typed `needs_input`, malformed JSON, nonzero process exit, and ensuring no token appears in errors.
+Add tests for typed `needs_input`, malformed JSON, nonzero process exit, and ensuring no token appears in errors. Add a dispatcher spawn test proving a Daytona agent worker receives `DAYTONA_API_KEY`, optional `DAYTONA_API_URL`/`DAYTONA_TARGET`, `HOME`, and `PATH`, while the same host environment produces no Daytona variables in a local worker spec.
 
 - [ ] **Step 2: Verify RED**
 
@@ -452,6 +452,8 @@ Expected Daytona argv includes `--backend=daytona`, `--sandbox-id`, `--repo-url`
 - [ ] **Step 5: Provision before spawn**
 
 Add `backend.Manager` to `Dispatcher` through `WithBackendManager`. In local mode keep `d.ws.Ensure(issue)`. In Daytona mode call `Ensure`, upsert the returned workspace before `Spawner.Spawn`, and pass the remote path and metadata in `WorkerSpec`.
+
+Build the Daytona worker environment by adding only `DAYTONA_API_KEY`, optional `DAYTONA_API_URL`/`DAYTONA_TARGET`, `HOME`, and `PATH` from the dispatcher process to the normal model/issue environment. Deduplicate by variable name. Keep the existing allow-listed environment byte-for-byte in local mode; never add Daytona variables there.
 
 Map `backend.ActionError.Kind` to `parkOrRetry`: `transient` consumes bounded recovery; `needs_input` and `capability` park immediately. Do not classify every provisioning error as transient.
 
