@@ -260,6 +260,117 @@ worker:
 	}
 }
 
+func TestLoad_AgentBackendDefaultsToLocal(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML)
+	if cfg.AgentBackend.Type != "local" {
+		t.Fatalf("AgentBackend.Type = %q, want local", cfg.AgentBackend.Type)
+	}
+}
+
+func TestLoad_DaytonaBackendDefaults(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML+`
+agent_backend:
+  type: daytona
+`)
+	if cfg.AgentBackend.Daytona.AutoStopMinutes != 60 {
+		t.Errorf("AutoStopMinutes = %d, want 60", cfg.AgentBackend.Daytona.AutoStopMinutes)
+	}
+	if cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes != 60 {
+		t.Errorf("ReviewerAutoDeleteMinutes = %d, want 60", cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes)
+	}
+}
+
+func TestLoad_DaytonaBackendRejectsInvalidValues(t *testing.T) {
+	tests := []struct {
+		name          string
+		yaml          string
+		wantErrSubstr string
+	}{
+		{
+			name: "unsupported backend type",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: docker
+`,
+			wantErrSubstr: "agent_backend.type",
+		},
+		{
+			name: "zero auto stop interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    auto_stop_minutes: 0
+`,
+			wantErrSubstr: "agent_backend.daytona.auto_stop_minutes",
+		},
+		{
+			name: "negative auto stop interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    auto_stop_minutes: -1
+`,
+			wantErrSubstr: "agent_backend.daytona.auto_stop_minutes",
+		},
+		{
+			name: "zero reviewer auto delete interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    reviewer_auto_delete_minutes: 0
+`,
+			wantErrSubstr: "agent_backend.daytona.reviewer_auto_delete_minutes",
+		},
+		{
+			name: "negative reviewer auto delete interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    reviewer_auto_delete_minutes: -1
+`,
+			wantErrSubstr: "agent_backend.daytona.reviewer_auto_delete_minutes",
+		},
+		{
+			name: "explicitly empty snapshot",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    snapshot: ""
+`,
+			wantErrSubstr: "agent_backend.daytona.snapshot",
+		},
+		{
+			name: "explicitly empty target",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    target: ""
+`,
+			wantErrSubstr: "agent_backend.daytona.target",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeYAML(t, tt.yaml)
+
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatalf("Load: expected error containing %q, got nil", tt.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSubstr) {
+				t.Errorf("Load: error %q does not mention %q", err.Error(), tt.wantErrSubstr)
+			}
+		})
+	}
+}
+
 // TestLoad_RequireChecksExplicitFalse asserts an explicit repo.require_checks:
 // false is honored (a repo declaring it has no CI at all), distinct from the
 // absent-key default of true.

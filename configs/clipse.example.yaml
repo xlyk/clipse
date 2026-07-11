@@ -85,6 +85,17 @@ rework_cap: 3
 recover_cap: 5
 recover_backoff_s: 30
 
+# agent_backend: where DAC workers execute. Omitting this block preserves
+# local mode. Daytona sandboxes stop after the configured idle interval;
+# reviewer sandboxes are deleted after their own idle interval.
+agent_backend:
+  type: daytona
+  daytona:
+    auto_stop_minutes: 60
+    reviewer_auto_delete_minutes: 60
+    # snapshot: "snapshot-id-or-name"
+    # target: "us"
+
 # worker: how the dispatcher execs the clipse-worker subprocess. command is
 # the argv PREFIX the Spawner execs for every worker invocation; the
 # dispatcher appends the per-run flags (--issue/--lane/--run/--thread/
