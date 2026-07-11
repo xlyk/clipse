@@ -191,6 +191,46 @@ def test_build_coder_agent_forwards_kernel_owned_checkpointer(monkeypatch):
     assert captured["kwargs"]["cwd"] == "/work/issue-1"
 
 
+def test_build_coder_agent_passes_daytona_sandbox(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    fake_sandbox = object()
+    model_stub = SimpleNamespace(profile=None)
+    monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=model_stub))
+    monkeypatch.setattr(
+        dac,
+        "create_cli_agent",
+        lambda *args, **kwargs: calls.update(kwargs) or (object(), object()),
+    )
+
+    dac.build_coder_agent(
+        get_coder_profile(),
+        None,
+        "/home/daytona/workspace/clipse",
+        sandbox=fake_sandbox,
+        sandbox_type="daytona",
+    )
+
+    assert calls["sandbox"] is fake_sandbox
+    assert calls["sandbox_type"] == "daytona"
+    assert calls["cwd"] == "/home/daytona/workspace/clipse"
+
+
+def test_build_coder_agent_local_mode_does_not_change_create_cli_agent_call_shape(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    model_stub = SimpleNamespace(profile=None)
+    monkeypatch.setattr(dac, "create_model", lambda spec, **kw: SimpleNamespace(model=model_stub))
+    monkeypatch.setattr(
+        dac,
+        "create_cli_agent",
+        lambda *args, **kwargs: calls.update(kwargs) or (object(), object()),
+    )
+
+    dac.build_coder_agent(get_coder_profile(), None, "/tmp/local")
+
+    assert "sandbox" not in calls
+    assert "sandbox_type" not in calls
+
+
 def test_build_coder_agent_wraps_create_cli_agent_errors(monkeypatch):
     def boom(*args, **kwargs):
         raise ValueError("bad model spec")

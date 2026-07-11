@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,9 +15,11 @@ from clipse_agent.backends.daytona import (
     REMOTE_REPO_REL,
     BackendActionError,
     DaytonaLifecycle,
+    DaytonaSession,
     labels_for,
     owner_key,
 )
+from clipse_agent.backends.session import CommandResult
 
 
 def _request(**overrides: object) -> BackendActionRequest:
@@ -449,3 +452,148 @@ def test_delete_sandbox_vanishing_after_lookup_is_successfully_deleted() -> None
     assert workspace.external_id == "sandbox-1"
     assert workspace.state == "deleted"
     assert client.deleted == [sandbox]
+
+
+@dataclass
+class _FakeExecuteResponse:
+    output: str
+    exit_code: int | None
+
+
+@dataclass
+class _FakeDaytonaBackend:
+    calls: list[str] = field(default_factory=list)
+
+    def execute(self, command: str) -> _FakeExecuteResponse:
+        self.calls.append(command)
+        return _FakeExecuteResponse(output="remote output", exit_code=0)
+
+
+@dataclass
+class _FakeSessionGit:
+    pull_calls: list[dict[str, Any]] = field(default_factory=list)
+    commit_calls: list[dict[str, Any]] = field(default_factory=list)
+    push_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def pull(self, **kwargs: Any) -> None:
+        self.pull_calls.append(kwargs)
+
+    def commit(self, **kwargs: Any) -> object:
+        self.commit_calls.append(kwargs)
+        return object()
+
+    def push(self, **kwargs: Any) -> None:
+        self.push_calls.append(kwargs)
+
+
+@dataclass
+class _FakeSessionSandbox:
+    git: _FakeSessionGit = field(default_factory=_FakeSessionGit)
+
+
+def test_daytona_session_run_executes_through_daytona_backend() -> None:
+    backend = _FakeDaytonaBackend()
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        backend,
+        _FakeSessionSandbox(),
+        token_reader=lambda: "unused",
+        host_runner=lambda _argv: "unused",
+    )
+
+    result = session.run(["python", "-c", "print('hello world')"])
+
+    assert backend.calls == [shlex.join(["python", "-c", "print('hello world')"])]
+    assert result == CommandResult(returncode=0, stdout="remote output", stderr="")
+    assert session.provider == "daytona"
+    assert session.sandbox is backend
+    assert session.sandbox_type == "daytona"
+
+
+def test_daytona_session_git_credentials_are_read_just_in_time() -> None:
+    token_reads: list[str] = []
+    tokens = iter(["pull-token", "push-token"])
+
+    def read_token() -> str:
+        token_reads.append("read")
+        return next(tokens)
+
+    sdk_sandbox = _FakeSessionSandbox()
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        _FakeDaytonaBackend(),
+        sdk_sandbox,
+        token_reader=read_token,
+        host_runner=lambda _argv: "unused",
+    )
+
+    assert token_reads == []
+    assert session.sync_base("main") == CommandResult(0)
+    assert token_reads == ["read"]
+    assert sdk_sandbox.git.pull_calls == [
+        {
+            "path": REMOTE_REPO_ABS,
+            "username": "x-access-token",
+            "password": "pull-token",
+            "branch": "main",
+            "remote": "origin",
+        }
+    ]
+
+    assert session.push("feat/CLI-1") == CommandResult(0)
+    assert token_reads == ["read", "read"]
+    assert sdk_sandbox.git.push_calls == [
+        {
+            "path": REMOTE_REPO_ABS,
+            "username": "x-access-token",
+            "password": "push-token",
+            "branch": "feat/CLI-1",
+            "remote": "origin",
+            "set_upstream": True,
+        }
+    ]
+
+
+def test_daytona_session_commit_uses_sdk_git_and_github_stays_on_host() -> None:
+    host_calls: list[list[str]] = []
+    sdk_sandbox = _FakeSessionSandbox()
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        _FakeDaytonaBackend(),
+        sdk_sandbox,
+        token_reader=lambda: "unused",
+        host_runner=lambda argv: host_calls.append(argv) or "https://github.com/xlyk/clipse/pull/1",
+    )
+
+    assert session.commit("feat: remote change") == CommandResult(0)
+    assert sdk_sandbox.git.commit_calls == [
+        {
+            "path": REMOTE_REPO_ABS,
+            "message": "feat: remote change",
+            "author": "clipse",
+            "email": "clipse@users.noreply.github.com",
+        }
+    ]
+
+    result = session.github(["pr", "view", "feat/CLI-1", "--json", "url"])
+
+    assert result == CommandResult(
+        0,
+        "https://github.com/xlyk/clipse/pull/1",
+        "",
+    )
+    assert host_calls == [
+        [
+            "gh",
+            "pr",
+            "view",
+            "feat/CLI-1",
+            "--json",
+            "url",
+            "--repo",
+            "xlyk/clipse",
+        ]
+    ]

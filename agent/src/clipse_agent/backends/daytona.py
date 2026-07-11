@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Iterable
+import shlex
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from daytona import (
@@ -22,6 +24,8 @@ from clipse_agent.backends.contracts import (
     WorkspaceState,
 )
 from clipse_agent.backends.github import AuthPreflight, github_auth_preflight, github_token, safe_error
+from clipse_agent.backends.github import HostRunner, subprocess_host_runner
+from clipse_agent.backends.session import CommandResult
 
 REMOTE_REPO_REL = "workspace/clipse"
 REMOTE_REPO_ABS = "/home/daytona/workspace/clipse"
@@ -52,6 +56,100 @@ class _DaytonaClient(Protocol):
 
 ClientFactory = Callable[[BackendActionRequest], _DaytonaClient]
 TokenReader = Callable[[], str]
+
+_GIT_USERNAME = "x-access-token"
+GIT_AUTHOR_NAME = "clipse"
+GIT_AUTHOR_EMAIL = "clipse@users.noreply.github.com"
+
+
+@dataclass(frozen=True)
+class DaytonaSession:
+    """Execute a worker turn against one existing Daytona sandbox.
+
+    ``sandbox`` is the LangChain ``DaytonaSandbox`` passed to DAC. The raw
+    SDK sandbox is retained separately for credential-scoped Git API calls;
+    GitHub CLI calls stay on the host and are scoped explicitly to
+    ``repo_slug`` so they never depend on a host checkout.
+    """
+
+    cwd: str
+    repo_slug: str
+    sandbox: Any
+    sdk_sandbox: Any
+    token_reader: TokenReader = github_token
+    host_runner: HostRunner = subprocess_host_runner
+    provider: str = field(default="daytona", init=False)
+    sandbox_type: str = field(default="daytona", init=False)
+
+    def run(self, argv: Sequence[str]) -> CommandResult:
+        response = self.sandbox.execute(shlex.join(argv))
+        returncode = response.exit_code if response.exit_code is not None else 1
+        return CommandResult(returncode=returncode, stdout=response.output)
+
+    def _git_token(self, operation: str) -> tuple[str | None, CommandResult | None]:
+        try:
+            return self.token_reader(), None
+        except Exception as exc:  # noqa: BLE001 - sanitize all credential-helper failures
+            return None, CommandResult(1, stderr=safe_error(operation, exc))
+
+    def sync_base(self, base_branch: str) -> CommandResult:
+        token, failure = self._git_token("git pull authentication")
+        if failure is not None:
+            return failure
+        try:
+            self.sdk_sandbox.git.pull(
+                path=self.cwd,
+                username=_GIT_USERNAME,
+                password=token,
+                branch=base_branch,
+                remote="origin",
+            )
+        except Exception as exc:  # noqa: BLE001 - SDK errors may contain credentials
+            return CommandResult(1, stderr=safe_error("git pull", exc))
+        return CommandResult(0)
+
+    def commit(self, message: str) -> CommandResult:
+        try:
+            self.sdk_sandbox.git.commit(
+                path=self.cwd,
+                message=message,
+                author=GIT_AUTHOR_NAME,
+                email=GIT_AUTHOR_EMAIL,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep provider details out of results
+            return CommandResult(1, stderr=safe_error("git commit", exc))
+        return CommandResult(0)
+
+    def push(self, branch: str) -> CommandResult:
+        token, failure = self._git_token("git push authentication")
+        if failure is not None:
+            return failure
+        try:
+            self.sdk_sandbox.git.push(
+                path=self.cwd,
+                username=_GIT_USERNAME,
+                password=token,
+                branch=branch,
+                remote="origin",
+                set_upstream=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - SDK errors may contain credentials
+            return CommandResult(1, stderr=safe_error("git push", exc))
+        return CommandResult(0)
+
+    def github(self, argv: Sequence[str]) -> CommandResult:
+        command = list(argv)
+        if not command or command[0] != "gh":
+            command.insert(0, "gh")
+        if len(command) > 1 and command[1] != "api" and not ({"--repo", "-R"} & set(command)):
+            command.extend(["--repo", self.repo_slug])
+        try:
+            stdout = self.host_runner(command)
+        except BackendActionError as exc:
+            return CommandResult(1, stderr=str(exc))
+        except Exception as exc:  # noqa: BLE001 - never echo host command exception text
+            return CommandResult(1, stderr=safe_error("GitHub command", exc))
+        return CommandResult(0, stdout=stdout)
 
 
 def repo_label(repo_slug: str) -> str:
@@ -299,6 +397,7 @@ __all__ = [
     "REMOTE_REPO_REL",
     "BackendActionError",
     "DaytonaLifecycle",
+    "DaytonaSession",
     "labels_for",
     "owner_key",
     "repo_label",

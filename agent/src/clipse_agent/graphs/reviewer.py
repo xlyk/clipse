@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from clipse_agent import dac
+from clipse_agent.backends.session import CommandResult
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs import coder
 from clipse_agent.graphs.coder import CoderGraphError as ReviewerGraphError
@@ -70,6 +71,7 @@ from clipse_agent.transcript import TranscriptWriter
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
+    from clipse_agent.backends.session import AgentSession
 
 __all__ = [
     "ReviewerGraphError",
@@ -110,7 +112,6 @@ TurnDriver = coder.TurnDriver
 # graphs.coder.
 # ---------------------------------------------------------------------------
 
-CommandResult = coder.CommandResult
 CommandRunner = coder.CommandRunner
 
 
@@ -745,6 +746,7 @@ def build_reviewer_graph(
     turn_driver: TurnDriver = dac.drive_turn,
     run_command: CommandRunner | None = None,
     transcript: TranscriptWriter | None = None,
+    session: AgentSession | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Build and compile the Reviewer lane's graph.
 
@@ -771,6 +773,10 @@ def build_reviewer_graph(
     """
     resolved_profile = profile if profile is not None else get_reviewer_profile()
     resolved_run_command = run_command if run_command is not None else _default_run_command
+    # Task 5 establishes the graph-facing session seam. Tasks 6-7 route
+    # individual graph operations through it; until then local command
+    # behavior remains unchanged.
+    _ = session
 
     graph: StateGraph[ReviewerState, Any, Any, Any] = StateGraph(ReviewerState)
     graph.add_node("load_context", load_context)

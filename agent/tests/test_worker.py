@@ -21,6 +21,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,6 +35,8 @@ from clipse_agent.backends.contracts import (
     BackendActionResult,
     BackendWorkspace,
 )
+from clipse_agent.backends.daytona import DaytonaSession
+from clipse_agent.backends.local import LocalSession
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.transcript import TranscriptWriter
 
@@ -288,6 +291,85 @@ def test_dispatch_base_branch_defaults_to_empty_string_when_flag_omitted(monkeyp
     )
 
     assert graph.calls[0]["input_state"]["base_branch"] == ""
+
+
+def test_dispatch_builds_local_session_and_preserves_local_agent_factory_shape(monkeypatch, capsys):
+    canned = _canned_result()
+    graph = _FakeGraph(final_state={"result": canned})
+    kwarg_calls: list[dict[str, Any]] = []
+    dac_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        worker.dac,
+        "build_coder_agent",
+        lambda *args, **kwargs: dac_calls.append((args, kwargs)) or (object(), object()),
+    )
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        ["--lane=coder", "--workspace=/ws", "--repo-slug=xlyk/clipse"],
+        graph=graph,
+        build_calls=[],
+        kwarg_calls=kwarg_calls,
+    )
+
+    session = kwarg_calls[-1]["session"]
+    assert isinstance(session, LocalSession)
+    assert session.cwd == "/ws"
+    assert session.repo_slug == "xlyk/clipse"
+    profile = object()
+    kwarg_calls[-1]["agent_factory"](profile, None, "/ws")
+    assert dac_calls == [((profile, None, "/ws"), {})]
+
+
+@pytest.mark.parametrize(
+    ("lane", "graph_attr"),
+    [("coder", "build_coder_graph"), ("reviewer", "build_reviewer_graph")],
+)
+def test_dispatch_builds_daytona_session_for_each_graph(
+    monkeypatch, capsys, lane: str, graph_attr: str
+) -> None:
+    raw_sandbox = SimpleNamespace(git=SimpleNamespace())
+    backend = object()
+    client = SimpleNamespace(get=lambda sandbox_id: raw_sandbox)
+    monkeypatch.setattr(worker, "Daytona", lambda: client)
+    monkeypatch.setattr(worker, "DaytonaSandbox", lambda *, sandbox: backend)
+    dac_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        worker.dac,
+        "build_coder_agent",
+        lambda *args, **kwargs: dac_calls.append(kwargs) or (object(), object()),
+    )
+    lane_value = Lane(lane)
+    canned = _canned_result(
+        lane=lane_value,
+        outcome=Outcome.needs_review if lane_value == Lane.coder else Outcome.done,
+    )
+    graph = _FakeGraph(final_state={"result": canned})
+    kwarg_calls: list[dict[str, Any]] = []
+
+    _run_main_capture(
+        monkeypatch,
+        capsys,
+        [
+            f"--lane={lane}",
+            "--workspace=/home/daytona/workspace/clipse",
+            "--backend=daytona",
+            "--sandbox-id=sandbox-1",
+            "--repo-slug=xlyk/clipse",
+        ],
+        graph=graph,
+        build_calls=[],
+        attr=graph_attr,
+        kwarg_calls=kwarg_calls,
+    )
+
+    session = kwarg_calls[-1]["session"]
+    assert isinstance(session, DaytonaSession)
+    assert session.sandbox is backend
+    profile = object()
+    kwarg_calls[-1]["agent_factory"](profile, None, session.cwd)
+    assert dac_calls == [{"sandbox": backend, "sandbox_type": "daytona"}]
 
 
 # ---------------------------------------------------------------------------

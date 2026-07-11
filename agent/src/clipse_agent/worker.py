@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from daytona import (
+    Daytona,
     DaytonaAuthenticationError,
     DaytonaAuthorizationError,
     DaytonaConnectionError,
@@ -40,12 +41,16 @@ from daytona import (
     DaytonaTimeoutError,
     DaytonaValidationError,
 )
+from langchain_daytona import DaytonaSandbox
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
 from clipse_agent.backends.contracts import BackendActionError, BackendActionRequest, BackendActionResult
-from clipse_agent.backends.daytona import DaytonaLifecycle
+from clipse_agent import dac
+from clipse_agent.backends.daytona import DaytonaLifecycle, DaytonaSession
 from clipse_agent.backends.github import safe_error
+from clipse_agent.backends.local import LocalSession
+from clipse_agent.backends.session import AgentSession
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs.coder import build_coder_graph
 from clipse_agent.graphs.reviewer import build_reviewer_graph
@@ -80,6 +85,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--docs-shell-allow-list", default="")
     parser.add_argument("--transcript", default="")
     parser.add_argument("--base-branch", default="")
+    parser.add_argument("--backend", default="local")
     parser.add_argument("--backend-provider", default="daytona")
     parser.add_argument("--backend-role", default="")
     parser.add_argument("--repo-url", default="")
@@ -296,6 +302,38 @@ def _coerce_lane(raw: str) -> Lane | None:
         return None
 
 
+def _build_session(args: argparse.Namespace) -> AgentSession:
+    """Attach this worker invocation to its local or remote runtime."""
+
+    if args.backend in {"", "local"}:
+        return LocalSession(args.workspace, args.repo_slug)
+    if args.backend != "daytona":
+        raise ValueError(f"unsupported runtime backend: {args.backend}")
+    if not args.sandbox_id:
+        raise ValueError("Daytona runtime requires --sandbox-id")
+
+    sdk_sandbox = Daytona().get(args.sandbox_id)
+    sandbox = DaytonaSandbox(sandbox=sdk_sandbox)
+    return DaytonaSession(args.workspace, args.repo_slug, sandbox, sdk_sandbox)
+
+
+def _session_agent_factory(session: AgentSession) -> Any:
+    """Bind DAC construction to the session without changing local kwargs."""
+
+    def _build(profile: Any, checkpointer: Any, cwd: str) -> Any:
+        if session.sandbox is None:
+            return dac.build_coder_agent(profile, checkpointer, cwd)
+        return dac.build_coder_agent(
+            profile,
+            checkpointer,
+            cwd,
+            sandbox=session.sandbox,
+            sandbox_type=session.sandbox_type,
+        )
+
+    return _build
+
+
 def _blocked_transient(args: argparse.Namespace, *, lane: Lane, summary: str) -> WorkerResult:
     """Build a schema-valid blocked/transient result from nothing but
     `args` and an already-valid `lane`. This must never itself raise --
@@ -369,6 +407,7 @@ async def _run_lane_graph(
         "workspace": args.workspace,
         "max_tokens": _resolve_max_tokens(args),
         "base_branch": args.base_branch,
+        "branch": args.branch,
     }
     config: dict[str, Any] = {"configurable": {"thread_id": f"{args.thread}::{lane.value}"}}
 
@@ -401,6 +440,7 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
     """
     lane = _coerce_lane(args.lane)
     if lane == Lane.coder:
+        session = _build_session(args)
         return await _run_lane_graph(
             args,
             build_coder_graph,
@@ -417,9 +457,12 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
                     shell_allow_list=_parse_shell(args.docs_shell_allow_list),
                 ),
                 "transcript": _build_transcript(args.transcript),
+                "session": session,
+                "agent_factory": _session_agent_factory(session),
             },
         )
     if lane == Lane.reviewer:
+        session = _build_session(args)
         return await _run_lane_graph(
             args,
             build_reviewer_graph,
@@ -431,6 +474,8 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
                     shell_allow_list=_parse_shell(args.shell_allow_list),
                 ),
                 "transcript": _build_transcript(args.transcript),
+                "session": session,
+                "agent_factory": _session_agent_factory(session),
             },
         )
     return _blocked_transient(

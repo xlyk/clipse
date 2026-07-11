@@ -66,13 +66,13 @@ import logging
 import os
 import subprocess
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from clipse_agent import dac
+from clipse_agent.backends.session import CommandResult
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.profiles.coder import CoderProfile, get_coder_docs_profile, get_coder_profile
 from clipse_agent.tail import parse_structured_tail
@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
     from clipse_agent.dac import DacTurnResult
+    from clipse_agent.backends.session import AgentSession
 
 # Diagnostics only (e.g. a best-effort sync_base fetch/merge failure) -- must
 # never touch stdout, which worker.py reserves for exactly one WorkerResult
@@ -106,15 +107,6 @@ class CoderGraphError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Subprocess seam (git/gh)
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CommandResult:
-    """The outcome of running one git/gh command."""
-
-    returncode: int
-    stdout: str
-    stderr: str
 
 
 # An injectable stand-in for `subprocess.run`: given an argv and a cwd, run
@@ -1080,6 +1072,7 @@ def build_coder_graph(
     turn_driver: TurnDriver = dac.drive_turn,
     run_command: CommandRunner | None = None,
     transcript: TranscriptWriter | None = None,
+    session: AgentSession | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Build and compile the Coder lane's graph.
 
@@ -1112,6 +1105,10 @@ def build_coder_graph(
     resolved_profile = profile if profile is not None else get_coder_profile()
     resolved_docs_profile = docs_profile if docs_profile is not None else get_coder_docs_profile()
     resolved_run_command = run_command if run_command is not None else _default_run_command
+    # Task 5 establishes the graph-facing session seam. Tasks 6-7 route
+    # individual graph operations through it; until then local command
+    # behavior remains unchanged.
+    _ = session
 
     graph: StateGraph[CoderState, Any, Any, Any] = StateGraph(CoderState)
     graph.add_node("load_context", load_context)
