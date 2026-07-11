@@ -80,6 +80,9 @@ func BuildPlan(spec *Spec, board []BoardIssue) *Plan {
 		}
 		p.Issues = append(p.Issues, op)
 		for _, d := range is.Deps {
+			if relationExists(existingByRef, is.Ref, d) {
+				continue
+			}
 			p.Relations = append(p.Relations, RelationOp{FromRef: is.Ref, ToRef: d})
 		}
 	}
@@ -90,4 +93,21 @@ func BuildPlan(spec *Spec, board []BoardIssue) *Plan {
 	}
 	sort.Strings(p.Orphans)
 	return p
+}
+
+// relationExists reports whether the board already records fromRef as
+// blocked-by toRef. Only meaningful when both refs already exist on the
+// board; if either is being created this run, the relation cannot pre-exist.
+func relationExists(existingByRef map[string]BoardIssue, fromRef, toRef string) bool {
+	from, okFrom := existingByRef[fromRef]
+	to, okTo := existingByRef[toRef]
+	if !okFrom || !okTo {
+		return false
+	}
+	for _, id := range from.BlockedBy {
+		if id == to.ID {
+			return true
+		}
+	}
+	return false
 }

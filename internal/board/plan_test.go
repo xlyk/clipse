@@ -43,3 +43,21 @@ func TestBuildPlanEmitsRelationsFromDeps(t *testing.T) {
 		t.Errorf("relations = %v, want [{b a}]", p.Relations)
 	}
 }
+
+func TestBuildPlanSkipsExistingRelation(t *testing.T) {
+	spec := &Spec{Team: "CLI", Issues: []Issue{
+		{Ref: "a", Title: "A", Body: "x"},
+		{Ref: "b", Title: "B", Body: "y", Deps: []string{"a"}},
+	}}
+	aSHA := ContentSHA(spec.Issues[0])
+	bSHA := ContentSHA(spec.Issues[1])
+	board := []BoardIssue{
+		{ID: "LA", Description: "x\n\n" + RenderMarker("a", aSHA)},
+		// b already blocked-by a (LA), so the relation must NOT be re-emitted.
+		{ID: "LB", Description: "y\n\n" + RenderMarker("b", bSHA), BlockedBy: []string{"LA"}},
+	}
+	p := BuildPlan(spec, board)
+	if len(p.Relations) != 0 {
+		t.Errorf("relations = %v, want none (already present)", p.Relations)
+	}
+}
