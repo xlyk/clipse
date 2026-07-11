@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/xlyk/clipse/internal/board"
+	"github.com/xlyk/clipse/internal/boardspec"
 	"github.com/xlyk/clipse/internal/linear/bootstrap"
 )
 
@@ -53,8 +53,8 @@ func newBoardApplyCmd() *cobra.Command {
 
 // loadSpecAndClient parses+validates the spec and builds a bootstrap client
 // scoped to its team.
-func loadSpecAndClient(specPath string) (*board.Spec, *bootstrap.Client, error) {
-	spec, err := board.Parse(specPath)
+func loadSpecAndClient(specPath string) (*boardspec.Spec, *bootstrap.Client, error) {
+	spec, err := boardspec.Parse(specPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -94,9 +94,9 @@ func runBoardApply(cmd *cobra.Command, specPath string) error {
 	if err != nil {
 		return fmt.Errorf("reading team issues: %w", err)
 	}
-	plan := board.BuildPlan(spec, issues)
+	plan := boardspec.BuildPlan(spec, issues)
 	fmt.Fprint(cmd.OutOrStdout(), plan.Render())
-	if err := board.Apply(ctx, client, spec, plan); err != nil {
+	if err := boardspec.Apply(ctx, client, spec, plan); err != nil {
 		return fmt.Errorf("applying plan: %w", err)
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "\napplied.")
@@ -105,6 +105,6 @@ func runBoardApply(cmd *cobra.Command, specPath string) error {
 
 // planText is the pure core of the plan command: build the plan and render
 // it. Split out so it can be unit-tested without a network call.
-func planText(spec *board.Spec, issues []board.BoardIssue) string {
-	return board.BuildPlan(spec, issues).Render()
+func planText(spec *boardspec.Spec, issues []boardspec.BoardIssue) string {
+	return boardspec.BuildPlan(spec, issues).Render()
 }

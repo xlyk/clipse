@@ -1,9 +1,9 @@
-// Package board reconciles a declarative board spec (board.yaml) onto a
+// Package boardspec reconciles a declarative board spec (board.yaml) onto a
 // Linear team. It is pure: parsing, validation, content markers, and the
 // create/update/skip plan live here with no network or LLM dependency. The
 // Linear mutations that execute a plan live in internal/linear/bootstrap,
 // walled off from the dispatcher's client.
-package board
+package boardspec
 
 import (
 	"fmt"

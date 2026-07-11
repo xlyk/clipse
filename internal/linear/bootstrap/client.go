@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xlyk/clipse/internal/board"
+	"github.com/xlyk/clipse/internal/boardspec"
 )
 
 const (
@@ -66,7 +66,7 @@ func NewClientWithBaseURL(baseURL, teamKey string) (*Client, error) {
 // TeamIssues returns every issue on the configured team as the planner needs
 // it: id, identifier, description (carrying the ref marker), and the Linear
 // ids of its blockers (inverseRelations of type "blocks").
-func (c *Client) TeamIssues(ctx context.Context) ([]board.BoardIssue, error) {
+func (c *Client) TeamIssues(ctx context.Context) ([]boardspec.BoardIssue, error) {
 	reqBody, err := marshalGraphQL(TeamIssuesQuery, map[string]any{"teamKey": c.teamKey})
 	if err != nil {
 		return nil, fmt.Errorf("team issues: %w", err)
@@ -97,9 +97,9 @@ func (c *Client) TeamIssues(ctx context.Context) ([]board.BoardIssue, error) {
 	if err := json.Unmarshal(resp, &payload); err != nil {
 		return nil, fmt.Errorf("team issues: decoding: %w", err)
 	}
-	out := make([]board.BoardIssue, 0, len(payload.Data.Issues.Nodes))
+	out := make([]boardspec.BoardIssue, 0, len(payload.Data.Issues.Nodes))
 	for _, n := range payload.Data.Issues.Nodes {
-		bi := board.BoardIssue{ID: n.ID, Identifier: n.Identifier, Description: n.Description}
+		bi := boardspec.BoardIssue{ID: n.ID, Identifier: n.Identifier, Description: n.Description}
 		for _, r := range n.InverseRelations.Nodes {
 			if r.Type == "blocks" {
 				bi.BlockedBy = append(bi.BlockedBy, r.Issue.ID)
@@ -167,7 +167,7 @@ func (c *Client) resolve(ctx context.Context) error {
 }
 
 // EnsureLabels creates any of names not already present on the team, caching
-// each new label's id. Implements board.Linear.
+// each new label's id. Implements boardspec.Linear.
 func (c *Client) EnsureLabels(ctx context.Context, names []string) error {
 	if err := c.resolve(ctx); err != nil {
 		return err
@@ -209,7 +209,7 @@ func (c *Client) EnsureLabels(ctx context.Context, names []string) error {
 
 // StartStateID returns the id of the state new issues start in: the "todo"
 // state (falling back to "backlog"), which clipse's dispatcher promotes to
-// "ready" once an issue's dependencies clear. Implements board.Linear.
+// "ready" once an issue's dependencies clear. Implements boardspec.Linear.
 func (c *Client) StartStateID(ctx context.Context) (string, error) {
 	if err := c.resolve(ctx); err != nil {
 		return "", err
@@ -245,8 +245,8 @@ func (c *Client) labelIDs(names []string) ([]string, error) {
 }
 
 // CreateIssue creates an issue and returns its Linear id. Implements
-// board.Linear.
-func (c *Client) CreateIssue(ctx context.Context, in board.CreateInput) (string, error) {
+// boardspec.Linear.
+func (c *Client) CreateIssue(ctx context.Context, in boardspec.CreateInput) (string, error) {
 	if err := c.resolve(ctx); err != nil {
 		return "", err
 	}
@@ -283,8 +283,8 @@ func (c *Client) CreateIssue(ctx context.Context, in board.CreateInput) (string,
 	return payload.Data.IssueCreate.Issue.ID, nil
 }
 
-// UpdateIssue updates an existing issue. Implements board.Linear.
-func (c *Client) UpdateIssue(ctx context.Context, id string, in board.UpdateInput) error {
+// UpdateIssue updates an existing issue. Implements boardspec.Linear.
+func (c *Client) UpdateIssue(ctx context.Context, id string, in boardspec.UpdateInput) error {
 	if err := c.resolve(ctx); err != nil {
 		return err
 	}
@@ -309,7 +309,7 @@ func (c *Client) UpdateIssue(ctx context.Context, id string, in board.UpdateInpu
 
 // AddBlockedBy records that dependentID is blocked by blockerID. The relation
 // is created on the blocker's side (issueId=blocker) as type "blocks", so the
-// dependent sees it in inverseRelations. Implements board.Linear.
+// dependent sees it in inverseRelations. Implements boardspec.Linear.
 func (c *Client) AddBlockedBy(ctx context.Context, dependentID, blockerID string) error {
 	reqBody, err := marshalGraphQL(IssueRelationCreateMutation, map[string]any{
 		"issueId":        blockerID,

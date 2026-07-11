@@ -1,4 +1,4 @@
-package board
+package boardspec
 
 import "sort"
 

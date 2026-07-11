@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xlyk/clipse/internal/board"
+	"github.com/xlyk/clipse/internal/boardspec"
 )
 
-// TestApplyLoopbackCreatesWithMarkerAndRelation drives board.Apply against a
+// TestApplyLoopbackCreatesWithMarkerAndRelation drives boardspec.Apply against a
 // bootstrap.Client pointed at an httptest server, asserting the wire calls:
 // a start-state resolve, an issueCreate whose description carries the marker,
 // and an issueRelationCreate of type "blocks".
@@ -49,12 +49,12 @@ func TestApplyLoopbackCreatesWithMarkerAndRelation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClientWithBaseURL: %v", err)
 	}
-	spec := &board.Spec{Team: "CLI", DefaultLabels: []string{"agent:coder"}, Issues: []board.Issue{
+	spec := &boardspec.Spec{Team: "CLI", DefaultLabels: []string{"agent:coder"}, Issues: []boardspec.Issue{
 		{Ref: "a", Title: "A", Body: "aa"},
 		{Ref: "b", Title: "B", Body: "bb", Deps: []string{"a"}},
 	}}
-	p := board.BuildPlan(spec, nil)
-	if err := board.Apply(context.Background(), c, spec, p); err != nil {
+	p := boardspec.BuildPlan(spec, nil)
+	if err := boardspec.Apply(context.Background(), c, spec, p); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if created != 2 {
@@ -81,4 +81,4 @@ func itoa(n int) string {
 	return string(b)
 }
 
-var _ board.Linear = (*Client)(nil)
+var _ boardspec.Linear = (*Client)(nil)
