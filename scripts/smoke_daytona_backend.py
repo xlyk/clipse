@@ -9,7 +9,7 @@ import os
 import secrets
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import quote
@@ -51,24 +51,31 @@ _REMOTE_TOOL_NAMES = frozenset(
 )
 
 
+def _string_field_rows(raw: str, field: str, operation: str) -> list[str]:
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        raise SmokeError(f"{operation} returned invalid JSON") from None
+    if not isinstance(rows, list) or any(
+        not isinstance(row, Mapping)
+        or not isinstance(row.get(field), str)
+        or not row[field].strip()
+        for row in rows
+    ):
+        raise SmokeError(f"{operation} returned an invalid response shape")
+    return sorted(row[field] for row in rows)
+
+
 def _open_pr_urls(run: Callable[[list[str]], str], slug: str, branch: str) -> list[str]:
     raw = run(
         ["gh", "pr", "list", "--repo", slug, "--state", "open", "--head", branch, "--json", "url"]
     )
-    try:
-        rows = json.loads(raw)
-        return sorted(row["url"] for row in rows if isinstance(row, dict) and isinstance(row.get("url"), str))
-    except (json.JSONDecodeError, TypeError):
-        raise SmokeError("GitHub PR cleanup query returned invalid JSON") from None
+    return _string_field_rows(raw, "url", "GitHub PR cleanup query")
 
 
 def _branch_refs(run: Callable[[list[str]], str], slug: str, branch: str) -> list[str]:
     endpoint = f"repos/{slug}/git/matching-refs/heads/{quote(branch, safe='/')}"
-    try:
-        rows = json.loads(run(["gh", "api", endpoint]))
-        return sorted(row["ref"] for row in rows if isinstance(row, dict) and isinstance(row.get("ref"), str))
-    except (json.JSONDecodeError, TypeError):
-        raise SmokeError("GitHub branch cleanup query returned invalid JSON") from None
+    return _string_field_rows(run(["gh", "api", endpoint]), "ref", "GitHub branch cleanup query")
 
 
 def cleanup_github(

@@ -74,6 +74,46 @@ def test_cleanup_github_recovers_lost_create_close_push_and_delete_responses() -
     assert len(delete_calls) == 1
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        "not-a-list",
+        [1],
+        [{}],
+        [{"url": ""}],
+        [{"url": "   "}],
+        [{"url": 42}],
+        [{"url": "https://github.com/xlyk/clipse/pull/123"}, {}],
+    ],
+)
+def test_open_pr_urls_rejects_wrong_or_malformed_response_shape(payload: object) -> None:
+    smoke = _smoke_module()
+
+    with pytest.raises(smoke.SmokeError):
+        smoke._open_pr_urls(lambda _argv: json.dumps(payload), "xlyk/clipse", "smoke/daytona-1")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        "not-a-list",
+        [1],
+        [{}],
+        [{"ref": ""}],
+        [{"ref": "   "}],
+        [{"ref": 42}],
+        [{"ref": "refs/heads/smoke/daytona-1"}, {}],
+    ],
+)
+def test_branch_refs_rejects_wrong_or_malformed_response_shape(payload: object) -> None:
+    smoke = _smoke_module()
+
+    with pytest.raises(smoke.SmokeError):
+        smoke._branch_refs(lambda _argv: json.dumps(payload), "xlyk/clipse", "smoke/daytona-1")
+
+
 def test_cleanup_sandboxes_rediscovers_lost_create_and_retries_lost_delete_response() -> None:
     smoke = _smoke_module()
     workspace = BackendWorkspace(
@@ -164,7 +204,6 @@ def test_reviewer_proof_rejects_host_diff_only_or_invalid_verdict(
     tools: tuple[str, ...],
 ) -> None:
     smoke = _smoke_module()
-
 
     with pytest.raises(smoke.SmokeError):
         smoke.validate_reviewer_evidence(smoke.AgentTurnEvidence(text, tools))
