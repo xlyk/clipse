@@ -28,6 +28,7 @@ import os
 import sys
 import traceback
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 from daytona import (
@@ -47,7 +48,11 @@ from pydantic import ValidationError
 
 from clipse_agent.backends.contracts import BackendActionError, BackendActionRequest, BackendActionResult
 from clipse_agent import dac
-from clipse_agent.backends.daytona import DaytonaLifecycle, DaytonaSession
+from clipse_agent.backends.daytona import (
+    DaytonaLifecycle,
+    DaytonaSession,
+    RepositoryScopedDaytonaSandbox,
+)
 from clipse_agent.backends.github import safe_error
 from clipse_agent.backends.local import LocalSession
 from clipse_agent.backends.session import AgentSession
@@ -302,7 +307,12 @@ def _coerce_lane(raw: str) -> Lane | None:
         return None
 
 
-def _build_session(args: argparse.Namespace) -> AgentSession:
+@dataclass(frozen=True)
+class _SessionAttachFailure:
+    summary: str = "clipse-worker: Daytona sandbox attachment failed"
+
+
+def _build_session(args: argparse.Namespace) -> AgentSession | _SessionAttachFailure:
     """Attach this worker invocation to its local or remote runtime."""
 
     if args.backend in {"", "local"}:
@@ -312,8 +322,12 @@ def _build_session(args: argparse.Namespace) -> AgentSession:
     if not args.sandbox_id:
         raise ValueError("Daytona runtime requires --sandbox-id")
 
-    sdk_sandbox = Daytona().get(args.sandbox_id)
-    sandbox = DaytonaSandbox(sandbox=sdk_sandbox)
+    try:
+        sdk_sandbox = Daytona().get(args.sandbox_id)
+        daytona_backend = DaytonaSandbox(sandbox=sdk_sandbox)
+        sandbox = RepositoryScopedDaytonaSandbox(daytona_backend, args.workspace)
+    except Exception:  # noqa: BLE001 - discard provider bodies and exception causes at the attach boundary
+        return _SessionAttachFailure()
     return DaytonaSession(args.workspace, args.repo_slug, sandbox, sdk_sandbox)
 
 
@@ -323,6 +337,14 @@ def _session_agent_factory(session: AgentSession) -> Any:
     def _build(profile: Any, checkpointer: Any, cwd: str) -> Any:
         if session.sandbox is None:
             return dac.build_coder_agent(profile, checkpointer, cwd)
+        profile = replace(
+            profile,
+            system_prompt=(
+                f"{profile.system_prompt}\n\n"
+                f"The absolute repository root in this Daytona sandbox is {session.cwd}. "
+                "Treat that path as the workspace root for every repository operation."
+            ),
+        )
         return dac.build_coder_agent(
             profile,
             checkpointer,
@@ -441,6 +463,8 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
     lane = _coerce_lane(args.lane)
     if lane == Lane.coder:
         session = _build_session(args)
+        if isinstance(session, _SessionAttachFailure):
+            return _blocked_transient(args, lane=Lane.coder, summary=session.summary)
         return await _run_lane_graph(
             args,
             build_coder_graph,
@@ -463,6 +487,8 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
         )
     if lane == Lane.reviewer:
         session = _build_session(args)
+        if isinstance(session, _SessionAttachFailure):
+            return _blocked_transient(args, lane=Lane.reviewer, summary=session.summary)
         return await _run_lane_graph(
             args,
             build_reviewer_graph,

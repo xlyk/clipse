@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 from daytona import DaytonaNotFoundError
+from deepagents.backends.protocol import ExecuteResponse
 
 from clipse_agent.backends.contracts import BackendActionRequest, BackendWorkspace
 from clipse_agent.backends.daytona import (
@@ -16,6 +18,7 @@ from clipse_agent.backends.daytona import (
     BackendActionError,
     DaytonaLifecycle,
     DaytonaSession,
+    RepositoryScopedDaytonaSandbox,
     labels_for,
     owner_key,
 )
@@ -464,7 +467,7 @@ class _FakeExecuteResponse:
 class _FakeDaytonaBackend:
     calls: list[str] = field(default_factory=list)
 
-    def execute(self, command: str) -> _FakeExecuteResponse:
+    def execute(self, command: str, *, timeout: int | None = None) -> _FakeExecuteResponse:
         self.calls.append(command)
         return _FakeExecuteResponse(output="remote output", exit_code=0)
 
@@ -509,6 +512,28 @@ def test_daytona_session_run_executes_through_daytona_backend() -> None:
     assert session.provider == "daytona"
     assert session.sandbox is backend
     assert session.sandbox_type == "daytona"
+
+
+def test_daytona_session_run_sanitizes_backend_exceptions() -> None:
+    canary = "provider-body-ghp_attach_canary"
+
+    class RaisingBackend:
+        def execute(self, _command: str) -> _FakeExecuteResponse:
+            raise RuntimeError(canary)
+
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        RaisingBackend(),
+        _FakeSessionSandbox(),
+        token_reader=lambda: "unused",
+        host_runner=lambda _argv: "unused",
+    )
+
+    result = session.run(["pwd"])
+
+    assert result == CommandResult(1, stderr="Daytona command failed")
+    assert canary not in repr(result)
 
 
 def test_daytona_session_git_credentials_are_read_just_in_time() -> None:
@@ -597,3 +622,189 @@ def test_daytona_session_commit_uses_sdk_git_and_github_stays_on_host() -> None:
             "xlyk/clipse",
         ]
     ]
+
+
+class _RecordingBackend:
+    """Pinned SandboxBackendProtocol surface used to verify full delegation."""
+
+    id = "sandbox-1"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    def _record(self, *call: Any) -> tuple[Any, ...]:
+        self.calls.append(call)
+        return call
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        self.calls.append(("execute", command, timeout))
+        output = REMOTE_REPO_ABS if command.endswith("pwd") else f"git-dir:{REMOTE_REPO_ABS}/.git"
+        return ExecuteResponse(output=output, exit_code=0, truncated=False)
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        self.calls.append(("aexecute", command, timeout))
+        return ExecuteResponse(output=REMOTE_REPO_ABS, exit_code=0, truncated=False)
+
+    def ls(self, path: str) -> tuple[Any, ...]:
+        return self._record("ls", path)
+
+    async def als(self, path: str) -> tuple[Any, ...]:
+        return self._record("als", path)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> tuple[Any, ...]:
+        return self._record("read", file_path, offset, limit)
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> tuple[Any, ...]:
+        return self._record("aread", file_path, offset, limit)
+
+    def grep(self, pattern: str, path: str | None = None, glob: str | None = None) -> tuple[Any, ...]:
+        return self._record("grep", pattern, path, glob)
+
+    async def agrep(
+        self, pattern: str, path: str | None = None, glob: str | None = None
+    ) -> tuple[Any, ...]:
+        return self._record("agrep", pattern, path, glob)
+
+    def glob(self, pattern: str, path: str | None = None) -> tuple[Any, ...]:
+        return self._record("glob", pattern, path)
+
+    async def aglob(self, pattern: str, path: str | None = None) -> tuple[Any, ...]:
+        return self._record("aglob", pattern, path)
+
+    def write(self, file_path: str, content: str) -> tuple[Any, ...]:
+        return self._record("write", file_path, content)
+
+    async def awrite(self, file_path: str, content: str) -> tuple[Any, ...]:
+        return self._record("awrite", file_path, content)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> tuple[Any, ...]:
+        return self._record("edit", file_path, old_string, new_string, replace_all)
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> tuple[Any, ...]:
+        return self._record("aedit", file_path, old_string, new_string, replace_all)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> tuple[Any, ...]:
+        return self._record("upload_files", files)
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> tuple[Any, ...]:
+        return self._record("aupload_files", files)
+
+    def download_files(self, paths: list[str]) -> tuple[Any, ...]:
+        return self._record("download_files", paths)
+
+    async def adownload_files(self, paths: list[str]) -> tuple[Any, ...]:
+        return self._record("adownload_files", paths)
+
+
+def test_repository_scoped_backend_starts_shell_in_remote_repo() -> None:
+    raw = _RecordingBackend()
+    scoped = RepositoryScopedDaytonaSandbox(raw, REMOTE_REPO_ABS)
+
+    pwd = scoped.execute("pwd")
+    git = scoped.execute("git rev-parse --git-dir", timeout=30)
+
+    assert pwd.output == REMOTE_REPO_ABS
+    assert git.output == f"git-dir:{REMOTE_REPO_ABS}/.git"
+    assert raw.calls == [
+        ("execute", f"cd {shlex.quote(REMOTE_REPO_ABS)} && pwd", None),
+        (
+            "execute",
+            f"cd {shlex.quote(REMOTE_REPO_ABS)} && git rev-parse --git-dir",
+            30,
+        ),
+    ]
+
+
+def test_repository_scoped_backend_resolves_all_sync_file_methods() -> None:
+    raw = _RecordingBackend()
+    scoped = RepositoryScopedDaytonaSandbox(raw, REMOTE_REPO_ABS)
+
+    assert scoped.ls("src") == ("ls", f"{REMOTE_REPO_ABS}/src")
+    assert scoped.read("README.md", 2, 10) == ("read", f"{REMOTE_REPO_ABS}/README.md", 2, 10)
+    assert scoped.grep("needle") == ("grep", "needle", REMOTE_REPO_ABS, None)
+    assert scoped.glob("**/*.py") == ("glob", "**/*.py", REMOTE_REPO_ABS)
+    assert scoped.write("notes/out.txt", "body") == (
+        "write",
+        f"{REMOTE_REPO_ABS}/notes/out.txt",
+        "body",
+    )
+    assert scoped.edit("README.md", "old", "new", True) == (
+        "edit",
+        f"{REMOTE_REPO_ABS}/README.md",
+        "old",
+        "new",
+        True,
+    )
+    assert scoped.upload_files([("new.bin", b"x"), ("/tmp/absolute.bin", b"y")]) == (
+        "upload_files",
+        [(f"{REMOTE_REPO_ABS}/new.bin", b"x"), ("/tmp/absolute.bin", b"y")],
+    )
+    assert scoped.download_files(["README.md", "/tmp/absolute.bin"]) == (
+        "download_files",
+        [f"{REMOTE_REPO_ABS}/README.md", "/tmp/absolute.bin"],
+    )
+    assert scoped.read("/tmp/absolute.txt") == ("read", "/tmp/absolute.txt", 0, 2000)
+
+
+async def _exercise_async_backend(scoped: RepositoryScopedDaytonaSandbox) -> None:
+    command = f"cd {shlex.quote(REMOTE_REPO_ABS)} && pwd"
+    assert (await scoped.aexecute("pwd", timeout=5)).output == REMOTE_REPO_ABS
+    assert await scoped.als("src") == ("als", f"{REMOTE_REPO_ABS}/src")
+    assert await scoped.aread("README.md", 1, 4) == (
+        "aread",
+        f"{REMOTE_REPO_ABS}/README.md",
+        1,
+        4,
+    )
+    assert await scoped.agrep("needle", "src", "*.py") == (
+        "agrep",
+        "needle",
+        f"{REMOTE_REPO_ABS}/src",
+        "*.py",
+    )
+    assert await scoped.aglob("*.md") == ("aglob", "*.md", REMOTE_REPO_ABS)
+    assert await scoped.awrite("notes/out.txt", "body") == (
+        "awrite",
+        f"{REMOTE_REPO_ABS}/notes/out.txt",
+        "body",
+    )
+    assert await scoped.aedit("README.md", "old", "new") == (
+        "aedit",
+        f"{REMOTE_REPO_ABS}/README.md",
+        "old",
+        "new",
+        False,
+    )
+    assert await scoped.aupload_files([("new.bin", b"x")]) == (
+        "aupload_files",
+        [(f"{REMOTE_REPO_ABS}/new.bin", b"x")],
+    )
+    assert await scoped.adownload_files(["README.md"]) == (
+        "adownload_files",
+        [f"{REMOTE_REPO_ABS}/README.md"],
+    )
+    assert scoped.backend.calls[0] == ("aexecute", command, 5)
+
+
+def test_repository_scoped_backend_resolves_all_async_methods() -> None:
+    scoped = RepositoryScopedDaytonaSandbox(_RecordingBackend(), REMOTE_REPO_ABS)
+    asyncio.run(_exercise_async_backend(scoped))
+
+
+def test_repository_scoped_backend_rejects_relative_escape() -> None:
+    scoped = RepositoryScopedDaytonaSandbox(_RecordingBackend(), REMOTE_REPO_ABS)
+
+    with pytest.raises(ValueError, match="escapes repository root"):
+        scoped.read("../outside.txt")

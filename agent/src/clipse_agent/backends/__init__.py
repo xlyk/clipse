@@ -7,7 +7,7 @@ from clipse_agent.backends.contracts import (
     BackendWorkspace,
 )
 from clipse_agent.backends.daytona import DaytonaLifecycle
-from clipse_agent.backends.daytona import DaytonaSession
+from clipse_agent.backends.daytona import DaytonaSession, RepositoryScopedDaytonaSandbox
 from clipse_agent.backends.local import LocalSession
 from clipse_agent.backends.session import AgentSession, CommandResult
 
@@ -18,6 +18,7 @@ __all__ = [
     "BackendWorkspace",
     "DaytonaLifecycle",
     "DaytonaSession",
+    "RepositoryScopedDaytonaSandbox",
     "LocalSession",
     "AgentSession",
     "CommandResult",

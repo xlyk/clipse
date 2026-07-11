@@ -35,7 +35,11 @@ from clipse_agent.backends.contracts import (
     BackendActionResult,
     BackendWorkspace,
 )
-from clipse_agent.backends.daytona import DaytonaSession
+from clipse_agent.backends.daytona import (
+    REMOTE_REPO_ABS,
+    DaytonaSession,
+    RepositoryScopedDaytonaSandbox,
+)
 from clipse_agent.backends.local import LocalSession
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.transcript import TranscriptWriter
@@ -334,11 +338,11 @@ def test_dispatch_builds_daytona_session_for_each_graph(
     client = SimpleNamespace(get=lambda sandbox_id: raw_sandbox)
     monkeypatch.setattr(worker, "Daytona", lambda: client)
     monkeypatch.setattr(worker, "DaytonaSandbox", lambda *, sandbox: backend)
-    dac_calls: list[dict[str, Any]] = []
+    dac_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     monkeypatch.setattr(
         worker.dac,
         "build_coder_agent",
-        lambda *args, **kwargs: dac_calls.append(kwargs) or (object(), object()),
+        lambda *args, **kwargs: dac_calls.append((args, kwargs)) or (object(), object()),
     )
     lane_value = Lane(lane)
     canned = _canned_result(
@@ -366,10 +370,59 @@ def test_dispatch_builds_daytona_session_for_each_graph(
 
     session = kwarg_calls[-1]["session"]
     assert isinstance(session, DaytonaSession)
-    assert session.sandbox is backend
-    profile = object()
+    assert isinstance(session.sandbox, RepositoryScopedDaytonaSandbox)
+    assert session.sandbox.backend is backend
+    profile = worker.get_coder_profile() if lane_value == Lane.coder else worker.get_reviewer_profile()
     kwarg_calls[-1]["agent_factory"](profile, None, session.cwd)
-    assert dac_calls == [{"sandbox": backend, "sandbox_type": "daytona"}]
+    built_profile = dac_calls[0][0][0]
+    assert REMOTE_REPO_ABS in built_profile.system_prompt
+    assert "repository root" in built_profile.system_prompt.lower()
+    assert dac_calls[0][1] == {"sandbox": session.sandbox, "sandbox_type": "daytona"}
+
+
+@pytest.mark.parametrize("failure_at", ["get", "attach"])
+def test_daytona_session_attach_failure_is_sanitized_transient(
+    monkeypatch, capsys, failure_at: str
+) -> None:
+    canary = "provider-body-ghp_attach_canary"
+    raw_sandbox = SimpleNamespace(git=SimpleNamespace())
+
+    def get(_sandbox_id: str) -> object:
+        if failure_at == "get":
+            raise RuntimeError(canary)
+        return raw_sandbox
+
+    def attach(*, sandbox: object) -> object:
+        assert sandbox is raw_sandbox
+        if failure_at == "attach":
+            raise RuntimeError(canary)
+        return object()
+
+    monkeypatch.setattr(worker, "Daytona", lambda: SimpleNamespace(get=get))
+    monkeypatch.setattr(worker, "DaytonaSandbox", attach)
+
+    exit_code = worker.main(
+        [
+            "--issue=SPAC-1",
+            "--lane=coder",
+            "--run=run-1",
+            "--thread=thread-1",
+            f"--workspace={REMOTE_REPO_ABS}",
+            "--backend=daytona",
+            "--sandbox-id=sandbox-1",
+            "--repo-slug=xlyk/clipse",
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert canary not in captured.out
+    result = WorkerResult.model_validate_json(captured.out)
+    assert result.outcome == Outcome.blocked
+    assert result.block_kind == BlockKind.transient
+    assert result.summary == "clipse-worker: Daytona sandbox attachment failed"
+    assert canary not in result.model_dump_json()
 
 
 # ---------------------------------------------------------------------------

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import posixpath
 import shlex
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from daytona import (
     CreateSandboxFromSnapshotParams,
@@ -15,6 +16,18 @@ from daytona import (
     DaytonaNotFoundError,
     DaytonaValidationError,
     ListSandboxesQuery,
+)
+from deepagents.backends.protocol import (
+    EditResult,
+    ExecuteResponse,
+    FileDownloadResponse,
+    FileUploadResponse,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    SandboxBackendProtocol,
+    WriteResult,
 )
 
 from clipse_agent.backends.contracts import (
@@ -60,6 +73,204 @@ TokenReader = Callable[[], str]
 _GIT_USERNAME = "x-access-token"
 GIT_AUTHOR_NAME = "clipse"
 GIT_AUTHOR_EMAIL = "clipse@users.noreply.github.com"
+_BACKEND_FAILURE = "Daytona backend operation failed"
+_T = TypeVar("_T")
+
+
+class RepositoryScopedDaytonaSandbox(SandboxBackendProtocol):
+    """Scope Daytona shell and file operations to one absolute repository.
+
+    DAC's backend protocol accepts relative paths even though Daytona's native
+    file transfer methods require absolute paths. This adapter owns that
+    translation consistently across the complete pinned sync/async protocol.
+    Absolute paths are preserved for deliberate sandbox-global access.
+    """
+
+    def __init__(self, backend: SandboxBackendProtocol, cwd: str) -> None:
+        normalized = posixpath.normpath(cwd)
+        if not posixpath.isabs(normalized):
+            raise ValueError("repository root must be absolute")
+        self.backend = backend
+        self.cwd = normalized
+
+    @property
+    def id(self) -> str:
+        return self.backend.id
+
+    def _path(self, path: str) -> str:
+        if posixpath.isabs(path):
+            return path
+        resolved = posixpath.normpath(posixpath.join(self.cwd, path))
+        if posixpath.commonpath((self.cwd, resolved)) != self.cwd:
+            raise ValueError("relative path escapes repository root")
+        return resolved
+
+    def _safe(self, operation: Callable[[], _T], fallback: Callable[[], _T]) -> _T:
+        try:
+            return operation()
+        except Exception:  # noqa: BLE001 - provider exceptions may contain response bodies or credentials
+            return fallback()
+
+    async def _safe_async(
+        self,
+        operation: Callable[[], Awaitable[_T]],
+        fallback: Callable[[], _T],
+    ) -> _T:
+        try:
+            return await operation()
+        except Exception:  # noqa: BLE001 - provider exceptions may contain response bodies or credentials
+            return fallback()
+
+    def _command(self, command: str) -> str:
+        return f"cd {shlex.quote(self.cwd)} && {command}"
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        scoped = self._command(command)
+        return self._safe(
+            lambda: self.backend.execute(scoped, timeout=timeout),
+            lambda: ExecuteResponse(output=_BACKEND_FAILURE, exit_code=1),
+        )
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        scoped = self._command(command)
+        return await self._safe_async(
+            lambda: self.backend.aexecute(scoped, timeout=timeout),
+            lambda: ExecuteResponse(output=_BACKEND_FAILURE, exit_code=1),
+        )
+
+    def ls(self, path: str) -> LsResult:
+        resolved = self._path(path)
+        return self._safe(
+            lambda: self.backend.ls(resolved),
+            lambda: LsResult(error=_BACKEND_FAILURE),
+        )
+
+    async def als(self, path: str) -> LsResult:
+        resolved = self._path(path)
+        return await self._safe_async(
+            lambda: self.backend.als(resolved),
+            lambda: LsResult(error=_BACKEND_FAILURE),
+        )
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        resolved = self._path(file_path)
+        return self._safe(
+            lambda: self.backend.read(resolved, offset, limit),
+            lambda: ReadResult(error=_BACKEND_FAILURE),
+        )
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        resolved = self._path(file_path)
+        return await self._safe_async(
+            lambda: self.backend.aread(resolved, offset, limit),
+            lambda: ReadResult(error=_BACKEND_FAILURE),
+        )
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        resolved = self.cwd if path is None else self._path(path)
+        return self._safe(
+            lambda: self.backend.grep(pattern, resolved, glob),
+            lambda: GrepResult(error=_BACKEND_FAILURE),
+        )
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        resolved = self.cwd if path is None else self._path(path)
+        return await self._safe_async(
+            lambda: self.backend.agrep(pattern, resolved, glob),
+            lambda: GrepResult(error=_BACKEND_FAILURE),
+        )
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        resolved = self.cwd if path is None else self._path(path)
+        return self._safe(
+            lambda: self.backend.glob(pattern, resolved),
+            lambda: GlobResult(error=_BACKEND_FAILURE),
+        )
+
+    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
+        resolved = self.cwd if path is None else self._path(path)
+        return await self._safe_async(
+            lambda: self.backend.aglob(pattern, resolved),
+            lambda: GlobResult(error=_BACKEND_FAILURE),
+        )
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        resolved = self._path(file_path)
+        return self._safe(
+            lambda: self.backend.write(resolved, content),
+            lambda: WriteResult(error=_BACKEND_FAILURE),
+        )
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        resolved = self._path(file_path)
+        return await self._safe_async(
+            lambda: self.backend.awrite(resolved, content),
+            lambda: WriteResult(error=_BACKEND_FAILURE),
+        )
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        resolved = self._path(file_path)
+        return self._safe(
+            lambda: self.backend.edit(resolved, old_string, new_string, replace_all),
+            lambda: EditResult(error=_BACKEND_FAILURE),
+        )
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        resolved = self._path(file_path)
+        return await self._safe_async(
+            lambda: self.backend.aedit(resolved, old_string, new_string, replace_all),
+            lambda: EditResult(error=_BACKEND_FAILURE),
+        )
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        resolved = [(self._path(path), content) for path, content in files]
+        return self._safe(
+            lambda: self.backend.upload_files(resolved),
+            lambda: [FileUploadResponse(path=path, error=_BACKEND_FAILURE) for path, _ in resolved],
+        )
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        resolved = [(self._path(path), content) for path, content in files]
+        return await self._safe_async(
+            lambda: self.backend.aupload_files(resolved),
+            lambda: [FileUploadResponse(path=path, error=_BACKEND_FAILURE) for path, _ in resolved],
+        )
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        resolved = [self._path(path) for path in paths]
+        return self._safe(
+            lambda: self.backend.download_files(resolved),
+            lambda: [FileDownloadResponse(path=path, error=_BACKEND_FAILURE) for path in resolved],
+        )
+
+    async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        resolved = [self._path(path) for path in paths]
+        return await self._safe_async(
+            lambda: self.backend.adownload_files(resolved),
+            lambda: [FileDownloadResponse(path=path, error=_BACKEND_FAILURE) for path in resolved],
+        )
 
 
 @dataclass(frozen=True)
@@ -82,7 +293,10 @@ class DaytonaSession:
     sandbox_type: str = field(default="daytona", init=False)
 
     def run(self, argv: Sequence[str]) -> CommandResult:
-        response = self.sandbox.execute(shlex.join(argv))
+        try:
+            response = self.sandbox.execute(shlex.join(argv))
+        except Exception:  # noqa: BLE001 - provider exceptions may contain response bodies or credentials
+            return CommandResult(1, stderr="Daytona command failed")
         returncode = response.exit_code if response.exit_code is not None else 1
         return CommandResult(returncode=returncode, stdout=response.output)
 
@@ -398,6 +612,7 @@ __all__ = [
     "BackendActionError",
     "DaytonaLifecycle",
     "DaytonaSession",
+    "RepositoryScopedDaytonaSandbox",
     "labels_for",
     "owner_key",
     "repo_label",
