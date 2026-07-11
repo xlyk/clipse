@@ -141,6 +141,7 @@ type AgentWorkspace struct {
 type IssueSnapshot struct {
 	Issue
 	LatestRun *Run
+	Workspace *AgentWorkspace
 
 	// Runs is every run for this issue in chronological order (oldest first:
 	// coder, then reviewer, then git_operator as the card

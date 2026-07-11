@@ -7,7 +7,7 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
 ## Status
 
 - **Phase 0 (scaffold + contract) and Phase 1 (zero-LLM Go kernel) are complete** — built test-first against a fake worker (`testworker`) and a mocked Linear, `go test -race ./...` clean.
-- **Phase 2 (real DAC coder worker) and Phase 3 (reviewer / git-operator lanes, auto-merge; documentation folded into the coder graph) are complete**: the coder and reviewer lanes run real DAC turns, `internal/gitops` owns the CI-and-branch-protection merge gate, per-lane models and the `shell_allow_list` policy are configurable, and the live eval suite (`make eval`) exercises both lanes end to end against the real model + `gh`. Still pending for any lane configured on the `openai_codex` model provider: a one-time interactive ChatGPT sign-in on the dispatcher host, run as the same OS user the dispatcher runs as (`uv --project agent run dcode` → `/auth` → `openai_codex`; token lands at `~/.deepagents/.state/chatgpt-auth.json`, reachable because `HOME` is already in the env allow-list; auto-refreshes after).
+- **Phase 2 (real DAC coder worker) and Phase 3 (reviewer / git-operator lanes, auto-merge; documentation folded into the coder graph) are complete**: the coder and reviewer lanes run real DAC turns, `internal/gitops` owns the CI-and-branch-protection merge gate, per-lane models and the `shell_allow_list` policy are configurable, and the live eval suite (`make eval`) exercises both lanes end to end against the real model + `gh`. The recommended Daytona backend runs DAC filesystem/shell tools in remote sandboxes; local worktrees remain the compatibility default when `agent_backend` is absent. Still pending for any lane configured on the `openai_codex` model provider: a one-time interactive ChatGPT sign-in on the dispatcher host, run as the same OS user the dispatcher runs as (`uv --project agent run dcode` → `/auth` → `openai_codex`; token lands at `~/.deepagents/.state/chatgpt-auth.json`; auto-refreshes after).
 
 ## Build, test, run
 
@@ -26,6 +26,7 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
   that suite when bumping the DAC pin). Model override:
   `CLIPSE_EVAL_MODEL=openai_codex:gpt-5-codex make eval`. See
   `agent/evals/README.md`.
+- `make smoke-daytona-backend` — opt-in production-path Daytona smoke; opens a draft PR, runs coder/reviewer DAC turns, never merges, and cleans all live resources.
 
 Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard). Kernel tests need **no** network or LLM.
 
@@ -51,6 +52,7 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 
 - `LINEAR_API_KEY` is kernel-only; `internal/config` rejects it in `env_allowlist`.
 - Workers may inherit only allow-listed env such as `ANTHROPIC_API_KEY`, `GH_TOKEN`/`GITHUB_TOKEN`, `HOME`, and `PATH`.
+- Daytona controller actions may inherit `DAYTONA_API_KEY`; local workers never do. Host `gh` credentials pass only as Daytona SDK Git method arguments, never through sandbox env, Git config, prompts, transcripts, results, or argv.
 - `openai_codex:*` stores OAuth under inherited `HOME`; treat `chatgpt-auth.json` as an account credential.
 - Default `shell_allow_list: all` means unrestricted shell. Narrow it for lower-trust issues.
 <!-- managed:readme-agents-doc:section=SECURITY:END -->
@@ -73,6 +75,8 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 - **Docs are inside the coder graph** — there is no `documentation` column, `scribe` lane, or `-docs` worktree.
 - **`max_tokens_per_run` is per DAC round** — it is a context guard after auto-compaction, not a cumulative spend cap.
 - **Codex auth is user-sensitive** — `/auth` must run as the dispatcher OS user so worker `HOME` finds the token.
+- **Daytona never falls back to local** — lifecycle/preflight failures use the normal typed block/retry path. Do not add an automatic host-worktree fallback.
+- **Workspace cleanup is durable** — terminal coder workspaces and every reviewer workspace are queued in SQLite; the dispatcher retries cleanup and reconciles provider inventory on startup.
 <!-- managed:readme-agents-doc:section=GOTCHAS:END -->
 
 ## Layout
@@ -84,10 +88,12 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 - `internal/store` — SQLite kernel (issues / runs / events / linear_writes), CAS claim, outbox.
 - `internal/board` — pure state machine (`Next`, `Promote`).
 - `internal/spawn` — `Spawner` + local impl, `testworker` process control, git worktree lifecycle, orphan reaping.
+- `internal/backend` — provider-neutral lifecycle manager and command-backed Daytona protocol.
 - `internal/linear` — GraphQL `Client`, normalize, in-memory mock, writes.
 - `internal/contract` — **generated** Go types (do not edit).
 - `schema/` — `worker-result.schema.json` + `board.schema.json`, the shared source of truth.
 - `agent/` — uv Python project; `clipse-worker` entrypoint; `contract.py` is **generated**.
+- `agent/src/clipse_agent/backends/` — local/Daytona sessions, lifecycle contracts, and trusted host GitHub helpers.
 - `testworker/` — Go fake worker emitting canned schema-valid JSON (kernel regression harness; stays in the tree permanently).
 - `configs/clipse.example.yaml` — config shape.
 

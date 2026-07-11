@@ -104,12 +104,14 @@ func RenderStatus(w io.Writer, snap store.Snapshot) error {
 		return fmt.Errorf("writing section separator: %w", err)
 	}
 
-	if _, err := fmt.Fprintln(tw, "IDENTIFIER\tLANE\tSTATUS\tLATEST RUN\tMIRROR"); err != nil {
+	if _, err := fmt.Fprintln(tw, "IDENTIFIER\tLANE\tSTATUS\tLATEST RUN\tMIRROR\tBACKEND\tROLE\tSTATE\tSANDBOX"); err != nil {
 		return fmt.Errorf("writing issue header: %w", err)
 	}
 	for _, issue := range sortedIssues(snap.Issues) {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+		provider, role, state, sandbox := workspaceCells(issue.Workspace)
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			issue.Identifier, issue.LaneLabel, issue.BoardStatus, latestRunCell(issue.LatestRun), mirrorCell(issue.Unmirrored),
+			provider, role, state, sandbox,
 		); err != nil {
 			return fmt.Errorf("writing issue row for %s: %w", issue.Identifier, err)
 		}
@@ -119,6 +121,19 @@ func RenderStatus(w io.Writer, snap store.Snapshot) error {
 		return fmt.Errorf("flushing status table: %w", err)
 	}
 	return nil
+}
+
+func workspaceCells(workspace *store.AgentWorkspace) (provider, role, state, sandbox string) {
+	if workspace == nil {
+		return "-", "-", "-", "-"
+	}
+	sandbox = workspace.ExternalID
+	if sandbox == "" {
+		sandbox = "-"
+	} else if len(sandbox) > 8 {
+		sandbox = sandbox[:8]
+	}
+	return workspace.Provider, workspace.Role, string(workspace.State), sandbox
 }
 
 // latestRunCell renders a IssueSnapshot.LatestRun as a single table cell:

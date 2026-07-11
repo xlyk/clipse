@@ -62,6 +62,49 @@ func TestReadSnapshot_CumulativeTokensAcrossRuns(t *testing.T) {
 	}
 }
 
+func TestReadSnapshot_CurrentWorkspacePrefersCoderThenActiveReviewer(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	for _, issue := range []store.Issue{
+		{ID: "issue-coder", Identifier: "CLP-1", BoardStatus: "running"},
+		{ID: "issue-reviewer", Identifier: "CLP-2", BoardStatus: "review"},
+		{ID: "issue-none", Identifier: "CLP-3", BoardStatus: "ready"},
+	} {
+		if err := s.UpsertIssue(ctx, issue); err != nil {
+			t.Fatalf("UpsertIssue %s: %v", issue.ID, err)
+		}
+	}
+
+	for _, workspace := range []store.AgentWorkspace{
+		{OwnerKey: "reviewer-coder-issue", IssueID: "issue-coder", RunID: "run-1", Provider: "daytona", Role: "reviewer", ExternalID: "sb-reviewer", WorkspacePath: "/remote/reviewer", State: store.WorkspaceActive, LastAction: "ensure", CreatedAt: 20, UpdatedAt: 20},
+		{OwnerKey: "coder-issue", IssueID: "issue-coder", Provider: "daytona", Role: "coder", ExternalID: "sb-coder", WorkspacePath: "/remote/coder", State: store.WorkspaceStopped, LastAction: "stop", CreatedAt: 10, UpdatedAt: 30},
+		{OwnerKey: "reviewer-deleted", IssueID: "issue-reviewer", RunID: "run-old", Provider: "daytona", Role: "reviewer", ExternalID: "sb-deleted", WorkspacePath: "/remote/old", State: store.WorkspaceDeleted, LastAction: "delete", CreatedAt: 10, UpdatedAt: 10},
+		{OwnerKey: "reviewer-active", IssueID: "issue-reviewer", RunID: "run-new", Provider: "daytona", Role: "reviewer", ExternalID: "sb-active", WorkspacePath: "/remote/new", State: store.WorkspaceActive, LastAction: "ensure", CreatedAt: 30, UpdatedAt: 30},
+	} {
+		if err := s.UpsertAgentWorkspace(ctx, workspace); err != nil {
+			t.Fatalf("UpsertAgentWorkspace %s: %v", workspace.OwnerKey, err)
+		}
+	}
+
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	byID := make(map[string]store.IssueSnapshot, len(snap.Issues))
+	for _, issue := range snap.Issues {
+		byID[issue.ID] = issue
+	}
+	if got := byID["issue-coder"].Workspace; got == nil || got.ExternalID != "sb-coder" {
+		t.Fatalf("issue-coder Workspace = %#v, want persistent coder workspace", got)
+	}
+	if got := byID["issue-reviewer"].Workspace; got == nil || got.ExternalID != "sb-active" {
+		t.Fatalf("issue-reviewer Workspace = %#v, want active reviewer workspace", got)
+	}
+	if got := byID["issue-none"].Workspace; got != nil {
+		t.Fatalf("issue-none Workspace = %#v, want nil", got)
+	}
+}
+
 // TestReadSnapshot_RecentEventsAndLastEventAt asserts ReadSnapshot loads the
 // trailing events newest-first, capped at recentEventLimit (15), and reports
 // LastEventAt as the max ts across them — the data the TUI liveness signal and

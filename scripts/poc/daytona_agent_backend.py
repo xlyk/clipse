@@ -9,7 +9,6 @@ import os
 import re
 import secrets
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 
@@ -19,6 +18,8 @@ from deepagents_code.config import create_model
 from langchain_daytona import DaytonaSandbox
 
 from clipse_agent.dac import drive_turn
+from clipse_agent.backends.contracts import BackendActionError
+from clipse_agent.backends.github import github_token, subprocess_host_runner
 
 DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
 REMOTE_REPO = "/home/daytona/workspace/clipse"
@@ -40,11 +41,10 @@ class PocError(RuntimeError):
 
 def run_host(argv: list[str]) -> str:
     """Run a trusted host command without echoing stdout or stderr on failure."""
-    result = subprocess.run(argv, text=True, capture_output=True, check=False)
-    if result.returncode != 0:
-        command = " ".join(argv[:2])
-        raise PocError(f"host command failed: {command}")
-    return result.stdout.strip()
+    try:
+        return subprocess_host_runner(argv)
+    except BackendActionError as exc:
+        raise PocError(str(exc)) from None
 
 
 def github_repo() -> tuple[str, str]:
@@ -74,15 +74,6 @@ def github_repo() -> tuple[str, str]:
     if not branch:
         raise PocError("GitHub returned an empty default branch")
     return f"https://github.com/{slug}.git", branch
-
-
-def github_token() -> str:
-    """Read the host gh token without returning it to any agent input."""
-    run_host(["gh", "auth", "status", "--hostname", "github.com"])
-    token = run_host(["gh", "auth", "token", "--hostname", "github.com"])
-    if not token:
-        raise PocError("gh auth token returned an empty token")
-    return token
 
 
 def require_env(name: str) -> str:

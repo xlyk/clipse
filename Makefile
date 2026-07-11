@@ -6,7 +6,7 @@ BINARY   = ./bin/clipse
 GO_JSONSCHEMA_VERSION      = v0.23.1
 DATAMODEL_CODEGEN_VERSION  = 0.66.3
 
-.PHONY: build test test-go test-py lint run codegen eval eval-report
+.PHONY: build test test-go test-py lint run codegen eval eval-report smoke-daytona-backend
 
 ## build: compile the clipse binary into ./bin/clipse
 build:
@@ -76,3 +76,7 @@ eval:
 ## eval-report: summarize the newest eval run (agent/evals/results/latest.jsonl)
 eval-report:
 	cd agent && uv run python evals/report.py
+
+## smoke-daytona-backend: run the opt-in live Daytona coder/reviewer smoke
+smoke-daytona-backend:
+	cd agent && uv run python ../scripts/smoke_daytona_backend.py

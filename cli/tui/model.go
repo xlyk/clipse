@@ -119,6 +119,7 @@ type Row struct {
 	// disk, so follow mode can replay a past run even when nothing is
 	// currently claimed. Sourced from SnapshotMsg.TranscriptIdents.
 	HasTranscript bool
+	Workspace     *store.AgentWorkspace
 }
 
 // Model is the bubbletea model for `clipse tui`. It holds only
@@ -688,6 +689,7 @@ func (m *Model) fold(snap store.Snapshot) {
 			Priority:        is.Priority,
 			Unmirrored:      is.Unmirrored,
 			HasTranscript:   m.transcripts[is.Identifier],
+			Workspace:       is.Workspace,
 		}
 
 		m.byStatus[is.BoardStatus] = append(m.byStatus[is.BoardStatus], row)
