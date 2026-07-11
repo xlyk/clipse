@@ -78,3 +78,32 @@ func TestAllowlistedEnv(t *testing.T) {
 		})
 	}
 }
+
+func TestMergeEnv_OverlaysByNameWithoutDuplicates(t *testing.T) {
+	base := []string{
+		"ANTHROPIC_API_KEY=model",
+		"PATH=/normal/bin",
+		"HOME=/normal/home",
+		"CLIPSE_ISSUE_TEXT=task",
+		"PATH=/stale/duplicate",
+	}
+	overlay := []string{
+		"PATH=/host/bin",
+		"HOME=/host/home",
+		"DAYTONA_API_KEY=daytona",
+		"DAYTONA_API_URL=https://daytona.example",
+		"DAYTONA_TARGET=us",
+	}
+	want := []string{
+		"ANTHROPIC_API_KEY=model",
+		"PATH=/host/bin",
+		"HOME=/host/home",
+		"CLIPSE_ISSUE_TEXT=task",
+		"DAYTONA_API_KEY=daytona",
+		"DAYTONA_API_URL=https://daytona.example",
+		"DAYTONA_TARGET=us",
+	}
+	if got := spawn.MergeEnv(base, overlay); !slices.Equal(got, want) {
+		t.Fatalf("MergeEnv() = %v, want %v", got, want)
+	}
+}

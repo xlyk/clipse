@@ -311,6 +311,33 @@ func TestWorkerArgs(t *testing.T) {
 				"--workspace=",
 			},
 		},
+		{
+			name: "daytona backend metadata appended when set",
+			spec: WorkerSpec{
+				Issue:     "CLP-1",
+				Lane:      "coder",
+				RunID:     "run-1",
+				ThreadID:  "thread-1",
+				Workspace: "/home/daytona/workspace/clipse",
+				Backend:   "daytona",
+				SandboxID: "sandbox-1",
+				RepoURL:   "https://github.com/xlyk/clipse.git",
+				RepoSlug:  "xlyk/clipse",
+				Branch:    "CLP-1-branch",
+			},
+			want: []string{
+				"--issue=CLP-1",
+				"--lane=coder",
+				"--run=run-1",
+				"--thread=thread-1",
+				"--workspace=/home/daytona/workspace/clipse",
+				"--backend=daytona",
+				"--sandbox-id=sandbox-1",
+				"--repo-url=https://github.com/xlyk/clipse.git",
+				"--repo-slug=xlyk/clipse",
+				"--branch=CLP-1-branch",
+			},
+		},
 	}
 
 	for _, tt := range tests {

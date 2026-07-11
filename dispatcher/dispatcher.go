@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/xlyk/clipse/internal/backend"
 	"github.com/xlyk/clipse/internal/config"
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/spawn"
@@ -67,6 +68,7 @@ type Dispatcher struct {
 	linear  linear.Client
 	spawner spawn.Spawner
 	ws      Workspacer
+	backend backend.Manager
 
 	now      func() int64
 	newRunID func() string
@@ -121,6 +123,13 @@ func WithRunIDGenerator(gen func() string) Option {
 // cfg.EnvAllowlist.
 func WithEnvFor(envFor func(issue store.Issue) []string) Option {
 	return func(d *Dispatcher) { d.envFor = envFor }
+}
+
+// WithBackendManager installs the provider-neutral remote workspace manager.
+// Local mode never consults it; the dispatch composition root supplies it
+// only when agent_backend.type is daytona.
+func WithBackendManager(manager backend.Manager) Option {
+	return func(d *Dispatcher) { d.backend = manager }
 }
 
 // WithLogger overrides the default slog logger used for dispatcher lifecycle

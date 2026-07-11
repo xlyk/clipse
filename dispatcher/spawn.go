@@ -3,10 +3,13 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/xlyk/clipse/internal/backend"
 	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
@@ -29,8 +32,39 @@ import (
 // process to Wait on, so this can't flow through the normal
 // applyResult/runResult path.
 func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID, lane, threadID string, turn int, reviewFeedback string) error {
-	// Every spawned lane (coder/reviewer) operates on the issue's own branch.
-	workspace, err := d.ws.Ensure(issue)
+	// Local lanes operate on the issue's git worktree. Daytona lanes first
+	// ensure their role-scoped sandbox, then launch the local Python worker as
+	// a remote-session coordinator against the returned repository path.
+	var (
+		workspace       string
+		remoteWorkspace backend.Workspace
+		repoSlug        string
+		err             error
+	)
+	if d.cfg.AgentBackend.Type == "daytona" {
+		repoSlug = backend.RepoSlug(d.cfg.Repo.Remote)
+		if d.backend == nil {
+			err = &backend.ActionError{Kind: backend.ErrorKindCapability, Op: "ensure", Msg: "Daytona backend manager is not configured"}
+		} else {
+			remoteWorkspace, err = d.backend.Ensure(ctx, backend.EnsureRequest{
+				Provider:                  "daytona",
+				Role:                      lane,
+				IssueID:                   issue.ID,
+				RunID:                     runID,
+				RepoURL:                   d.cfg.Repo.Remote,
+				RepoSlug:                  repoSlug,
+				BaseBranch:                d.cfg.Repo.BaseBranch,
+				Branch:                    issue.BranchName,
+				AutoStopMinutes:           d.cfg.AgentBackend.Daytona.AutoStopMinutes,
+				ReviewerAutoDeleteMinutes: d.cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes,
+				Snapshot:                  d.cfg.AgentBackend.Daytona.Snapshot,
+				Target:                    d.cfg.AgentBackend.Daytona.Target,
+			})
+			workspace = remoteWorkspace.WorkspacePath
+		}
+	} else {
+		workspace, err = d.ws.Ensure(issue)
+	}
 	if err != nil {
 		// A workspace/spawn failure is transient by nature, so it is eligible
 		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
@@ -44,10 +78,37 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		// ever run again. A no-op for a fresh claim's first spawn
 		// (spawnClaim), which never has a pre-existing entry for runID.
 		delete(d.inflight, runID)
+		kind := contract.BlockKindTransient
+		if d.cfg.AgentBackend.Type == "daytona" {
+			kind = backendBlockKind(err)
+		}
 		cause := fmt.Errorf("preparing workspace: %w", err)
-		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), kind, d.now(), retryPayload{}, func() error {
 			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
 		})
+	}
+
+	if d.cfg.AgentBackend.Type == "daytona" {
+		now := d.now()
+		if err := d.store.UpsertAgentWorkspace(ctx, store.AgentWorkspace{
+			OwnerKey:      remoteWorkspace.OwnerKey,
+			IssueID:       issue.ID,
+			RunID:         runID,
+			Provider:      "daytona",
+			Role:          lane,
+			ExternalID:    remoteWorkspace.ExternalID,
+			WorkspacePath: remoteWorkspace.WorkspacePath,
+			State:         store.WorkspaceState(remoteWorkspace.State),
+			LastAction:    "ensure",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}); err != nil {
+			delete(d.inflight, runID)
+			cause := fmt.Errorf("persisting provisioned workspace: %w", err)
+			return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, now, retryPayload{}, func() error {
+				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+			})
+		}
 	}
 
 	// d.envFor is always set (New defaults it to defaultEnvFor;
@@ -55,6 +116,9 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	// nil WorkerSpec.Env, which exec.Cmd.Env would treat as "inherit the
 	// dispatcher's full environment".
 	env := d.envFor(issue)
+	if d.cfg.AgentBackend.Type == "daytona" {
+		env = spawn.MergeEnv(env, daytonaWorkerEnv())
+	}
 
 	// A rework re-run carries the review feedback that routed the card back to
 	// the Coder lane. Injected here (not via envFor) so it rides alongside
@@ -95,6 +159,11 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		DocsShellAllowList: docsShellAllowList,
 		BaseBranch:         d.cfg.Repo.BaseBranch,
 		TranscriptPath:     d.transcriptPath(issue),
+		Backend:            backendName(d.cfg.AgentBackend.Type),
+		SandboxID:          remoteWorkspace.ExternalID,
+		RepoURL:            daytonaOnly(d.cfg.AgentBackend.Type, d.cfg.Repo.Remote),
+		RepoSlug:           repoSlug,
+		Branch:             daytonaOnly(d.cfg.AgentBackend.Type, issue.BranchName),
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -139,6 +208,46 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	}()
 
 	return nil
+}
+
+func backendBlockKind(err error) contract.BlockKind {
+	var actionErr *backend.ActionError
+	if !errors.As(err, &actionErr) {
+		return contract.BlockKindCapability
+	}
+	switch actionErr.Kind {
+	case backend.ErrorKindTransient:
+		return contract.BlockKindTransient
+	case backend.ErrorKindNeedsInput:
+		return contract.BlockKindNeedsInput
+	default:
+		return contract.BlockKindCapability
+	}
+}
+
+func daytonaWorkerEnv() []string {
+	keys := []string{"DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET", "HOME", "PATH"}
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
+func backendName(configured string) string {
+	if configured == "daytona" {
+		return configured
+	}
+	return ""
+}
+
+func daytonaOnly(configured, value string) string {
+	if configured == "daytona" {
+		return value
+	}
+	return ""
 }
 
 // checkpointDBPath returns the per-issue LangGraph checkpointer database
