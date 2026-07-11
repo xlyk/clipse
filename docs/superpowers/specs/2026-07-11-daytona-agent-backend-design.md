@@ -1,7 +1,7 @@
 # Daytona Agent Backend Design
 
 **Date:** 2026-07-11  
-**Status:** Design approved; pending written-spec review  
+**Status:** Approved for implementation  
 **Supersedes:** The production exclusions in `2026-07-11-daytona-agent-backend-poc-design.md`; the POC remains a diagnostic tool.
 
 ## Summary
