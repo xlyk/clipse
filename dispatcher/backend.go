@@ -14,42 +14,59 @@ import (
 const workspaceReconcileNeedsInput = "workspace_reconcile_needs_input"
 const workspaceReconcileNeedsInputAction = "reconcile_needs_input"
 
-// drainWorkspaceCleanup retries every durable cleanup_pending row once per
-// tick. Provider failures are diagnostic state, not a board transition: the
-// row stays pending with a sanitized error and the tick continues.
+// drainWorkspaceCleanup retries each configured-provider cleanup_pending row
+// once per tick. Remote Delete and local Remove failures are diagnostic state,
+// not board transitions: the row stays pending with a sanitized error and the
+// tick continues through its later phases, including outbox drain.
 func (d *Dispatcher) drainWorkspaceCleanup(ctx context.Context) error {
-	if d.cfg.AgentBackend.Type != "daytona" {
+	provider := d.cfg.AgentBackend.Type
+	if provider != "daytona" && provider != "local" {
 		return nil
-	}
-	if d.backend == nil {
-		return errors.New("remote workspace backend manager is not configured")
 	}
 	pending, err := d.store.PendingWorkspaceCleanup(ctx)
 	if err != nil {
 		return fmt.Errorf("listing pending workspace cleanup: %w", err)
 	}
-	remotePending := pending[:0]
+	ownedPending := pending[:0]
 	for _, workspace := range pending {
-		if workspace.Provider == "daytona" {
-			remotePending = append(remotePending, workspace)
+		if workspace.Provider == provider {
+			ownedPending = append(ownedPending, workspace)
 		}
 	}
-	if len(remotePending) == 0 {
+	if len(ownedPending) == 0 {
 		return nil
 	}
-	_, repoSlug, err := backend.CanonicalGitHubRemote(d.cfg.Repo.Remote)
-	if err != nil {
-		return fmt.Errorf("resolving repository for workspace cleanup: %w", err)
-	}
-	for _, workspace := range remotePending {
-		remote := backend.Workspace{
-			Provider: workspace.Provider, OwnerKey: workspace.OwnerKey, ExternalID: workspace.ExternalID,
-			WorkspacePath: workspace.WorkspacePath, State: backend.WorkspaceState(workspace.State),
-			Role: workspace.Role, IssueID: workspace.IssueID, RunID: workspace.RunID,
-			RepoSlug: repoSlug, Target: d.cfg.AgentBackend.Daytona.Target,
+	var repoSlug string
+	if provider == "daytona" {
+		if d.backend == nil {
+			return errors.New("remote workspace backend manager is not configured")
 		}
-		if err := d.backend.Delete(ctx, remote); err != nil {
-			message := sanitizedWorkspaceCleanupError(err)
+		_, repoSlug, err = backend.CanonicalGitHubRemote(d.cfg.Repo.Remote)
+		if err != nil {
+			return fmt.Errorf("resolving repository for workspace cleanup: %w", err)
+		}
+	}
+	for _, workspace := range ownedPending {
+		var cleanupErr error
+		var message string
+		if provider == "local" {
+			issue, err := d.store.GetIssue(ctx, workspace.IssueID)
+			if err != nil {
+				return fmt.Errorf("loading issue %s for local workspace cleanup: %w", workspace.IssueID, err)
+			}
+			cleanupErr = d.ws.Remove(*issue)
+			message = "local workspace cleanup failed"
+		} else {
+			remote := backend.Workspace{
+				Provider: workspace.Provider, OwnerKey: workspace.OwnerKey, ExternalID: workspace.ExternalID,
+				WorkspacePath: workspace.WorkspacePath, State: backend.WorkspaceState(workspace.State),
+				Role: workspace.Role, IssueID: workspace.IssueID, RunID: workspace.RunID,
+				RepoSlug: repoSlug, Target: d.cfg.AgentBackend.Daytona.Target,
+			}
+			cleanupErr = d.backend.Delete(ctx, remote)
+			message = sanitizedWorkspaceCleanupError(cleanupErr)
+		}
+		if cleanupErr != nil {
 			if recordErr := d.store.RecordWorkspaceCleanupError(ctx, workspace.OwnerKey, message, d.now()); recordErr != nil {
 				return fmt.Errorf("recording cleanup failure for %s: %w", workspace.OwnerKey, recordErr)
 			}
@@ -215,7 +232,8 @@ func (d *Dispatcher) reconcileAgentWorkspaces(ctx context.Context) error {
 // coder workspace or the old run-scoped reviewer workspace without issuing a
 // second provider List call. The next normal Tick drain performs deletion.
 func (d *Dispatcher) scheduleRecoveredWorkspaceCleanup(ctx context.Context) error {
-	if d.cfg.AgentBackend.Type != "daytona" {
+	provider := d.cfg.AgentBackend.Type
+	if provider != "daytona" && provider != "local" {
 		return nil
 	}
 	workspaces, err := d.store.ListAgentWorkspaces(ctx)
@@ -236,14 +254,14 @@ func (d *Dispatcher) scheduleRecoveredWorkspaceCleanup(ctx context.Context) erro
 	}
 	coderCounts := make(map[string]int)
 	for _, workspace := range workspaces {
-		if workspace.Provider == "daytona" && workspace.Role == "coder" && workspace.State != store.WorkspaceDeleted && workspace.LastAction != workspaceReconcileNeedsInputAction {
+		if workspace.Provider == provider && workspace.Role == "coder" && workspace.State != store.WorkspaceDeleted && workspace.LastAction != workspaceReconcileNeedsInputAction {
 			coderCounts[workspace.IssueID]++
 		}
 	}
 	now := d.now()
 	duplicateEvents := make(map[string]bool)
 	for _, workspace := range workspaces {
-		if workspace.Provider != "daytona" {
+		if workspace.Provider != provider {
 			continue
 		}
 		issue, known := issues[workspace.IssueID]
@@ -251,6 +269,14 @@ func (d *Dispatcher) scheduleRecoveredWorkspaceCleanup(ctx context.Context) erro
 			continue
 		}
 		if workspaceHasOpenRun(workspace, openRuns) {
+			continue
+		}
+		if provider == "local" {
+			if workspace.Role == "coder" && known && terminalStatuses[issue.BoardStatus] {
+				if err := d.store.MarkWorkspaceCleanupPending(ctx, workspace.OwnerKey, now); err != nil {
+					return fmt.Errorf("scheduling recovered local workspace %s cleanup: %w", workspace.OwnerKey, err)
+				}
+			}
 			continue
 		}
 		if workspace.Role == "reviewer" {
@@ -326,7 +352,8 @@ func (d *Dispatcher) appendWorkspaceNeedsInput(ctx context.Context, issueID, det
 // duplicate is deliberately not selected: startup reconciliation emits the
 // visible needs-input event and leaves both provider objects untouched.
 func (d *Dispatcher) cleanupCoderWorkspaceRequested(ctx context.Context, issueID, terminalStatus string) (bool, error) {
-	if d.cfg.AgentBackend.Type != "daytona" || !terminalStatuses[terminalStatus] {
+	provider := d.cfg.AgentBackend.Type
+	if (provider != "daytona" && provider != "local") || !terminalStatuses[terminalStatus] {
 		return false, nil
 	}
 	workspaces, err := d.store.AgentWorkspacesByIssue(ctx, issueID)
@@ -335,33 +362,11 @@ func (d *Dispatcher) cleanupCoderWorkspaceRequested(ctx context.Context, issueID
 	}
 	count := 0
 	for _, workspace := range workspaces {
-		if workspace.Provider == "daytona" && workspace.Role == "coder" && workspace.State != store.WorkspaceDeleted && workspace.LastAction != workspaceReconcileNeedsInputAction {
+		if workspace.Provider == provider && workspace.Role == "coder" && workspace.State != store.WorkspaceDeleted && workspace.LastAction != workspaceReconcileNeedsInputAction {
 			count++
 		}
 	}
 	return count == 1, nil
-}
-
-func (d *Dispatcher) removeLocalWorkspace(issue store.Issue) error {
-	if d.cfg.AgentBackend.Type != "local" {
-		return nil
-	}
-	if err := d.ws.Remove(issue); err != nil {
-		return fmt.Errorf("removing local worktree for terminal issue %s: %w", issue.ID, err)
-	}
-	workspaces, err := d.store.AgentWorkspacesByIssue(context.Background(), issue.ID)
-	if err != nil {
-		return fmt.Errorf("loading local workspace row for terminal issue %s: %w", issue.ID, err)
-	}
-	for _, workspace := range workspaces {
-		if workspace.Provider != "local" || workspace.Role != "coder" || workspace.State == store.WorkspaceDeleted {
-			continue
-		}
-		if err := d.store.MarkWorkspaceDeleted(context.Background(), workspace.OwnerKey, d.now()); err != nil {
-			return fmt.Errorf("marking local workspace deleted for terminal issue %s: %w", issue.ID, err)
-		}
-	}
-	return nil
 }
 
 func localWorkspaceOwnerKey(issueID string) string {

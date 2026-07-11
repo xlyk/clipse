@@ -206,6 +206,90 @@ func TestTransition_TerminalStatusAtomicallyQueuesCoderCleanup(t *testing.T) {
 	}
 }
 
+func TestTransition_TerminalStatusQueuesLocalCoderCleanup(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedRunningIssueWithRun(t, s, "issue-1", "run-1")
+	workspace := store.AgentWorkspace{
+		OwnerKey: "local:coder:issue-1", IssueID: "issue-1", Provider: "local", Role: "coder",
+		WorkspacePath: "/workspace", State: store.WorkspaceActive, LastAction: "ensure", CreatedAt: 10, UpdatedAt: 10,
+	}
+	if err := s.UpsertAgentWorkspace(ctx, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Transition(ctx, store.TransitionReq{
+		IssueID: "issue-1", NewStatus: "done", ClearClaim: true, CloseRunID: "run-1", RunStatus: "done",
+		CleanupCoderWorkspace: true, CleanupWorkspaceProvider: "local", Event: store.Event{Ts: 500, Kind: "terminal"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.AgentWorkspacesByIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].State != store.WorkspaceCleanupPending {
+		t.Fatalf("local terminal workspace = %+v", rows)
+	}
+}
+
+func TestHasPendingLinearSetState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.EnqueueLinearSetState(ctx, "issue-1", "done", 10); err != nil {
+		t.Fatal(err)
+	}
+	has, err := s.HasPendingLinearSetState(ctx, "issue-1")
+	if err != nil || !has {
+		t.Fatalf("issue-1 pending setstate = %v, err=%v", has, err)
+	}
+	has, err = s.HasPendingLinearSetState(ctx, "issue-2")
+	if err != nil || has {
+		t.Fatalf("issue-2 pending setstate = %v, err=%v", has, err)
+	}
+	writes, err := s.DrainPendingLinearWrites(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkLinearWriteDone(ctx, writes[0].ID, 20); err != nil {
+		t.Fatal(err)
+	}
+	has, err = s.HasPendingLinearSetState(ctx, "issue-1")
+	if err != nil || has {
+		t.Fatalf("completed issue-1 setstate still pending = %v, err=%v", has, err)
+	}
+}
+
+func TestDrainPendingLinearWriteHeadsReturnsOldestPerIssue(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	for _, item := range []struct {
+		issue  string
+		target string
+	}{
+		{issue: "issue-a", target: "ready"},
+		{issue: "issue-a", target: "done"},
+		{issue: "issue-a", target: "blocked"},
+		{issue: "issue-b", target: "review"},
+	} {
+		if err := s.EnqueueLinearSetState(ctx, item.issue, item.target, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	heads, err := s.DrainPendingLinearWriteHeads(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heads) != 2 {
+		t.Fatalf("heads = %+v, want one row for each issue", heads)
+	}
+	if heads[0].IssueID != "issue-a" || heads[0].Target != "ready" {
+		t.Fatalf("issue-a head = %+v, want oldest ready", heads[0])
+	}
+	if heads[1].IssueID != "issue-b" || heads[1].Target != "review" {
+		t.Fatalf("issue-b head = %+v, want review despite three earlier issue-a rows", heads[1])
+	}
+}
+
 func TestTransition_CoderCleanupFailureRollsBackTerminalTransition(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

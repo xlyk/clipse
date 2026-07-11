@@ -85,12 +85,10 @@ func (d *Dispatcher) pollAndUpsert(ctx context.Context) error {
 // running claim). The two states can differ for two very different
 // reasons, handled oppositely:
 //
-//   - No active claim: nobody but a human could have moved this issue in
-//     Linear (the dispatcher only changes board_status via ClaimReady/
-//     Transition, both of which also enqueue their own outbox mirror). This
-//     is a human move — adopt it into SQLite. No outbox mirror: Linear
-//     already holds this state, so mirroring it back would be a no-op write
-//     at best.
+//   - No active claim and no pending setstate: nobody but a human could have
+//     moved this issue in Linear, so adopt it into SQLite. A pending setstate
+//     means the opposite: SQLite already committed a transition whose mirror
+//     has not reached Linear, so preserve SQLite and let drainOutbox converge.
 //   - An active claim: the dispatcher currently owns this issue, and
 //     linearStatus reflects a state Linear held before the claim's own
 //     mirror write was applied/observed. Re-assert the dispatcher's truth by
@@ -104,9 +102,6 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 	}
 
 	if issue.BoardStatus == linearStatus {
-		if linearStatus == "cancelled" {
-			return d.removeLocalWorkspace(*issue)
-		}
 		return nil
 	}
 
@@ -124,6 +119,13 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 	// dispatcher-owns-this-claim case below: re-assert the store's real
 	// status instead of trusting Linear's.
 	if !issue.ClaimLock.Valid && linearStatus != string(contract.ColumnRunning) {
+		pendingSetState, err := d.store.HasPendingLinearSetState(ctx, issueID)
+		if err != nil {
+			return fmt.Errorf("checking pending setstate for issue %s: %w", issueID, err)
+		}
+		if pendingSetState {
+			return nil
+		}
 		return d.adoptLinearMove(ctx, issueID, issue.BoardStatus, linearStatus, now)
 	}
 	return d.reassertOwnedState(ctx, issueID, issue.BoardStatus, now)
@@ -154,11 +156,12 @@ func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, priorStatus, 
 		return fmt.Errorf("preparing terminal workspace cleanup for issue %s: %w", issueID, err)
 	}
 	req := store.TransitionReq{
-		IssueID:               issueID,
-		NewStatus:             linearStatus,
-		CleanupCoderWorkspace: cleanupCoderWorkspace,
-		ResetReworkCount:      humanRequeueFromBlocked,
-		ResetRecoverAttempts:  humanRequeueFromBlocked,
+		IssueID:                  issueID,
+		NewStatus:                linearStatus,
+		CleanupCoderWorkspace:    cleanupCoderWorkspace,
+		CleanupWorkspaceProvider: d.cfg.AgentBackend.Type,
+		ResetReworkCount:         humanRequeueFromBlocked,
+		ResetRecoverAttempts:     humanRequeueFromBlocked,
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),
@@ -168,15 +171,6 @@ func (d *Dispatcher) adoptLinearMove(ctx context.Context, issueID, priorStatus, 
 	}
 	if err := d.store.Transition(ctx, req); err != nil {
 		return fmt.Errorf("adopting linear move for issue %s: %w", issueID, err)
-	}
-	if linearStatus == "cancelled" {
-		issue, err := d.store.GetIssue(ctx, issueID)
-		if err != nil {
-			return fmt.Errorf("loading cancelled issue %s for local cleanup: %w", issueID, err)
-		}
-		if err := d.removeLocalWorkspace(*issue); err != nil {
-			return err
-		}
 	}
 	return nil
 }

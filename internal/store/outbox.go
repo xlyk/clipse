@@ -21,6 +21,9 @@ type TransitionReq struct {
 	// workspace. Keeping this update inside Transition prevents a crash from
 	// committing the terminal board state without durably scheduling cleanup.
 	CleanupCoderWorkspace bool
+	// CleanupWorkspaceProvider selects the provider-owned coder row to queue.
+	// Empty preserves the original Daytona behavior for existing callers.
+	CleanupWorkspaceProvider string
 
 	// SkipReworkBump suppresses the automatic rework_count increment that
 	// NewStatus=="rework" would otherwise apply (see applyIssueTransition).
@@ -131,18 +134,25 @@ func applyCoderWorkspaceCleanup(ctx context.Context, tx *sql.Tx, req TransitionR
 	if req.NewStatus != "done" && req.NewStatus != "cancelled" {
 		return fmt.Errorf("transitioning issue %s: coder workspace cleanup requires a terminal status", req.IssueID)
 	}
+	provider := req.CleanupWorkspaceProvider
+	if provider == "" {
+		provider = "daytona"
+	}
+	if provider != "daytona" && provider != "local" {
+		return fmt.Errorf("transitioning issue %s: unsupported workspace cleanup provider %q", req.IssueID, provider)
+	}
 	const q = `
 		UPDATE agent_workspaces
 		SET state = ?, last_error = '', updated_at = ?
 		WHERE owner_key = (
 			SELECT owner_key
 			FROM agent_workspaces
-			WHERE issue_id = ? AND provider = 'daytona' AND role = 'coder' AND state <> ? AND last_action <> 'reconcile_needs_input'
+			WHERE issue_id = ? AND provider = ? AND role = 'coder' AND state <> ? AND last_action <> 'reconcile_needs_input'
 			GROUP BY issue_id
 			HAVING COUNT(*) = 1
 		)
 	`
-	res, err := tx.ExecContext(ctx, q, WorkspaceCleanupPending, req.Event.Ts, req.IssueID, WorkspaceDeleted)
+	res, err := tx.ExecContext(ctx, q, WorkspaceCleanupPending, req.Event.Ts, req.IssueID, provider, WorkspaceDeleted)
 	if err != nil {
 		return fmt.Errorf("transitioning issue %s: scheduling coder workspace cleanup: %w", req.IssueID, err)
 	}
@@ -278,6 +288,23 @@ func (s *Store) EnqueueLinearSetState(ctx context.Context, issueID, column strin
 	return nil
 }
 
+// HasPendingLinearSetState reports whether issueID has an unmirrored board
+// state transition. Poll reconciliation must preserve SQLite while this is
+// true: Linear may still be showing the stale state the outbox will correct.
+func (s *Store) HasPendingLinearSetState(ctx context.Context, issueID string) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+			SELECT 1 FROM linear_writes
+			WHERE issue_id = ? AND kind = 'setstate' AND status = 'pending'
+		)
+	`
+	var pending bool
+	if err := s.db.QueryRowContext(ctx, q, issueID).Scan(&pending); err != nil {
+		return false, fmt.Errorf("checking pending setstate for issue %s: %w", issueID, err)
+	}
+	return pending, nil
+}
+
 // DrainPendingLinearWrites returns up to limit pending linear_writes rows,
 // ordered by id (oldest first), so the dispatcher processes the outbox in
 // enqueue order.
@@ -293,6 +320,36 @@ func (s *Store) DrainPendingLinearWrites(ctx context.Context, limit int) ([]Line
 	if err != nil {
 		return nil, fmt.Errorf("draining pending linear writes: %w", err)
 	}
+	return scanLinearWrites(rows, "pending")
+}
+
+// DrainPendingLinearWriteHeads returns the oldest pending write for each
+// issue, ordered globally by id and limited by distinct issue count. The
+// dispatcher uses this view so one issue's failed head cannot be overtaken by
+// its later writes or monopolize the batch ahead of unrelated issues.
+func (s *Store) DrainPendingLinearWriteHeads(ctx context.Context, limit int) ([]LinearWrite, error) {
+	const q = `
+		SELECT lw.id, lw.issue_id, lw.kind, lw.target, lw.body, lw.status, lw.attempts,
+			lw.last_error, lw.created_at, lw.updated_at
+		FROM linear_writes AS lw
+		WHERE lw.status = 'pending'
+			AND NOT EXISTS (
+				SELECT 1 FROM linear_writes AS earlier
+				WHERE earlier.issue_id = lw.issue_id
+					AND earlier.status = 'pending'
+					AND earlier.id < lw.id
+			)
+		ORDER BY lw.id
+		LIMIT ?
+	`
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("draining pending linear write heads: %w", err)
+	}
+	return scanLinearWrites(rows, "pending heads")
+}
+
+func scanLinearWrites(rows *sql.Rows, scope string) ([]LinearWrite, error) {
 	defer rows.Close()
 
 	var writes []LinearWrite
@@ -301,12 +358,12 @@ func (s *Store) DrainPendingLinearWrites(ctx context.Context, limit int) ([]Line
 		if err := rows.Scan(
 			&w.ID, &w.IssueID, &w.Kind, &w.Target, &w.Body, &w.Status, &w.Attempts, &w.LastError, &w.CreatedAt, &w.UpdatedAt,
 		); err != nil {
-			return nil, fmt.Errorf("scanning pending linear write row: %w", err)
+			return nil, fmt.Errorf("scanning linear write row (%s): %w", scope, err)
 		}
 		writes = append(writes, w)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating pending linear write rows: %w", err)
+		return nil, fmt.Errorf("iterating linear write rows (%s): %w", scope, err)
 	}
 	return writes, nil
 }

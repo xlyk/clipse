@@ -380,17 +380,18 @@ func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store
 	}
 
 	req := store.TransitionReq{
-		IssueID:               issue.ID,
-		NewStatus:             next,
-		ClearClaim:            true,
-		CloseRunID:            runID,
-		RunStatus:             outcome,
-		ResultJSON:            resultJSON,
-		TokensIn:              result.Tokens.In,
-		TokensOut:             result.Tokens.Out,
-		CleanupCoderWorkspace: cleanupCoderWorkspace,
-		EnqueueSetState:       true,
-		Comment:               comment,
+		IssueID:                  issue.ID,
+		NewStatus:                next,
+		ClearClaim:               true,
+		CloseRunID:               runID,
+		RunStatus:                outcome,
+		ResultJSON:               resultJSON,
+		TokensIn:                 result.Tokens.In,
+		TokensOut:                result.Tokens.Out,
+		CleanupCoderWorkspace:    cleanupCoderWorkspace,
+		CleanupWorkspaceProvider: d.cfg.AgentBackend.Type,
+		EnqueueSetState:          true,
+		Comment:                  comment,
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),
@@ -423,14 +424,6 @@ func (d *Dispatcher) applyTerminalWorkerOutcome(ctx context.Context, issue store
 	req.ResetRecoverAttempts = true
 	if err := d.store.Transition(ctx, req); err != nil {
 		return fmt.Errorf("transitioning issue %s: %w", issue.ID, err)
-	}
-	if next == string(contract.ColumnDone) {
-		if err := d.removeLocalWorkspace(issue); err != nil {
-			// The terminal transition is already committed. Surface the cleanup
-			// failure for visibility without reopening or otherwise mutating the
-			// completed issue.
-			return err
-		}
 	}
 	return nil
 }

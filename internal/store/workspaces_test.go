@@ -66,6 +66,31 @@ func TestAgentWorkspace_CleanupErrorRemainsPending(t *testing.T) {
 	}
 }
 
+func TestAgentWorkspace_LocalCleanupErrorRemainsPending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	workspace := store.AgentWorkspace{
+		OwnerKey: "local:coder:issue-1", IssueID: "issue-1", Provider: "local", Role: "coder",
+		WorkspacePath: "/workspace", State: store.WorkspaceActive, LastAction: "ensure", CreatedAt: 10, UpdatedAt: 10,
+	}
+	if err := s.UpsertAgentWorkspace(ctx, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkWorkspaceCleanupPending(ctx, workspace.OwnerKey, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordWorkspaceCleanupError(ctx, workspace.OwnerKey, "local workspace cleanup failed", 30); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.PendingWorkspaceCleanup(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Provider != "local" || pending[0].State != store.WorkspaceCleanupPending || pending[0].LastError != "local workspace cleanup failed" {
+		t.Fatalf("local pending cleanup row = %+v", pending)
+	}
+}
+
 func TestAgentWorkspace_UpsertPreservesCreatedAtAndListsByIssue(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

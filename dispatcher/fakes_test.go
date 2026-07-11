@@ -142,8 +142,9 @@ type stubWorkspacer struct {
 	mu   sync.Mutex
 	root string
 
-	ensured []string
-	removed []string
+	ensured      []string
+	removed      []string
+	removeErrors []error
 }
 
 func newStubWorkspacer(root string) *stubWorkspacer {
@@ -169,7 +170,18 @@ func (w *stubWorkspacer) Remove(issue store.Issue) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.removed = append(w.removed, issue.ID)
+	if len(w.removeErrors) > 0 {
+		err := w.removeErrors[0]
+		w.removeErrors = w.removeErrors[1:]
+		return err
+	}
 	return nil
+}
+
+func (w *stubWorkspacer) SetRemoveErrors(errs ...error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.removeErrors = append([]error(nil), errs...)
 }
 
 // EnsuredIssues returns the issue IDs Ensure was called for, in call order,

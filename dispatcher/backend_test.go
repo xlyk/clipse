@@ -891,11 +891,8 @@ func TestLocalCancelledIssueRemovesWorktreeIdempotently(t *testing.T) {
 	if err := d.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Tick(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := ws.RemovedIssues(); !slices.Equal(got, []string{"issue-1", "issue-1"}) {
-		t.Fatalf("Remove calls = %v, want idempotent cleanup on both cancelled observations", got)
+	if got := ws.RemovedIssues(); !slices.Equal(got, []string{"issue-1"}) {
+		t.Fatalf("Remove calls = %v, want one durable cleanup attempt", got)
 	}
 	if issue := getIssue(t, s, "issue-1"); issue.BoardStatus != "cancelled" {
 		t.Fatalf("board status = %q, want cancelled", issue.BoardStatus)
@@ -927,11 +924,74 @@ func TestTerminalDoneLocalCleanupMarksWorkspaceDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace := mustAgentWorkspace(t, s, "issue-1", "local:coder:issue-1")
+	if workspace.State != store.WorkspaceCleanupPending {
+		t.Fatalf("done local lifecycle row after terminal transition = %+v, want pending until next tick", workspace)
+	}
+	if got := ws.RemovedIssues(); len(got) != 0 {
+		t.Fatalf("local done cleanup ran before its durable queue tick: %v", got)
+	}
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	workspace = mustAgentWorkspace(t, s, "issue-1", "local:coder:issue-1")
 	if workspace.State != store.WorkspaceDeleted || workspace.LastAction != "delete" {
 		t.Fatalf("done local lifecycle row = %+v", workspace)
 	}
 	if got := ws.RemovedIssues(); !slices.Equal(got, []string{"issue-1"}) {
 		t.Fatalf("local done Remove calls = %v", got)
+	}
+}
+
+func TestLocalWorkspaceCleanupFailureStaysPendingAndDoesNotBlockOutbox(t *testing.T) {
+	for _, terminalStatus := range []string{"done", "cancelled"} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			ctx := context.Background()
+			s := openTestStore(t)
+			seedColumnIssue(t, s, "issue-1", terminalStatus, 1, 100)
+			seedAgentWorkspace(t, s, store.AgentWorkspace{
+				OwnerKey: "local:coder:issue-1", IssueID: "issue-1", Provider: "local", Role: "coder",
+				WorkspacePath: "/workspace", State: store.WorkspaceCleanupPending,
+				LastAction: "ensure", CreatedAt: 10, UpdatedAt: 10,
+			})
+			if err := s.EnqueueLinearSetState(ctx, "issue-1", terminalStatus, 200); err != nil {
+				t.Fatal(err)
+			}
+			lc := &linear.MockClient{}
+			ws := newStubWorkspacer(t.TempDir())
+			ws.SetRemoveErrors(errors.New("sensitive local path detail"))
+			cfg := zeroCapConfig()
+			cfg.AgentBackend.Type = "local"
+			d := dispatcher.New(cfg, s, lc, newFakeSpawner(), ws, dispatcher.WithClock(fixedClock(1000)))
+
+			if err := d.Tick(ctx); err != nil {
+				t.Fatalf("cleanup failure aborted Tick: %v", err)
+			}
+			workspace := mustAgentWorkspace(t, s, "issue-1", "local:coder:issue-1")
+			if workspace.State != store.WorkspaceCleanupPending || workspace.LastError != "local workspace cleanup failed" {
+				t.Fatalf("workspace after failed Remove = %+v", workspace)
+			}
+			if strings.Contains(workspace.LastError, "sensitive") {
+				t.Fatalf("cleanup diagnostic leaked raw error: %q", workspace.LastError)
+			}
+			pending, err := s.DrainPendingLinearWrites(ctx, 10)
+			if err != nil || len(pending) != 0 {
+				t.Fatalf("outbox was blocked by local cleanup failure: pending=%+v err=%v", pending, err)
+			}
+			if len(lc.SetStateCalls) != 1 || lc.SetStateCalls[0].TargetColumn != terminalStatus {
+				t.Fatalf("SetState calls = %+v", lc.SetStateCalls)
+			}
+
+			if err := d.Tick(ctx); err != nil {
+				t.Fatal(err)
+			}
+			workspace = mustAgentWorkspace(t, s, "issue-1", "local:coder:issue-1")
+			if workspace.State != store.WorkspaceDeleted || workspace.LastError != "" {
+				t.Fatalf("workspace after cleanup retry = %+v", workspace)
+			}
+			if got := ws.RemovedIssues(); !slices.Equal(got, []string{"issue-1", "issue-1"}) {
+				t.Fatalf("Remove retry calls = %v", got)
+			}
+		})
 	}
 }
 

@@ -12,35 +12,57 @@ const drainOutboxLimit = 100
 // drainOutbox is the only place the dispatcher writes to Linear: every board
 // transition enqueues a pending mirror write in the same store transaction
 // that changed board state, and drainOutbox is what actually sends it. A
-// Linear API failure here just leaves the row pending for a later tick's
-// retry — it never loses or duplicates the underlying transition (A2).
+// The store returns only each issue's oldest pending write. A failure leaves
+// that head pending while independent issues continue; later writes for the
+// failed issue cannot overtake it or monopolize this batch.
 func (d *Dispatcher) drainOutbox(ctx context.Context) error {
-	writes, err := d.store.DrainPendingLinearWrites(ctx, drainOutboxLimit)
-	if err != nil {
-		return fmt.Errorf("draining pending linear writes: %w", err)
-	}
-
 	now := d.now()
-	for _, w := range writes {
-		var sendErr error
-		switch w.Kind {
-		case "setstate":
-			sendErr = d.linear.SetState(ctx, w.IssueID, w.Target)
-		case "comment":
-			sendErr = d.linear.Comment(ctx, w.IssueID, w.Body)
-		default:
-			sendErr = fmt.Errorf("unknown linear write kind %q", w.Kind)
+	blockedIssues := make(map[string]bool)
+	processed := 0
+	for processed < drainOutboxLimit {
+		writes, err := d.store.DrainPendingLinearWriteHeads(ctx, drainOutboxLimit)
+		if err != nil {
+			return fmt.Errorf("draining pending linear writes: %w", err)
+		}
+		if len(writes) == 0 {
+			return nil
 		}
 
-		if sendErr != nil {
-			if err := d.store.MarkLinearWriteFailed(ctx, w.ID, sendErr.Error(), now); err != nil {
-				return fmt.Errorf("marking linear write %d failed: %w", w.ID, err)
+		madeProgress := false
+		for _, w := range writes {
+			if processed >= drainOutboxLimit {
+				break
 			}
-			d.logger.Warn("linear mirror write failed, will retry", "write_id", w.ID, "issue_id", w.IssueID, "kind", w.Kind, "error", sendErr)
-			continue
+			if blockedIssues[w.IssueID] {
+				continue
+			}
+			madeProgress = true
+			processed++
+
+			var sendErr error
+			switch w.Kind {
+			case "setstate":
+				sendErr = d.linear.SetState(ctx, w.IssueID, w.Target)
+			case "comment":
+				sendErr = d.linear.Comment(ctx, w.IssueID, w.Body)
+			default:
+				sendErr = fmt.Errorf("unknown linear write kind %q", w.Kind)
+			}
+
+			if sendErr != nil {
+				if err := d.store.MarkLinearWriteFailed(ctx, w.ID, sendErr.Error(), now); err != nil {
+					return fmt.Errorf("marking linear write %d failed: %w", w.ID, err)
+				}
+				blockedIssues[w.IssueID] = true
+				d.logger.Warn("linear mirror write failed, will retry", "write_id", w.ID, "issue_id", w.IssueID, "kind", w.Kind, "error", sendErr)
+				continue
+			}
+			if err := d.store.MarkLinearWriteDone(ctx, w.ID, now); err != nil {
+				return fmt.Errorf("marking linear write %d done: %w", w.ID, err)
+			}
 		}
-		if err := d.store.MarkLinearWriteDone(ctx, w.ID, now); err != nil {
-			return fmt.Errorf("marking linear write %d done: %w", w.ID, err)
+		if !madeProgress {
+			return nil
 		}
 	}
 	return nil

@@ -2,6 +2,8 @@ package dispatcher_test
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"testing"
 
 	"github.com/xlyk/clipse/internal/config"
@@ -269,6 +271,176 @@ func TestTick_PollAdoptsHumanMoveWhenUnclaimed(t *testing.T) {
 	if got2.BoardStatus != "running" {
 		t.Errorf("BoardStatus after second tick = %q, want running (adopted issue was claimable)", got2.BoardStatus)
 	}
+}
+
+func TestTick_PendingTerminalSetStatePreventsBackwardAdoptionAndStillConverges(t *testing.T) {
+	for _, terminalStatus := range []string{"done", "cancelled"} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			ctx := context.Background()
+			s := openTestStore(t)
+			seedColumnIssue(t, s, "issue-1", terminalStatus, 1, 100)
+			seedAgentWorkspace(t, s, store.AgentWorkspace{
+				OwnerKey: "local:coder:issue-1", IssueID: "issue-1", Provider: "local", Role: "coder",
+				WorkspacePath: "/workspace", State: store.WorkspaceCleanupPending,
+				LastAction: "ensure", CreatedAt: 10, UpdatedAt: 10,
+			})
+			if err := s.EnqueueLinearSetState(ctx, "issue-1", terminalStatus, 200); err != nil {
+				t.Fatal(err)
+			}
+			writes, err := s.DrainPendingLinearWrites(ctx, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.MarkLinearWriteFailed(ctx, writes[0].ID, "prior mirror outage", 300); err != nil {
+				t.Fatal(err)
+			}
+
+			lc := &linear.MockClient{Issues: []linear.Issue{{
+				ID: "issue-1", Identifier: "CLP-1", Status: "todo", Lane: "coder", Priority: 1,
+				BranchName: "issue-1-branch", UpdatedAt: 400,
+			}}}
+			ws := newStubWorkspacer(t.TempDir())
+			cfg := zeroCapConfig()
+			cfg.AgentBackend.Type = "local"
+			// A fresh Dispatcher models restart: only SQLite and the outbox carry
+			// knowledge of the committed terminal transition.
+			d := newTestDispatcher(t, cfg, s, lc, newFakeSpawner(), ws, fixedClock(1000))
+
+			if err := d.Tick(ctx); err != nil {
+				t.Fatal(err)
+			}
+			issue := getIssue(t, s, "issue-1")
+			if issue.BoardStatus != terminalStatus {
+				t.Fatalf("board status = %q, want terminal %q preserved", issue.BoardStatus, terminalStatus)
+			}
+			workspace := mustAgentWorkspace(t, s, "issue-1", "local:coder:issue-1")
+			if workspace.State != store.WorkspaceDeleted {
+				t.Fatalf("cleanup did not proceed while mirror converged: %+v", workspace)
+			}
+			if got := ws.RemovedIssues(); !slices.Equal(got, []string{"issue-1"}) {
+				t.Fatalf("Remove calls = %v", got)
+			}
+			if len(lc.SetStateCalls) != 1 || lc.SetStateCalls[0].TargetColumn != terminalStatus {
+				t.Fatalf("SetState calls = %+v, want terminal convergence", lc.SetStateCalls)
+			}
+			pending, err := s.DrainPendingLinearWrites(ctx, 10)
+			if err != nil || len(pending) != 0 {
+				t.Fatalf("pending writes after convergence = %+v, err=%v", pending, err)
+			}
+		})
+	}
+}
+
+func TestTick_OutboxFailureCannotReorderTerminalSetState(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", string(contract.ColumnDone), 1, 100)
+	if err := s.EnqueueLinearSetState(ctx, "issue-1", string(contract.ColumnReady), 200); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueLinearSetState(ctx, "issue-1", string(contract.ColumnDone), 300); err != nil {
+		t.Fatal(err)
+	}
+	lc := &failFirstSetStateLinear{status: string(contract.ColumnReady)}
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, newFakeSpawner(), newStubWorkspacer(t.TempDir()), fixedClock(1000))
+
+	for tick := 1; tick <= 4; tick++ {
+		if err := d.Tick(ctx); err != nil {
+			t.Fatalf("tick %d: %v", tick, err)
+		}
+	}
+	issue := getIssue(t, s, "issue-1")
+	if issue.BoardStatus != string(contract.ColumnDone) {
+		t.Fatalf("out-of-order mirror moved SQLite backward to %q, want done", issue.BoardStatus)
+	}
+	if lc.status != string(contract.ColumnDone) {
+		t.Fatalf("final Linear status = %q, want done", lc.status)
+	}
+	pending, err := s.DrainPendingLinearWrites(ctx, 10)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending writes = %+v, err=%v", pending, err)
+	}
+}
+
+func TestTick_OutboxFailureBlocksOnlySameIssue(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	for _, item := range []struct {
+		issue  string
+		target string
+	}{
+		{issue: "issue-a", target: "ready"},
+		{issue: "issue-a", target: "done"},
+		{issue: "issue-b", target: "review"},
+	} {
+		if err := s.EnqueueLinearSetState(ctx, item.issue, item.target, 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lc := &failIssueLinear{failIssue: "issue-a"}
+	d := newTestDispatcher(t, zeroCapConfig(), s, lc, newFakeSpawner(), newStubWorkspacer(t.TempDir()), fixedClock(1000))
+	if err := d.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(lc.calls, []string{"issue-a:ready", "issue-b:review"}) {
+		t.Fatalf("SetState calls = %v, want issue-a head then independent issue-b; issue-a done must not overtake", lc.calls)
+	}
+	pending, err := s.DrainPendingLinearWrites(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending[0].IssueID != "issue-a" || pending[0].Target != "ready" || pending[1].IssueID != "issue-a" || pending[1].Target != "done" {
+		t.Fatalf("pending after per-issue drain = %+v", pending)
+	}
+}
+
+type failFirstSetStateLinear struct {
+	status string
+	failed bool
+}
+
+type failIssueLinear struct {
+	failIssue string
+	calls     []string
+}
+
+func (*failIssueLinear) CandidateIssues(context.Context) ([]linear.Issue, error) { return nil, nil }
+
+func (c *failIssueLinear) SetState(_ context.Context, issueID, target string) error {
+	c.calls = append(c.calls, issueID+":"+target)
+	if issueID == c.failIssue {
+		return errors.New("permanent issue-specific failure")
+	}
+	return nil
+}
+
+func (*failIssueLinear) Comment(context.Context, string, string) error { return nil }
+
+func (*failIssueLinear) IssueComments(context.Context, string) ([]linear.Comment, error) {
+	return nil, nil
+}
+
+func (c *failFirstSetStateLinear) CandidateIssues(context.Context) ([]linear.Issue, error) {
+	return []linear.Issue{{
+		ID: "issue-1", Identifier: "CLP-1", Status: c.status, Lane: "coder", Priority: 1,
+		BranchName: "issue-1-branch", UpdatedAt: 400,
+	}}, nil
+}
+
+func (c *failFirstSetStateLinear) SetState(_ context.Context, _ string, target string) error {
+	if !c.failed {
+		c.failed = true
+		return errors.New("first mirror attempt failed")
+	}
+	c.status = target
+	return nil
+}
+
+func (*failFirstSetStateLinear) Comment(context.Context, string, string) error { return nil }
+
+func (*failFirstSetStateLinear) IssueComments(context.Context, string) ([]linear.Comment, error) {
+	return nil, nil
 }
 
 // TestTick_PollAdoptsHumanRequeueFromBlocked_ResetsReworkCount asserts the

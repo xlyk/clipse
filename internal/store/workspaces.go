@@ -53,8 +53,9 @@ func (s *Store) UpsertAgentWorkspace(ctx context.Context, workspace AgentWorkspa
 }
 
 // MarkWorkspaceCleanupPending durably schedules an owned workspace for
-// provider deletion. The dispatcher drains these rows independently of the
-// issue transition that requested cleanup.
+// provider-specific cleanup (remote Delete or local worktree Remove). The
+// dispatcher drains these rows independently of the issue transition that
+// requested cleanup.
 func (s *Store) MarkWorkspaceCleanupPending(ctx context.Context, ownerKey string, now int64) error {
 	const q = `
 		UPDATE agent_workspaces
