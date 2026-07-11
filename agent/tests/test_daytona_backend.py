@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 from dataclasses import dataclass, field
 from typing import Any
@@ -475,18 +476,27 @@ class _FakeDaytonaBackend:
 @dataclass
 class _FakeSessionGit:
     pull_calls: list[dict[str, Any]] = field(default_factory=list)
+    add_calls: list[dict[str, Any]] = field(default_factory=list)
     commit_calls: list[dict[str, Any]] = field(default_factory=list)
     push_calls: list[dict[str, Any]] = field(default_factory=list)
+    transcript: list[dict[str, Any]] = field(default_factory=list)
 
-    def pull(self, **kwargs: Any) -> None:
-        self.pull_calls.append(kwargs)
+    def pull(self, path: str, /, **kwargs: Any) -> None:
+        self.pull_calls.append({"path": path, **kwargs})
+        self.transcript.append({"event": "git.pull", "branch": kwargs["branch"]})
+
+    def add(self, path: str, files: list[str]) -> None:
+        self.add_calls.append({"path": path, "files": files})
+        self.transcript.append({"event": "git.add", "files": files})
 
     def commit(self, **kwargs: Any) -> object:
         self.commit_calls.append(kwargs)
+        self.transcript.append({"event": "git.commit", "message": kwargs["message"]})
         return object()
 
     def push(self, **kwargs: Any) -> None:
         self.push_calls.append(kwargs)
+        self.transcript.append({"event": "git.push", "branch": kwargs["branch"]})
 
 
 @dataclass
@@ -581,6 +591,29 @@ def test_daytona_session_git_credentials_are_read_just_in_time() -> None:
     ]
 
 
+def test_daytona_authenticated_git_calls_leave_no_credential_surface(monkeypatch) -> None:
+    token = "ghp_daytona_session_canary"
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    backend = _FakeDaytonaBackend()
+    sdk_sandbox = _FakeSessionSandbox()
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        backend,
+        sdk_sandbox,
+        token_reader=lambda: token,
+        host_runner=lambda _argv: "unused",
+    )
+
+    for result in (session.sync_base("main"), session.push("feat/CLI-1")):
+        config = session.run(["git", "config", "--get-regexp", r"^remote\.origin\."])
+        assert token not in repr(dict(os.environ))
+        assert token not in config.stdout
+        assert token not in repr(result)
+        assert token not in repr(sdk_sandbox.git.transcript)
+
+
 def test_daytona_session_commit_uses_sdk_git_and_github_stays_on_host() -> None:
     host_calls: list[list[str]] = []
     sdk_sandbox = _FakeSessionSandbox()
@@ -594,6 +627,7 @@ def test_daytona_session_commit_uses_sdk_git_and_github_stays_on_host() -> None:
     )
 
     assert session.commit("feat: remote change") == CommandResult(0)
+    assert sdk_sandbox.git.add_calls == [{"path": REMOTE_REPO_ABS, "files": ["."]}]
     assert sdk_sandbox.git.commit_calls == [
         {
             "path": REMOTE_REPO_ABS,

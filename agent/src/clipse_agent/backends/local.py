@@ -29,7 +29,10 @@ class LocalSession:
         )
 
     def sync_base(self, base_branch: str) -> CommandResult:
-        return self.run(["git", "pull", "--no-rebase", "origin", base_branch])
+        fetched = self.run(["git", "fetch", "origin", base_branch])
+        if fetched.returncode != 0:
+            return fetched
+        return self.run(["git", "merge", "--no-edit", f"origin/{base_branch}"])
 
     def commit(self, message: str) -> CommandResult:
         return self.run(["git", "commit", "-m", message])

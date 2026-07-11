@@ -47,6 +47,8 @@ REMOTE_REPO_ABS = "/home/daytona/workspace/clipse"
 class _Git(Protocol):
     def clone(self, **kwargs: Any) -> None: ...
 
+    def add(self, path: str, files: list[str]) -> None: ...
+
 
 class _Sandbox(Protocol):
     id: str
@@ -292,6 +294,12 @@ class DaytonaSession:
     provider: str = field(default="daytona", init=False)
     sandbox_type: str = field(default="daytona", init=False)
 
+    @property
+    def repo_path(self) -> str:
+        """Absolute repository path used by Daytona's Git SDK."""
+
+        return self.cwd
+
     def run(self, argv: Sequence[str]) -> CommandResult:
         try:
             response = self.sandbox.execute(shlex.join(argv))
@@ -312,7 +320,7 @@ class DaytonaSession:
             return failure
         try:
             self.sdk_sandbox.git.pull(
-                path=self.cwd,
+                self.repo_path,
                 username=_GIT_USERNAME,
                 password=token,
                 branch=base_branch,
@@ -324,8 +332,9 @@ class DaytonaSession:
 
     def commit(self, message: str) -> CommandResult:
         try:
+            self.sdk_sandbox.git.add(self.repo_path, ["."])
             self.sdk_sandbox.git.commit(
-                path=self.cwd,
+                path=self.repo_path,
                 message=message,
                 author=GIT_AUTHOR_NAME,
                 email=GIT_AUTHOR_EMAIL,
@@ -340,7 +349,7 @@ class DaytonaSession:
             return failure
         try:
             self.sdk_sandbox.git.push(
-                path=self.cwd,
+                path=self.repo_path,
                 username=_GIT_USERNAME,
                 password=token,
                 branch=branch,
