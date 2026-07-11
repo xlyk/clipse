@@ -174,7 +174,7 @@ func TestCanonicalGitHubRemote(t *testing.T) {
 	}{
 		{
 			name:     "clean HTTPS",
-			remote:   "https://github.com/x/y.git",
+			remote:   "https://github.com/x/y",
 			wantURL:  "https://github.com/x/y.git",
 			wantSlug: "x/y",
 		},
@@ -185,10 +185,72 @@ func TestCanonicalGitHubRemote(t *testing.T) {
 			wantSlug: "x/y",
 		},
 		{
+			name:     "GitHub-safe ASCII components",
+			remote:   "https://github.com/Org_1.test/repo-name_2.git",
+			wantURL:  "https://github.com/Org_1.test/repo-name_2.git",
+			wantSlug: "Org_1.test/repo-name_2",
+		},
+		{
 			name:          "credential-bearing HTTPS",
 			remote:        "https://user:token-secret@github.com/x/y.git",
 			wantErr:       true,
 			forbiddenText: []string{"user", "token-secret", "https://"},
+		},
+		{
+			name:          "SCP query suffix",
+			remote:        "git@github.com:x/y.git?token=ghp_secret",
+			wantErr:       true,
+			forbiddenText: []string{"ghp_secret"},
+		},
+		{
+			name:          "SCP fragment suffix",
+			remote:        "git@github.com:x/y.git#ghp_secret",
+			wantErr:       true,
+			forbiddenText: []string{"ghp_secret"},
+		},
+		{
+			name:          "encoded HTTPS query delimiter",
+			remote:        "https://github.com/x/y.git%3Ftoken=ghp_secret",
+			wantErr:       true,
+			forbiddenText: []string{"ghp_secret"},
+		},
+		{
+			name:          "encoded HTTPS fragment delimiter",
+			remote:        "https://github.com/x/y.git%23ghp_secret",
+			wantErr:       true,
+			forbiddenText: []string{"ghp_secret"},
+		},
+		{
+			name:    "leading whitespace",
+			remote:  " https://github.com/x/y.git",
+			wantErr: true,
+		},
+		{
+			name:          "embedded control",
+			remote:        "https://github.com/x/y.git\n?token=ghp_secret",
+			wantErr:       true,
+			forbiddenText: []string{"ghp_secret"},
+		},
+		{
+			name:          "extra path component",
+			remote:        "https://github.com/x/y/ghp_secret",
+			wantErr:       true,
+			forbiddenText: []string{"ghp_secret"},
+		},
+		{
+			name:    "HTTPS port",
+			remote:  "https://github.com:443/x/y.git",
+			wantErr: true,
+		},
+		{
+			name:    "non-safe component character",
+			remote:  "https://github.com/x/y+z.git",
+			wantErr: true,
+		},
+		{
+			name:    "non-ASCII component character",
+			remote:  "https://github.com/x/répo.git",
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
@@ -197,6 +259,9 @@ func TestCanonicalGitHubRemote(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("CanonicalGitHubRemote error = nil")
+				}
+				if strings.Contains(err.Error(), tt.remote) {
+					t.Errorf("error %q echoed rejected remote", err)
 				}
 				for _, forbidden := range tt.forbiddenText {
 					if strings.Contains(err.Error(), forbidden) {

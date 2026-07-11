@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/xlyk/clipse/dispatcher"
@@ -151,6 +152,46 @@ func TestSpawnAttempt_DaytonaDefaultEnvDropsHostGitHubTokens(t *testing.T) {
 		if _, ok := envValue(env, key); !ok {
 			t.Errorf("Daytona worker Env missing %s: %v", key, env)
 		}
+	}
+}
+
+func TestSpawnAttempt_DaytonaRejectsUnsafeRemoteBeforeLifecycleOrArgv(t *testing.T) {
+	const secret = "ghp_secret"
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+	spawner := newFakeSpawner()
+	manager := &fakeBackendManager{workspace: backend.Workspace{
+		Provider: "daytona", OwnerKey: "owner", ExternalID: "sandbox-1",
+		WorkspacePath: "/home/daytona/workspace/clipse", State: "active",
+	}}
+	cfg := testConfig()
+	cfg.AgentBackend = config.AgentBackend{Type: "daytona", Daytona: config.DaytonaBackend{AutoStopMinutes: 60, ReviewerAutoDeleteMinutes: 60}}
+	cfg.Repo.Remote = "git@github.com:x/y.git?token=" + secret
+	d := dispatcher.New(cfg, s, &linear.MockClient{}, spawner, newStubWorkspacer(t.TempDir()),
+		dispatcher.WithClock(fixedClock(1000)), dispatcher.WithRunIDGenerator(sequentialRunIDs()), dispatcher.WithBackendManager(manager),
+	)
+	if err := d.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.ensures) != 0 {
+		t.Errorf("backend Ensure reached with unsafe remote: %+v", manager.ensures)
+	}
+	if spawner.SpawnCount() != 0 {
+		t.Errorf("SpawnCount = %d, want 0 so no worker argv can carry unsafe remote", spawner.SpawnCount())
+	}
+	snapshot, err := s.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue := snapshot.Issues[0]
+	if issue.BoardStatus != "blocked" {
+		t.Errorf("BoardStatus = %q, want blocked", issue.BoardStatus)
+	}
+	if issue.LatestRun == nil || !issue.LatestRun.Error.Valid {
+		t.Fatal("run error missing")
+	}
+	if strings.Contains(issue.LatestRun.Error.String, secret) || strings.Contains(issue.LatestRun.Error.String, cfg.Repo.Remote) {
+		t.Errorf("stored error leaked unsafe remote: %q", issue.LatestRun.Error.String)
 	}
 }
 

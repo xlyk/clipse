@@ -5,7 +5,7 @@ package backend
 import (
 	"context"
 	"errors"
-	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -82,32 +82,26 @@ type Manager interface {
 // Errors deliberately omit the rejected input because URL userinfo may carry
 // a token.
 func CanonicalGitHubRemote(remote string) (canonicalURL, slug string, err error) {
-	value := strings.TrimSpace(remote)
-	var repoPath string
-	if strings.HasPrefix(value, "git@github.com:") {
-		repoPath = strings.TrimPrefix(value, "git@github.com:")
-	} else {
-		parsed, parseErr := url.Parse(value)
-		if parseErr != nil {
-			return "", "", errors.New("remote is not a valid GitHub URL")
-		}
-		if parsed.User != nil {
-			return "", "", errors.New("remote must not contain credentials")
-		}
-		if parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return "", "", errors.New("remote must be credential-free GitHub HTTPS or SCP-style SSH")
-		}
-		repoPath = parsed.Path
+	matches := githubHTTPSRemote.FindStringSubmatch(remote)
+	if matches == nil {
+		matches = githubSCPRemote.FindStringSubmatch(remote)
 	}
-
-	repoPath = strings.TrimSuffix(strings.Trim(repoPath, "/"), ".git")
-	parts := strings.Split(repoPath, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", errors.New("remote must identify one GitHub owner and repository")
+	if matches == nil {
+		return "", "", errors.New("remote must be credential-free GitHub HTTPS or SCP-style SSH")
 	}
-	slug = parts[0] + "/" + parts[1]
+	owner := matches[1]
+	repo := strings.TrimSuffix(matches[2], ".git")
+	if owner == "" || repo == "" {
+		return "", "", errors.New("remote must be credential-free GitHub HTTPS or SCP-style SSH")
+	}
+	slug = owner + "/" + repo
 	return "https://github.com/" + slug + ".git", slug, nil
 }
+
+var (
+	githubHTTPSRemote = regexp.MustCompile(`\Ahttps://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\z`)
+	githubSCPRemote   = regexp.MustCompile(`\Agit@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\z`)
+)
 
 // ActionError is safe to expose to the kernel. It contains only the typed
 // provider classification and a sanitized message, never stderr or a raw
