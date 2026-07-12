@@ -66,13 +66,13 @@ import logging
 import os
 import subprocess
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from clipse_agent import dac
+from clipse_agent.backends.session import CommandResult
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.profiles.coder import CoderProfile, get_coder_docs_profile, get_coder_profile
 from clipse_agent.tail import parse_structured_tail
@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
     from clipse_agent.dac import DacTurnResult
+    from clipse_agent.backends.session import AgentSession
 
 # Diagnostics only (e.g. a best-effort sync_base fetch/merge failure) -- must
 # never touch stdout, which worker.py reserves for exactly one WorkerResult
@@ -108,15 +109,6 @@ class CoderGraphError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class CommandResult:
-    """The outcome of running one git/gh command."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-
-
 # An injectable stand-in for `subprocess.run`: given an argv and a cwd, run
 # it and report what happened. Tests pass a fake that records calls and
 # replays canned results instead of touching a real git/gh binary.
@@ -140,6 +132,15 @@ def _run(run_command: CommandRunner, argv: Sequence[str], cwd: str, *, check: bo
             f"command failed (exit {result.returncode}): {' '.join(argv)}\nstderr: {result.stderr}"
         )
     return result
+
+
+def _session_runner(session: AgentSession) -> CommandRunner:
+    """Adapt a cwd-owning session to the legacy command-runner shape."""
+
+    def _run_session(argv: Sequence[str], _cwd: str) -> CommandResult:
+        return session.run(argv)
+
+    return _run_session
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +287,11 @@ def load_context(state: CoderState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def make_ensure_worktree(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
+def make_ensure_worktree(
+    run_command: CommandRunner,
+    *,
+    session: AgentSession | None = None,
+) -> Callable[[CoderState], dict[str, Any]]:
     """Validate the worktree the kernel already created for this issue.
 
     Does not `os.chdir` the process -- every downstream git/gh call gets
@@ -299,6 +304,23 @@ def make_ensure_worktree(run_command: CommandRunner) -> Callable[[CoderState], d
         workspace = state.get("workspace")
         if not workspace:
             raise CoderGraphError("ensure_worktree: no workspace path given")
+
+        if session is not None:
+            verified = session.run(["git", "rev-parse", "--is-inside-work-tree"])
+            if verified.returncode != 0 or verified.stdout.strip() != "true":
+                raise CoderGraphError(f"ensure_worktree: not a git worktree: {workspace}")
+
+            cwd = session.cwd
+            updates: dict[str, Any] = {"cwd": cwd}
+            if not state.get("branch"):
+                head = session.run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+                if head.returncode != 0:
+                    raise CoderGraphError(
+                        f"command failed (exit {head.returncode}): git rev-parse --abbrev-ref HEAD\n"
+                        f"stderr: {head.stderr}"
+                    )
+                updates["branch"] = head.stdout.strip()
+            return updates
 
         path = Path(workspace)
         if not path.is_dir():
@@ -336,7 +358,11 @@ def _unmerged_paths(run_command: CommandRunner, cwd: str) -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
+def make_sync_base(
+    run_command: CommandRunner,
+    *,
+    session: AgentSession | None = None,
+) -> Callable[[CoderState], dict[str, Any]]:
     """Bring the worktree up to date with `origin/<base_branch>` before DAC's
     turn starts, so a long-running branch doesn't drift so far from base that
     its eventual PR stops being a clean fast-forward merge.
@@ -383,6 +409,34 @@ def make_sync_base(run_command: CommandRunner) -> Callable[[CoderState], dict[st
             return {"merge_conflict_files": []}
 
         cwd = state["cwd"]
+
+        if session is not None:
+            session_runner = _session_runner(session)
+            merge_head = _run(
+                session_runner,
+                ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                cwd,
+                check=False,
+            )
+            if merge_head.returncode == 0:
+                return {"merge_conflict_files": _unmerged_paths(session_runner, cwd)}
+
+            synced = session.sync_base(base_branch)
+            if synced.returncode == 0:
+                return {"merge_conflict_files": []}
+
+            conflict_files = _unmerged_paths(session_runner, cwd)
+            if conflict_files:
+                return {"merge_conflict_files": conflict_files}
+
+            logger.warning(
+                "sync_base: session sync for %s failed with no conflicting files (exit %d): %s -- aborting the merge",
+                base_branch,
+                synced.returncode,
+                synced.stderr.strip(),
+            )
+            _run(session_runner, ["git", "merge", "--abort"], cwd, check=False)
+            return {"merge_conflict_files": []}
 
         merge_head = _run(run_command, ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd, check=False)
         if merge_head.returncode == 0:
@@ -723,15 +777,16 @@ def _parse_porcelain_paths(porcelain_output: str) -> list[str]:
 
 def _commit_message(state: CoderState) -> str:
     issue_id = state.get("issue_id", "")
+    prefix = f"{issue_id}: " if issue_id else ""
     tail = parse_structured_tail(state.get("dac_last_text") or "")
     if tail.title:
-        return f"{issue_id}: {tail.title}"[:72]
+        return f"{prefix}{tail.title}"[:72]
     # Legacy fallback: a turn that skipped the STATUS/TITLE tail still gets a
     # message from the DAC summary's first narration line.
     turn = state.get("turn_count", 0) + 1
     summary_lines = (state.get("dac_summary") or "").strip().splitlines()
     headline = summary_lines[0] if summary_lines else f"turn {turn}"
-    return f"{issue_id}: {headline}"[:72]
+    return f"{prefix}{headline}"[:72]
 
 
 _CONFLICT_MARKER_PATTERN = r"^(<<<<<<<|>>>>>>>)"
@@ -767,7 +822,11 @@ def _unresolved_conflict_markers(run_command: CommandRunner, cwd: str, files: Se
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
+def make_commit(
+    run_command: CommandRunner,
+    *,
+    session: AgentSession | None = None,
+) -> Callable[[CoderState], dict[str, Any]]:
     """Stage and commit whatever this turn changed.
 
     `git add -A` always runs (harmless when there's nothing to add) and is
@@ -806,22 +865,38 @@ def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, 
 
     def _node(state: CoderState) -> dict[str, Any]:
         cwd = state["cwd"]
+        resolved_run_command = _session_runner(session) if session is not None else run_command
         conflict_files = state.get("merge_conflict_files") or []
         merging = bool(conflict_files)
 
         if merging:
-            unresolved = _unresolved_conflict_markers(run_command, cwd, conflict_files)
+            unresolved = _unresolved_conflict_markers(resolved_run_command, cwd, conflict_files)
             if unresolved:
                 raise CoderGraphError(f"unresolved conflict markers remain in: {', '.join(unresolved)}")
 
-        _run(run_command, ["git", "add", "-A"], cwd)
-        status = _run(run_command, ["git", "status", "--porcelain"], cwd)
+        _run(resolved_run_command, ["git", "add", "-A"], cwd)
+        status = _run(resolved_run_command, ["git", "status", "--porcelain"], cwd)
         paths = _parse_porcelain_paths(status.stdout)
 
         committed = False
         if paths or merging:
             if merging:
-                _run(run_command, ["git", "commit", "--no-edit"], cwd)
+                if session is not None:
+                    committed_result = session.commit_merge()
+                    if committed_result.returncode != 0:
+                        raise CoderGraphError(
+                            f"command failed (exit {committed_result.returncode}): git commit --no-edit\n"
+                            f"stderr: {committed_result.stderr}"
+                        )
+                else:
+                    _run(run_command, ["git", "commit", "--no-edit"], cwd)
+            elif session is not None:
+                committed_result = session.commit(_commit_message(state))
+                if committed_result.returncode != 0:
+                    raise CoderGraphError(
+                        f"command failed (exit {committed_result.returncode}): git commit\n"
+                        f"stderr: {committed_result.stderr}"
+                    )
             else:
                 _run(run_command, ["git", "commit", "-m", _commit_message(state)], cwd)
             committed = True
@@ -836,12 +911,23 @@ def make_commit(run_command: CommandRunner) -> Callable[[CoderState], dict[str, 
 # ---------------------------------------------------------------------------
 
 
-def make_push(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
+def make_push(
+    run_command: CommandRunner,
+    *,
+    session: AgentSession | None = None,
+) -> Callable[[CoderState], dict[str, Any]]:
     """Push the branch. `--set-upstream` makes this safe to call every
     turn, whether or not this is the branch's first push."""
 
     def _node(state: CoderState) -> dict[str, Any]:
-        _run(run_command, ["git", "push", "--set-upstream", "origin", state["branch"]], state["cwd"])
+        if session is not None:
+            pushed = session.push(state["branch"])
+            if pushed.returncode != 0:
+                raise CoderGraphError(
+                    f"command failed (exit {pushed.returncode}): git push\nstderr: {pushed.stderr}"
+                )
+        else:
+            _run(run_command, ["git", "push", "--set-upstream", "origin", state["branch"]], state["cwd"])
         return {}
 
     return _node
@@ -875,7 +961,11 @@ def _pr_body(state: CoderState) -> str:
     return body
 
 
-def make_open_pr(run_command: CommandRunner) -> Callable[[CoderState], dict[str, Any]]:
+def make_open_pr(
+    run_command: CommandRunner,
+    *,
+    session: AgentSession | None = None,
+) -> Callable[[CoderState], dict[str, Any]]:
     """Idempotently open (or reuse) the PR for this issue's branch.
 
     `gh pr view <branch> --json url` first; a PR already exists iff that
@@ -895,6 +985,38 @@ def make_open_pr(run_command: CommandRunner) -> Callable[[CoderState], dict[str,
     def _node(state: CoderState) -> dict[str, Any]:
         branch = state["branch"]
         cwd = state["cwd"]
+
+        if session is not None:
+            view = session.github(["pr", "view", branch, "--json", "url", "--jq", ".url"])
+            if view.returncode == 0:
+                return {"pr_url": view.stdout.strip()}
+
+            base_branch = state.get("base_branch") or "main"
+            ahead = session.run(["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"])
+            if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+                return {"pr_url": ""}
+
+            created = session.github(
+                [
+                    "pr",
+                    "create",
+                    "--draft",
+                    "--head",
+                    branch,
+                    "--base",
+                    base_branch,
+                    "--title",
+                    _pr_title(state),
+                    "--body",
+                    _pr_body(state),
+                ]
+            )
+            if created.returncode != 0:
+                raise CoderGraphError(
+                    f"command failed (exit {created.returncode}): gh pr create\nstderr: {created.stderr}"
+                )
+            url = next((line.strip() for line in reversed(created.stdout.splitlines()) if line.strip()), "")
+            return {"pr_url": url}
 
         view = _run(run_command, ["gh", "pr", "view", branch, "--json", "url"], cwd, check=False)
         if view.returncode == 0:
@@ -1080,6 +1202,7 @@ def build_coder_graph(
     turn_driver: TurnDriver = dac.drive_turn,
     run_command: CommandRunner | None = None,
     transcript: TranscriptWriter | None = None,
+    session: AgentSession | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Build and compile the Coder lane's graph.
 
@@ -1112,18 +1235,17 @@ def build_coder_graph(
     resolved_profile = profile if profile is not None else get_coder_profile()
     resolved_docs_profile = docs_profile if docs_profile is not None else get_coder_docs_profile()
     resolved_run_command = run_command if run_command is not None else _default_run_command
-
     graph: StateGraph[CoderState, Any, Any, Any] = StateGraph(CoderState)
     graph.add_node("load_context", load_context)
-    graph.add_node("ensure_worktree", make_ensure_worktree(resolved_run_command))
-    graph.add_node("sync_base", make_sync_base(resolved_run_command))
+    graph.add_node("ensure_worktree", make_ensure_worktree(resolved_run_command, session=session))
+    graph.add_node("sync_base", make_sync_base(resolved_run_command, session=session))
     graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer, transcript))
     graph.add_node(
         "run_docs", make_run_docs(resolved_docs_profile, agent_factory, turn_driver, checkpointer, transcript)
     )
-    graph.add_node("commit", make_commit(resolved_run_command))
-    graph.add_node("push", make_push(resolved_run_command))
-    graph.add_node("open_PR", make_open_pr(resolved_run_command))
+    graph.add_node("commit", make_commit(resolved_run_command, session=session))
+    graph.add_node("push", make_push(resolved_run_command, session=session))
+    graph.add_node("open_PR", make_open_pr(resolved_run_command, session=session))
     graph.add_node("emit_result", emit_result)
 
     graph.add_edge(START, "load_context")

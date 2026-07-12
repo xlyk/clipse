@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/xlyk/clipse/internal/backend"
 	"github.com/xlyk/clipse/internal/config"
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/spawn"
@@ -29,6 +31,10 @@ type Workspacer interface {
 	// (Documentation is written inside the Coder lane's own turn, in this
 	// same worktree, so there is no separate docs-branch workspace.)
 	Ensure(issue store.Issue) (string, error)
+
+	// Remove idempotently removes issue's worktree and local branch. Terminal
+	// local cleanup may be retried after a partial failure or restart.
+	Remove(issue store.Issue) error
 }
 
 // inflightRun tracks one runID the dispatcher has spawned but not yet
@@ -67,6 +73,7 @@ type Dispatcher struct {
 	linear  linear.Client
 	spawner spawn.Spawner
 	ws      Workspacer
+	backend backend.Manager
 
 	now      func() int64
 	newRunID func() string
@@ -121,6 +128,13 @@ func WithRunIDGenerator(gen func() string) Option {
 // cfg.EnvAllowlist.
 func WithEnvFor(envFor func(issue store.Issue) []string) Option {
 	return func(d *Dispatcher) { d.envFor = envFor }
+}
+
+// WithBackendManager installs the provider-neutral remote workspace manager.
+// Local mode never consults it; the dispatch composition root supplies it
+// only when agent_backend.type is daytona.
+func WithBackendManager(manager backend.Manager) Option {
+	return func(d *Dispatcher) { d.backend = manager }
 }
 
 // WithLogger overrides the default slog logger used for dispatcher lifecycle
@@ -290,11 +304,21 @@ func (d *Dispatcher) ttl() int64 {
 // overall pass reads as a checklist; see the package doc and the phase
 // methods themselves for the reasoning behind the ordering.
 func (d *Dispatcher) Tick(ctx context.Context) error {
-	if err := d.pollAndUpsert(ctx); err != nil {
-		return fmt.Errorf("tick: poll: %w", err)
-	}
-	if err := d.reconcile(ctx); err != nil {
-		return fmt.Errorf("tick: reconcile: %w", err)
+	pollErr := d.pollAndUpsert(ctx)
+	reconcileErr := d.reconcile(ctx)
+	cleanupErr := d.drainWorkspaceCleanup(ctx)
+	if pollErr != nil || reconcileErr != nil || cleanupErr != nil {
+		var joined []error
+		if pollErr != nil {
+			joined = append(joined, fmt.Errorf("tick: poll: %w", pollErr))
+		}
+		if reconcileErr != nil {
+			joined = append(joined, fmt.Errorf("tick: reconcile: %w", reconcileErr))
+		}
+		if cleanupErr != nil {
+			joined = append(joined, fmt.Errorf("tick: drain workspace cleanup: %w", cleanupErr))
+		}
+		return errors.Join(joined...)
 	}
 	if err := d.promote(ctx); err != nil {
 		return fmt.Errorf("tick: promote: %w", err)

@@ -1,13 +1,13 @@
 # AGENTS.md — Clipse agent & contributor guide
 
-Clipse turns Linear issues into merged PRs. A Go **dispatcher/kernel** polls Linear, atomically claims work into local SQLite, spawns per-issue Python **LangGraph + Deep Agents Code (DAC)** worker subprocesses in git worktrees, and owns every board transition off the worker's typed JSON result. The kernel is deterministic and LLM-free; the LLM lives only in the worker.
+Clipse turns Linear issues into merged PRs. A Go **dispatcher/kernel** polls Linear, atomically claims work into local SQLite, spawns per-issue Python **LangGraph + Deep Agents Code (DAC)** workers against the configured agent backend, and owns every board transition from the worker's typed JSON result. The kernel is deterministic and LLM-free; the LLM lives only in the worker.
 
 Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased work + acceptance criteria: `docs/plans/2026-07-01-clipse-implementation-plan.md`. Applied code-review amendments: `docs/plans/2026-07-01-plan-amendments.md`.
 
 ## Status
 
 - **Phase 0 (scaffold + contract) and Phase 1 (zero-LLM Go kernel) are complete** — built test-first against a fake worker (`testworker`) and a mocked Linear, `go test -race ./...` clean.
-- **Phase 2 (real DAC coder worker) and Phase 3 (reviewer / git-operator lanes, auto-merge; documentation folded into the coder graph) are complete**: the coder and reviewer lanes run real DAC turns, `internal/gitops` owns the CI-and-branch-protection merge gate, per-lane models and the `shell_allow_list` policy are configurable, and the live eval suite (`make eval`) exercises both lanes end to end against the real model + `gh`. Still pending for any lane configured on the `openai_codex` model provider: a one-time interactive ChatGPT sign-in on the dispatcher host, run as the same OS user the dispatcher runs as (`uv --project agent run dcode` → `/auth` → `openai_codex`; token lands at `~/.deepagents/.state/chatgpt-auth.json`, reachable because `HOME` is already in the env allow-list; auto-refreshes after).
+- **Phase 2 (real DAC coder worker) and Phase 3 (reviewer / git-operator lanes, auto-merge; documentation folded into the coder graph) are complete**: the coder and reviewer lanes run real DAC turns, `internal/gitops` owns the CI-and-branch-protection merge gate, per-lane models and the `shell_allow_list` policy are configurable, and the live eval suite (`make eval`) exercises both lanes end to end against the real model + `gh`. The recommended Daytona backend runs DAC filesystem/shell tools in remote sandboxes; local worktrees remain the compatibility default when `agent_backend` is absent. Still pending for any lane configured on the `openai_codex` model provider: a one-time interactive ChatGPT sign-in on the dispatcher host, run as the same OS user the dispatcher runs as (`uv --project agent run dcode` → `/auth` → `openai_codex`; token lands at `~/.deepagents/.state/chatgpt-auth.json`; auto-refreshes after).
 
 ## Build, test, run
 
@@ -26,6 +26,7 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
   that suite when bumping the DAC pin). Model override:
   `CLIPSE_EVAL_MODEL=openai_codex:gpt-5-codex make eval`. See
   `agent/evals/README.md`.
+- `make smoke-daytona-backend` — opt-in production-path Daytona smoke; opens a draft PR, runs coder/reviewer DAC turns, never merges, and cleans all live resources.
 
 Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard), `clipse board plan|apply` (bootstrap a Linear board from a `board.yaml` spec — see Board bootstrap below). Kernel tests need **no** network or LLM.
 
@@ -51,6 +52,7 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 
 - `LINEAR_API_KEY` is kernel-only; `internal/config` rejects it in `env_allowlist`.
 - Workers may inherit only allow-listed env such as `ANTHROPIC_API_KEY`, `GH_TOKEN`/`GITHUB_TOKEN`, `HOME`, and `PATH`.
+- Daytona controller actions may inherit `DAYTONA_API_KEY`; local workers never do. Host `gh` credentials pass only as Daytona SDK Git method arguments, never through sandbox env, Git config, prompts, transcripts, results, or argv.
 - `openai_codex:*` stores OAuth under inherited `HOME`; treat `chatgpt-auth.json` as an account credential.
 - Default `shell_allow_list: all` means unrestricted shell. Narrow it for lower-trust issues.
 <!-- managed:readme-agents-doc:section=SECURITY:END -->
@@ -73,6 +75,8 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 - **Docs are inside the coder graph** — there is no `documentation` column, `scribe` lane, or `-docs` worktree.
 - **`max_tokens_per_run` is per DAC round** — it is a context guard after auto-compaction, not a cumulative spend cap.
 - **Codex auth is user-sensitive** — `/auth` must run as the dispatcher OS user so worker `HOME` finds the token.
+- **Daytona never falls back to local** — lifecycle/preflight failures use the normal typed block/retry path. Do not add an automatic host-worktree fallback.
+- **Workspace cleanup is durable** — terminal coder workspaces and every reviewer workspace are queued in SQLite; the dispatcher retries cleanup and reconciles provider inventory on startup.
 <!-- managed:readme-agents-doc:section=GOTCHAS:END -->
 
 ## Layout
@@ -86,10 +90,12 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 - `internal/boardspec` — pure board-bootstrap: parse/validate `board.yaml`, the ref+sha content marker, and the create/update/skip reconciliation plan (no network, no LLM). Distinct from `internal/board` (the kernel state machine).
 - `internal/linear/bootstrap` — the Linear mutation client (`issueCreate`/`issueUpdate`/`issueRelationCreate`/label ensure) that executes a `boardspec` plan. Walled off from `internal/linear.HTTPClient` so the dispatcher can never create or delete issues.
 - `internal/spawn` — `Spawner` + local impl, `testworker` process control, git worktree lifecycle, orphan reaping.
+- `internal/backend` — provider-neutral lifecycle manager and command-backed Daytona protocol.
 - `internal/linear` — GraphQL `Client`, normalize, in-memory mock, writes.
 - `internal/contract` — **generated** Go types (do not edit).
 - `schema/` — `worker-result.schema.json` + `board.schema.json`, the shared source of truth.
 - `agent/` — uv Python project; `clipse-worker` entrypoint; `contract.py` is **generated**.
+- `agent/src/clipse_agent/backends/` — local/Daytona sessions, lifecycle contracts, and trusted host GitHub helpers.
 - `testworker/` — Go fake worker emitting canned schema-valid JSON (kernel regression harness; stays in the tree permanently).
 - `configs/clipse.example.yaml` — config shape; `configs/board.example.yaml` — board-spec shape (see `schema/board-spec.schema.json`, a reference-only schema, not codegen'd).
 - `skills/clipse-board-bootstrap` — repo-versioned skill: turns a prose project plan into a schema-valid `board.yaml` for `clipse board apply`. The LLM decomposition lives here, never in Go.
@@ -171,7 +177,7 @@ once the tool has a live-Linear run behind it.
 
 - **Documentation is a coder-graph step, not a lane** (reversed design decision D3): `graphs/coder.py`'s `run_docs` node drives a best-effort docs DAC turn (restricted `get_coder_docs_profile`) right before the PR is opened, so docs ride the same commit/PR as the code and get reviewed. A merged PR goes `merging → done` directly. This removed the `documentation` column, the `scribe` lane, and the `-docs` branch/worktree apparatus (`EnsureDocs`/`EnsureDocsWorktree`) — and with it the non-fast-forward push bug and the `-docs` worktree leak.
 - **Cross-lane claiming**: `board.Next` resolves reviewer outcomes while the issue sits at `review` and git-operator outcomes at `merging`; `store.ClaimColumn` claims per-column (`ClaimReady` still handles only `ready`→`running` for the coder). Shipped (decision P).
-- **Worktree cleanup**: the coder worktree + branch are removed by `internal/gitops` after a successful merge (decision F). The dead `Workspacer.Remove` was deleted. Cleanup on a non-merged terminal state (`cancelled`) is still unwired.
+- **Workspace cleanup**: `internal/gitops` removes the local coder worktree and branch after a successful merge (decision F). Terminal `done` and `cancelled` transitions now schedule provider-neutral workspace cleanup; Daytona deletion is retried from SQLite, and local cancellation removes the worktree through the same reconciliation path.
 - **Rework feedback carries the reviewer's rollup, not its inline findings**: `store.LatestReworkFeedback` → `CLIPSE_REVIEW_FEEDBACK` threads the newest `changes_requested` run's `summary` into the coder's rework re-run (fixed the byte-identical dead-loop). But that summary can go vague ("diff unchanged, same findings") instead of restating the actionable per-line findings, so convergence can hinge on the coder recovering specifics from the PR/context. Thread the reviewer's inline PR comments (or make `graphs/reviewer.py` always restate findings in its summary) so a rework turn always gets the actual asks.
 - **Linear `SetState`** — ✅ done (Phase 2): the HTTP client resolves `contract.Column` → per-team workflow-state id (fetch the team's states, map by name via the inverse of `statusFromWorkflowName`, cached) and scopes the candidate-issue query to the configured team.
 - **Git-operator is deterministic Go** (`internal/gitops`), not a DAC lane (decision O / amended J) — merge/tag/cleanup + CI-and-branch-protection gating live in the kernel in Phase 3.

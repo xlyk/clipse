@@ -30,6 +30,51 @@ func TestOpen_MigratesEmptyDB_CreatesLinearWrites(t *testing.T) {
 	}
 }
 
+func TestOpen_MigratesPreAgentWorkspaceDBIdempotently(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clipse.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: unexpected error: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE legacy_marker (value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("creating pre-feature marker table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO legacy_marker (value) VALUES ('preserve-me')`); err != nil {
+		t.Fatalf("seeding pre-feature marker table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing pre-feature db: %v", err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		s, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("Open attempt %d: unexpected error: %v", attempt, err)
+		}
+		var marker string
+		if err := s.DB().QueryRow(`SELECT value FROM legacy_marker`).Scan(&marker); err != nil {
+			s.Close()
+			t.Fatalf("reading preserved marker after Open attempt %d: %v", attempt, err)
+		}
+		if marker != "preserve-me" {
+			s.Close()
+			t.Fatalf("marker after Open attempt %d = %q, want %q", attempt, marker, "preserve-me")
+		}
+		for _, name := range []string{"agent_workspaces", "idx_agent_workspaces_issue", "idx_agent_workspaces_cleanup"} {
+			var got string
+			if err := s.DB().QueryRow(`SELECT name FROM sqlite_master WHERE name = ?`, name).Scan(&got); err != nil {
+				s.Close()
+				t.Fatalf("schema object %q missing after Open attempt %d: %v", name, attempt, err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close attempt %d: unexpected error: %v", attempt, err)
+		}
+	}
+}
+
 // TestOpen_MigratesEmptyDB_RunsHasProcStartedAt asserts that a fresh runs
 // table includes the proc_started_at column used for PID-identity checks on
 // dispatcher-restart orphan recovery (A1).

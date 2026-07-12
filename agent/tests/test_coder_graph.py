@@ -24,6 +24,8 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from clipse_agent import dac
+from clipse_agent.backends import local
+from clipse_agent.backends.local import LocalSession
 from clipse_agent.contract import BlockKind, Lane, Outcome, WorkerResult
 from clipse_agent.dac import DacTurnResult
 from clipse_agent.graphs import coder
@@ -186,6 +188,85 @@ class _FakeTranscript:
         return _sink
 
 
+class RecordingSession:
+    """Graph-facing remote session with scripted repository state.
+
+    Ordinary ``run`` calls are answered in memory; only the high-level
+    repository operations are recorded so routing assertions stay focused on
+    the session contract rather than its implementation details.
+    """
+
+    provider = "daytona"
+    sandbox = object()
+    sandbox_type = "daytona"
+
+    def __init__(
+        self,
+        *,
+        cwd: str = "/home/daytona/workspace/clipse",
+        branch: str = "feat/CLI-1",
+        changed_files: str = " M src/feature.py\n",
+        sync_result: coder.CommandResult | None = None,
+        unmerged_files: str = "",
+        unresolved_markers: str = "",
+        merge_commit_result: coder.CommandResult | None = None,
+        pr_url: str = "https://github.com/xlyk/clipse/pull/1",
+    ) -> None:
+        self.cwd = cwd
+        self.branch = branch
+        self.changed_files = changed_files
+        self.sync_result = sync_result or coder.CommandResult(0)
+        self.unmerged_files = unmerged_files
+        self.unresolved_markers = unresolved_markers
+        self.merge_commit_result = merge_commit_result or coder.CommandResult(0)
+        self.pr_url = pr_url
+        self.operations: list[tuple[Any, ...]] = []
+
+    def run(self, argv: Sequence[str]) -> coder.CommandResult:
+        command = list(argv)
+        if command == ["git", "rev-parse", "--is-inside-work-tree"]:
+            self.operations.append(("verify_repo",))
+            return coder.CommandResult(0, "true\n")
+        if command == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return coder.CommandResult(0, f"{self.branch}\n")
+        if command == ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+            return coder.CommandResult(1, "", "fatal: Needed a single revision")
+        if command == ["git", "diff", "--name-only", "--diff-filter=U"]:
+            return coder.CommandResult(0, self.unmerged_files)
+        if command[:2] == ["grep", "-lE"]:
+            return coder.CommandResult(0 if self.unresolved_markers else 1, self.unresolved_markers)
+        if command == ["git", "status", "--porcelain"]:
+            return coder.CommandResult(0, self.changed_files)
+        if command[:3] == ["git", "rev-list", "--count"]:
+            return coder.CommandResult(0, "1\n")
+        return coder.CommandResult(0)
+
+    def sync_base(self, base_branch: str) -> coder.CommandResult:
+        self.operations.append(("sync_base", base_branch))
+        return self.sync_result
+
+    def commit(self, message: str) -> coder.CommandResult:
+        self.operations.append(("commit", message))
+        return coder.CommandResult(0)
+
+    def commit_merge(self) -> coder.CommandResult:
+        self.operations.append(("commit_merge",))
+        return self.merge_commit_result
+
+    def push(self, branch: str) -> coder.CommandResult:
+        self.operations.append(("push", branch))
+        return coder.CommandResult(0)
+
+    def github(self, argv: Sequence[str]) -> coder.CommandResult:
+        command = tuple(argv)
+        self.operations.append(("github", command))
+        if command[:2] == ("pr", "view"):
+            return coder.CommandResult(0, self.pr_url)
+        if command[:2] == ("pr", "create"):
+            return coder.CommandResult(0, f"{self.pr_url}\n")
+        return coder.CommandResult(0)
+
+
 async def _drive(
     graph: Any, input_state: dict[str, Any], config: dict[str, Any]
 ) -> tuple[list[str], WorkerResult]:
@@ -314,6 +395,220 @@ def test_happy_path_runs_full_node_order_and_emits_needs_review(tmp_path):
     assert all(c["checkpointer"] is None and c["cwd"] == str(Path(workspace).resolve()) for c in agent_calls)
     assert agent_calls[0]["profile"].assistant_id == "clipse-coder"
     assert agent_calls[1]["profile"].assistant_id == "clipse-coder-docs"
+
+
+def test_remote_session_routes_the_happy_path_without_host_path_checks(monkeypatch):
+    session = RecordingSession()
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Implemented the issue.",
+        tokens_in=1,
+        tokens_out=1,
+        last_text="STATUS: done\nTITLE: feat: implement issue",
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        session=session,
+    )
+
+    def reject_host_path(_value: object) -> object:
+        pytest.fail("remote workspace must not be inspected with host pathlib")
+
+    monkeypatch.setattr(coder, "Path", reject_host_path)
+    input_state: coder.CoderState = {
+        "issue_id": "",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "workspace": session.cwd,
+        "branch": "feat/CLI-1",
+        "base_branch": "main",
+        "issue_text": "Implement the issue.",
+    }
+
+    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-1"}}))
+
+    assert order == [
+        "load_context",
+        "ensure_worktree",
+        "sync_base",
+        "run_DAC",
+        "run_docs",
+        "commit",
+        "push",
+        "open_PR",
+        "emit_result",
+    ]
+    assert result.outcome == Outcome.needs_review
+    assert session.operations == [
+        ("verify_repo",),
+        ("sync_base", "main"),
+        ("commit", "feat: implement issue"),
+        ("push", "feat/CLI-1"),
+        ("github", ("pr", "view", "feat/CLI-1", "--json", "url", "--jq", ".url")),
+    ]
+
+
+def test_remote_session_merge_conflict_reaches_dac() -> None:
+    session = RecordingSession(
+        sync_result=coder.CommandResult(1, "", "CONFLICT (content)"),
+        unmerged_files="src/a.py\n",
+    )
+    turn_calls: list[dict[str, Any]] = []
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Resolved the conflict.",
+        tokens_in=1,
+        tokens_out=1,
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, turn_calls),
+        session=session,
+    )
+    input_state: coder.CoderState = {
+        "issue_id": "CLI-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "workspace": session.cwd,
+        "branch": session.branch,
+        "base_branch": "main",
+        "issue_text": "Implement the issue.",
+    }
+
+    _, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-1"}}))
+
+    code_call = next(call for call in turn_calls if not _is_docs_turn(call["config"]))
+    assert "src/a.py" in code_call["task_text"]
+    assert "Implement the issue." not in code_call["task_text"]
+    assert result.outcome == Outcome.needs_review
+    assert ("commit_merge",) in session.operations
+
+
+def test_remote_session_merge_commit_failure_blocks_push_and_pr() -> None:
+    session = RecordingSession(
+        sync_result=coder.CommandResult(1, "", "CONFLICT (content)"),
+        unmerged_files="src/a.py\n",
+        merge_commit_result=coder.CommandResult(1, "", "merge commit failed"),
+    )
+    turn_result = DacTurnResult(
+        outcome_hint="completed",
+        final_text="Resolved the conflict.",
+        tokens_in=1,
+        tokens_out=1,
+    )
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        session=session,
+    )
+    input_state: coder.CoderState = {
+        "issue_id": "CLI-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "workspace": session.cwd,
+        "branch": session.branch,
+        "base_branch": "main",
+        "issue_text": "Implement the issue.",
+    }
+
+    with pytest.raises(coder.CoderGraphError, match="merge commit failed"):
+        asyncio.run(graph.ainvoke(input_state, {"configurable": {"thread_id": "thread-1"}}))
+
+    assert ("commit_merge",) in session.operations
+    assert not any(operation[0] in {"push", "github"} for operation in session.operations)
+
+
+def test_remote_session_unresolved_markers_block_commit() -> None:
+    session = RecordingSession(unresolved_markers="src/a.py\n")
+    node = coder.make_commit(FakeRunner(), session=session)
+
+    with pytest.raises(coder.CoderGraphError, match="src/a.py"):
+        node(
+            {
+                "cwd": session.cwd,
+                "issue_id": "CLI-1",
+                "merge_conflict_files": ["src/a.py"],
+            }
+        )
+
+    assert not any(operation[0] in {"commit", "push"} for operation in session.operations)
+
+
+def test_local_session_fallback_retains_legacy_graph_command_order(tmp_path):
+    runner = _base_runner()
+    turn_result = DacTurnResult(outcome_hint="completed", final_text="done", tokens_in=1, tokens_out=1)
+    graph = coder.build_coder_graph(
+        agent_factory=_fake_agent_factory([]),
+        turn_driver=_fake_turn_driver(turn_result, []),
+        run_command=runner,
+    )
+    input_state: coder.CoderState = {
+        "issue_id": "CLI-1",
+        "run_id": "run-1",
+        "thread_id": "thread-1",
+        "workspace": _worktree(tmp_path),
+        "branch": "feat/CLI-1",
+        "base_branch": "main",
+        "issue_text": "Implement the issue.",
+    }
+
+    asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-1"}}))
+
+    relevant = [
+        call.argv
+        for call in runner.calls
+        if call.argv[:2]
+        in [
+            ["git", "fetch"],
+            ["git", "merge"],
+            ["git", "add"],
+            ["git", "status"],
+            ["git", "commit"],
+            ["git", "push"],
+            ["gh", "pr"],
+        ]
+    ]
+    assert relevant == [
+        ["git", "fetch", "origin", "main"],
+        ["git", "merge", "--no-edit", "origin/main"],
+        ["git", "add", "-A"],
+        ["git", "status", "--porcelain"],
+        ["git", "commit", "-m", "CLI-1: done"],
+        ["git", "push", "--set-upstream", "origin", "feat/CLI-1"],
+        ["gh", "pr", "view", "feat/CLI-1", "--json", "url"],
+        [
+            "gh",
+            "pr",
+            "create",
+            "--draft",
+            "--head",
+            "feat/CLI-1",
+            "--base",
+            "main",
+            "--title",
+            "CLI-1: done",
+            "--body",
+            "Implements CLI-1.\n\ndone\n\nDocumentation: done",
+        ],
+    ]
+
+
+def test_local_session_sync_base_retains_fetch_then_merge_order(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(local.subprocess, "run", fake_run)
+    session = LocalSession("/work/issue-1", "xlyk/clipse")
+
+    assert session.sync_base("main") == coder.CommandResult(0)
+    assert calls == [
+        ["git", "fetch", "origin", "main"],
+        ["git", "merge", "--no-edit", "origin/main"],
+    ]
 
 
 def test_build_coder_graph_threads_transcript_to_both_dac_turns(tmp_path):

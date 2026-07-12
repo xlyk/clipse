@@ -192,6 +192,36 @@ func TestRenderStatus_EmptySnapshot(t *testing.T) {
 	}
 }
 
+func TestRenderStatus_BackendWorkspaceColumns(t *testing.T) {
+	snap := store.Snapshot{
+		CountsByStatus: map[string]int{"running": 1, "ready": 1},
+		Issues: []store.IssueSnapshot{
+			{
+				Issue:     store.Issue{ID: "issue-1", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "running"},
+				Workspace: &store.AgentWorkspace{Provider: "daytona", Role: "coder", State: store.WorkspaceActive, ExternalID: "sb-123456789"},
+			},
+			{Issue: store.Issue{ID: "issue-2", Identifier: "CLP-2", LaneLabel: "coder", BoardStatus: "ready"}},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := cli.RenderStatus(&buf, snap); err != nil {
+		t.Fatalf("RenderStatus: %v", err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "daytona  coder  active  sb-12345") {
+		t.Fatalf("status missing backend columns:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "CLP-2") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 || strings.Join(fields[len(fields)-4:], " ") != "- - - -" {
+				t.Fatalf("local/no-workspace row missing backend placeholders: %q", line)
+			}
+		}
+	}
+}
+
 func TestStatusCmd_Help(t *testing.T) {
 	cmd := cli.NewRootCmd()
 	var out bytes.Buffer

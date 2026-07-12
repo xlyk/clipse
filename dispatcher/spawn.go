@@ -3,10 +3,13 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/xlyk/clipse/internal/backend"
 	"github.com/xlyk/clipse/internal/contract"
 	"github.com/xlyk/clipse/internal/spawn"
 	"github.com/xlyk/clipse/internal/store"
@@ -29,12 +32,48 @@ import (
 // process to Wait on, so this can't flow through the normal
 // applyResult/runResult path.
 func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID, lane, threadID string, turn int, reviewFeedback string) error {
-	// Every spawned lane (coder/reviewer) operates on the issue's own branch.
-	workspace, err := d.ws.Ensure(issue)
+	// Local lanes operate on the issue's git worktree. Daytona lanes first
+	// ensure their role-scoped sandbox, then launch the local Python worker as
+	// a remote-session coordinator against the returned repository path.
+	var (
+		workspace       string
+		remoteWorkspace backend.Workspace
+		repoURL         string
+		repoSlug        string
+		err             error
+	)
+	if d.cfg.AgentBackend.Type == "daytona" {
+		repoURL, repoSlug, err = backend.CanonicalGitHubRemote(d.cfg.Repo.Remote)
+		if err != nil {
+			err = &backend.ActionError{Kind: backend.ErrorKindNeedsInput, Op: "ensure", Msg: "repo remote is not a safe GitHub remote"}
+		} else if d.backend == nil {
+			err = &backend.ActionError{Kind: backend.ErrorKindCapability, Op: "ensure", Msg: "Daytona backend manager is not configured"}
+		} else {
+			remoteWorkspace, err = d.backend.Ensure(ctx, backend.EnsureRequest{
+				Provider:                  "daytona",
+				Role:                      lane,
+				IssueID:                   issue.ID,
+				RunID:                     runID,
+				RepoURL:                   repoURL,
+				RepoSlug:                  repoSlug,
+				BaseBranch:                d.cfg.Repo.BaseBranch,
+				Branch:                    issue.BranchName,
+				AutoStopMinutes:           d.cfg.AgentBackend.Daytona.AutoStopMinutes,
+				ReviewerAutoDeleteMinutes: d.cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes,
+				Snapshot:                  d.cfg.AgentBackend.Daytona.Snapshot,
+				Target:                    d.cfg.AgentBackend.Daytona.Target,
+			})
+			workspace = remoteWorkspace.WorkspacePath
+		}
+	} else {
+		workspace, err = d.ws.Ensure(issue)
+	}
 	if err != nil {
-		// A workspace/spawn failure is transient by nature, so it is eligible
-		// for bounded auto-retry (auto-unblock layer 1); parkOrRetry falls back
-		// to blockOnSpawnFailure once the budget is spent (or RecoverCap is 0).
+		// Local workspace failures are transient and consume the bounded recovery
+		// budget. Daytona lifecycle failures preserve ActionError's typed
+		// classification: transient retries, while needs_input/capability park
+		// immediately. parkOrRetry handles both policies and falls back to
+		// blockOnSpawnFailure when appropriate.
 		// Either way the store's claim on runID is being cleared right now, so
 		// any stale d.inflight[runID] left over from a "continue" respawn
 		// (this is the SAME runID as the turn that just finished -- see
@@ -44,10 +83,46 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		// ever run again. A no-op for a fresh claim's first spawn
 		// (spawnClaim), which never has a pre-existing entry for runID.
 		delete(d.inflight, runID)
+		kind := contract.BlockKindTransient
+		if d.cfg.AgentBackend.Type == "daytona" {
+			kind = backendBlockKind(err)
+		}
 		cause := fmt.Errorf("preparing workspace: %w", err)
-		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
-			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), kind, d.now(), retryPayload{}, func() error {
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, false)
 		})
+	}
+
+	if d.cfg.AgentBackend.Type == "daytona" {
+		now := d.now()
+		if err := d.store.UpsertAgentWorkspace(ctx, store.AgentWorkspace{
+			OwnerKey:      remoteWorkspace.OwnerKey,
+			IssueID:       issue.ID,
+			RunID:         runID,
+			Provider:      "daytona",
+			Role:          lane,
+			ExternalID:    remoteWorkspace.ExternalID,
+			WorkspacePath: remoteWorkspace.WorkspacePath,
+			State:         store.WorkspaceState(remoteWorkspace.State),
+			LastAction:    "ensure",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}); err != nil {
+			delete(d.inflight, runID)
+			cause := fmt.Errorf("persisting provisioned workspace: %w", err)
+			return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, now, retryPayload{}, func() error {
+				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, false)
+			})
+		}
+	} else {
+		now := d.now()
+		if err := d.recordLocalWorkspace(ctx, issue, workspace); err != nil {
+			delete(d.inflight, runID)
+			cause := err
+			return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, now, retryPayload{}, func() error {
+				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, false)
+			})
+		}
 	}
 
 	// d.envFor is always set (New defaults it to defaultEnvFor;
@@ -55,6 +130,10 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	// nil WorkerSpec.Env, which exec.Cmd.Env would treat as "inherit the
 	// dispatcher's full environment".
 	env := d.envFor(issue)
+	if d.cfg.AgentBackend.Type == "daytona" {
+		env = spawn.RemoveEnv(env, "GH_TOKEN", "GITHUB_TOKEN")
+		env = spawn.MergeEnv(env, daytonaWorkerEnv())
+	}
 
 	// A rework re-run carries the review feedback that routed the card back to
 	// the Coder lane. Injected here (not via envFor) so it rides alongside
@@ -95,6 +174,13 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		DocsShellAllowList: docsShellAllowList,
 		BaseBranch:         d.cfg.Repo.BaseBranch,
 		TranscriptPath:     d.transcriptPath(issue),
+		Backend:            backendName(d.cfg.AgentBackend.Type),
+		SandboxID:          remoteWorkspace.ExternalID,
+		RepoURL:            daytonaOnly(d.cfg.AgentBackend.Type, repoURL),
+		RepoSlug:           repoSlug,
+		Branch:             daytonaOnly(d.cfg.AgentBackend.Type, issue.BranchName),
+		Target:             daytonaOnly(d.cfg.AgentBackend.Type, d.cfg.AgentBackend.Daytona.Target),
+		ProjectDir:         daytonaOnly(d.cfg.AgentBackend.Type, d.cfg.Repo.Path),
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -113,8 +199,10 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		// not survive it either.
 		delete(d.inflight, runID)
 		cause := fmt.Errorf("spawning worker: %w", err)
-		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
-			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+		cleanupReviewer := d.cfg.AgentBackend.Type == "daytona" && lane == string(contract.LaneReviewer)
+		payload := retryPayload{cleanupReviewerWorkspace: cleanupReviewer}
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), payload, func() error {
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, cleanupReviewer)
 		})
 	}
 
@@ -139,6 +227,46 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 	}()
 
 	return nil
+}
+
+func backendBlockKind(err error) contract.BlockKind {
+	var actionErr *backend.ActionError
+	if !errors.As(err, &actionErr) {
+		return contract.BlockKindCapability
+	}
+	switch actionErr.Kind {
+	case backend.ErrorKindTransient:
+		return contract.BlockKindTransient
+	case backend.ErrorKindNeedsInput:
+		return contract.BlockKindNeedsInput
+	default:
+		return contract.BlockKindCapability
+	}
+}
+
+func daytonaWorkerEnv() []string {
+	keys := []string{"DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET", "HOME", "PATH"}
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
+func backendName(configured string) string {
+	if configured == "daytona" {
+		return configured
+	}
+	return ""
+}
+
+func daytonaOnly(configured, value string) string {
+	if configured == "daytona" {
+		return value
+	}
+	return ""
 }
 
 // checkpointDBPath returns the per-issue LangGraph checkpointer database
@@ -286,17 +414,18 @@ func (d *Dispatcher) shellFor(lane string) (shell, docsShell string) {
 // blockOnSpawnFailure transitions issue straight to blocked when the
 // Spawner/Workspacer machinery itself fails (never got a process to Wait
 // on), rather than going through applyResult.
-func (d *Dispatcher) blockOnSpawnFailure(ctx context.Context, issueID, runID, lane string, cause error) error {
+func (d *Dispatcher) blockOnSpawnFailure(ctx context.Context, issueID, runID, lane string, cause error, cleanupReviewer bool) error {
 	now := d.now()
 	req := store.TransitionReq{
-		IssueID:         issueID,
-		NewStatus:       "blocked",
-		ClearClaim:      true,
-		CloseRunID:      runID,
-		RunStatus:       "blocked",
-		RunError:        cause.Error(),
-		EnqueueSetState: true,
-		Comment:         blockedComment("", cause.Error()),
+		IssueID:                  issueID,
+		NewStatus:                "blocked",
+		ClearClaim:               true,
+		CloseRunID:               runID,
+		RunStatus:                "blocked",
+		RunError:                 cause.Error(),
+		CleanupReviewerWorkspace: cleanupReviewer,
+		EnqueueSetState:          true,
+		Comment:                  blockedComment("", cause.Error()),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),

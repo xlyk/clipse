@@ -138,6 +138,9 @@ def build_coder_agent(
     profile: CoderProfile,
     checkpointer: BaseCheckpointSaver | None,
     cwd: str | Path,
+    *,
+    sandbox: Any | None = None,
+    sandbox_type: str | None = None,
 ) -> tuple[Pregel[Any, Any, Any, Any], CompositeBackend]:
     """Build the Coder lane's DAC agent from its profile.
 
@@ -215,19 +218,22 @@ def build_coder_agent(
         # is None (unrestricted, the default) or a tuple (restrictive) --
         # never anything else, so this is the only branch point.
         unrestricted = profile.shell_allow_list is None
-        return create_cli_agent(
-            model,
-            profile.assistant_id,
-            system_prompt=profile.system_prompt,
-            interactive=False,
-            auto_approve=unrestricted,
-            interrupt_shell_only=not unrestricted,
-            shell_allow_list=(list(profile.shell_allow_list) if not unrestricted else None),
-            enable_ask_user=True,
-            enable_shell=True,
-            checkpointer=checkpointer,
-            cwd=cwd,
-        )
+        cli_kwargs: dict[str, Any] = {
+            "system_prompt": profile.system_prompt,
+            "interactive": False,
+            "auto_approve": unrestricted,
+            "interrupt_shell_only": not unrestricted,
+            "shell_allow_list": list(profile.shell_allow_list) if not unrestricted else None,
+            "enable_ask_user": True,
+            "enable_shell": True,
+            "checkpointer": checkpointer,
+            "cwd": cwd,
+        }
+        if sandbox is not None:
+            cli_kwargs["sandbox"] = sandbox
+            if sandbox_type is not None:
+                cli_kwargs["sandbox_type"] = sandbox_type
+        return create_cli_agent(model, profile.assistant_id, **cli_kwargs)
     except Exception as exc:
         raise DacError(
             f"failed to build DAC agent for assistant_id={profile.assistant_id!r}: {exc}"

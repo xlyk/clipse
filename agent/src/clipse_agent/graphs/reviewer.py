@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from clipse_agent import dac
+from clipse_agent.backends.session import AgentSession, CommandResult
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs import coder
 from clipse_agent.graphs.coder import CoderGraphError as ReviewerGraphError
@@ -110,8 +111,8 @@ TurnDriver = coder.TurnDriver
 # graphs.coder.
 # ---------------------------------------------------------------------------
 
-CommandResult = coder.CommandResult
 CommandRunner = coder.CommandRunner
+GitHubCommandSource = CommandRunner | AgentSession
 
 
 def _default_run_command(argv: Sequence[str], cwd: str) -> CommandResult:
@@ -124,6 +125,25 @@ def _run(run_command: CommandRunner, argv: Sequence[str], cwd: str, *, check: bo
     if check and result.returncode != 0:
         raise ReviewerGraphError(
             f"command failed (exit {result.returncode}): {' '.join(argv)}\nstderr: {result.stderr}"
+        )
+    return result
+
+
+def _github(
+    source: GitHubCommandSource,
+    argv: Sequence[str],
+    cwd: str,
+    *,
+    check: bool = True,
+) -> CommandResult:
+    github = getattr(source, "github", None)
+    if callable(github):
+        result = github(argv)
+    else:
+        result = source(["gh", *argv], cwd)
+    if check and result.returncode != 0:
+        raise ReviewerGraphError(
+            f"command failed (exit {result.returncode}): gh {' '.join(argv)}\nstderr: {result.stderr}"
         )
     return result
 
@@ -157,11 +177,11 @@ class ReviewerState(TypedDict, total=False):
 
     Every key is optional at the TypedDict level (`total=False`) -- e.g. the
     blocked path never reaches `review_comments`/`pr_url`. Mirrors
-    `graphs.coder.CoderState`'s shape closely by design: both lanes run
-    against the *same* worktree/workspace for a given issue, and sharing
-    field names (`branch`, `cwd`, `dac_summary`, `prior_summary`, ...) is
-    what lets this graph reuse `load_context`/`make_ensure_worktree`
-    unmodified.
+    `graphs.coder.CoderState`'s shape closely by design. A local reviewer may
+    share the issue worktree while Daytona uses a fresh run-scoped sandbox;
+    the common field names (`branch`, `cwd`, `dac_summary`,
+    `prior_summary`, ...) let this graph reuse
+    `load_context`/`make_ensure_worktree` across both backends.
     """
 
     # --- Supplied by the caller (worker.py) at invocation ---
@@ -233,51 +253,54 @@ def _dac_config(thread_id: str) -> dict[str, Any]:
 _MAX_DIFF_CHARS = 60_000
 
 
-def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict[str, Any]]:
+def make_load_diff(source: GitHubCommandSource) -> Callable[[ReviewerState], dict[str, Any]]:
     """Pre-compute the PR diff into `task_text` so the DAC review turn sees it
-    in-context, instead of relying on the agent to shell out `git diff`.
+    in-context, instead of relying on the agent to discover the diff itself.
 
     The live Phase-3 smoke exposed why this matters: the read-mostly allow-list
     rejected the agent's `cd <worktree> && git diff main...HEAD`, so the
-    reviewer PASSED a PR it never actually saw. Computing the diff here (via the
-    injectable runner, in the worktree) makes the review independent of the
-    agent's shell entirely. Degrades to a note (never raises) if the diff can't
-    be produced, and caps an oversized diff so one huge PR can't blow the token
-    budget.
+    reviewer PASSED a PR it never actually saw. A graph-facing session loads
+    the authoritative PR diff through host GitHub; the legacy no-session seam
+    retains its injected local runner. Both paths degrade to a note (never
+    raise) if the diff cannot be produced and cap an oversized diff so one huge
+    PR cannot blow the token budget. Diff failures fail closed before DAC:
+    a reviewer that did not receive the authoritative diff cannot PASS.
     """
 
     def _node(state: ReviewerState) -> dict[str, Any]:
         base = state.get("base_branch") or "main"
+        branch = state["branch"]
         cwd = state["cwd"]
-        # Diff against origin/<base>, not the local base ref: the worktree's
-        # local ref is frozen at worktree creation, so once sibling PRs merge
-        # (and the coder's sync_base folds origin/<base> into HEAD) a diff
-        # against it includes THEIR files too -- the 2026-07-08 smoke run's
-        # phantom-scope-violation reject loop, which drove the coder into
-        # history-rewriting "repairs". The fetch is best-effort: offline
-        # (unit tests, air-gapped runs) it degrades to the local ref.
-        diff_base = base
-        fetch = _run(run_command, ["git", "fetch", "origin", base], cwd, check=False)
-        if fetch.returncode == 0:
+        session_github = callable(getattr(source, "github", None))
+        if session_github:
+            # GitHub's PR diff is authoritative for a fresh reviewer sandbox:
+            # it does not depend on local remote refs or host checkout state.
             diff_base = f"origin/{base}"
-        result = _run(run_command, ["git", "diff", f"{diff_base}...HEAD"], cwd, check=False)
+            diff_label = f"gh pr diff {branch}"
+            result = _github(source, ["pr", "diff", branch], cwd, check=False)
+        else:
+            # Preserve the pre-session local path for hand-built graph tests
+            # and callers that intentionally omit AgentSession.
+            diff_base = base
+            fetch = _run(source, ["git", "fetch", "origin", base], cwd, check=False)
+            if fetch.returncode == 0:
+                diff_base = f"origin/{base}"
+            diff_label = f"git diff {diff_base}...HEAD"
+            result = _run(source, ["git", "diff", f"{diff_base}...HEAD"], cwd, check=False)
         truncation_note = ""
         if result.returncode != 0:
-            diff_block = (
-                f"(could not compute `git diff {diff_base}...HEAD` "
-                f"(exit {result.returncode}): {result.stderr.strip()})"
-            )
+            raise ReviewerGraphError("authoritative PR diff unavailable")
         else:
             diff = result.stdout
             if len(diff) > _MAX_DIFF_CHARS:
                 kept = diff[:_MAX_DIFF_CHARS]
                 diff = kept + f"\n... (diff truncated at {_MAX_DIFF_CHARS} chars)"
-                truncation_note = _truncated_files_note(run_command, diff_base, cwd, kept)
+                truncation_note = _truncated_files_note(source, branch, diff_base, cwd, kept)
             diff_block = diff.strip() or "(empty diff -- no changes between base and HEAD)"
 
         task_text = state.get("task_text", "")
         augmented = (
-            f"{task_text}\n\n---\nPR diff (`git diff {diff_base}...HEAD`), provided for your review:\n\n"
+            f"{task_text}\n\n---\nPR diff (`{diff_label}`), provided for your review:\n\n"
             f"```diff\n{diff_block}\n```\n"
         )
         return {"task_text": augmented + truncation_note}
@@ -285,18 +308,28 @@ def make_load_diff(run_command: CommandRunner) -> Callable[[ReviewerState], dict
     return _node
 
 
-def _truncated_files_note(run_command: CommandRunner, base: str, cwd: str, kept: str) -> str:
+def _truncated_files_note(
+    source: GitHubCommandSource,
+    branch: str,
+    base: str,
+    cwd: str,
+    kept: str,
+) -> str:
     """Name the files whose diff was cut by the `_MAX_DIFF_CHARS` cap.
 
     The cap silently dropped three files from one Reflex review, and a
     reviewer that never sees a file cannot review it. This compares the full
-    changed-file list (`git diff --name-only`) against the kept prefix: a
-    file whose `diff --git a/<f>` header didn't survive the cut was omitted
-    wholly or in part, so it is enumerated with an instruction to read it
-    directly before verdict. Degrades to no note (never raises) if the file
-    list can't be produced.
+    changed-file list (host `gh pr diff --name-only` for a session; local git
+    for the legacy seam) against the kept prefix. A file whose
+    `diff --git a/<f>` header did not survive the cut was omitted wholly or in
+    part, so it is enumerated with an instruction to read it directly before
+    verdict. Degrades to no note (never raises) if the file list cannot be
+    produced.
     """
-    names = _run(run_command, ["git", "diff", "--name-only", f"{base}...HEAD"], cwd, check=False)
+    if callable(getattr(source, "github", None)):
+        names = _github(source, ["pr", "diff", branch, "--name-only"], cwd, check=False)
+    else:
+        names = _run(source, ["git", "diff", "--name-only", f"{base}...HEAD"], cwd, check=False)
     if names.returncode != 0:
         return ""
     all_files = [f for f in names.stdout.splitlines() if f.strip()]
@@ -500,7 +533,7 @@ def route_after_classify(state: ReviewerState) -> str:
 _MAX_COMMENT_CHARS = 60_000
 
 
-def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], dict[str, Any]]:
+def make_post_comments(source: GitHubCommandSource) -> Callable[[ReviewerState], dict[str, Any]]:
     """Post this turn's review findings to the PR.
 
     One inline `gh api` review comment per parsed `InlineComment` (GitHub's
@@ -543,7 +576,7 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
         # typed JSON result. Any other failure raises, and a genuine transient
         # getting the kernel's bounded retry is the desired outcome (unlike
         # the deterministic per-comment 422s handled best-effort below).
-        view = _run(run_command, ["gh", "pr", "view", branch, "--json", "number,headRefOid,url"], cwd, check=False)
+        view = _github(source, ["pr", "view", branch, "--json", "number,headRefOid,url"], cwd, check=False)
         if view.returncode != 0:
             # Narrow grace: only the known no-PR signal (the coder's honest
             # pr_url="" no-op path -- gh prints "no pull requests found").
@@ -566,10 +599,9 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
             # line isn't part of the diff hunk, and models routinely cite
             # context lines. One unplaceable comment must not park the card
             # -- the finding falls through to the summary comment instead.
-            result = _run(
-                run_command,
+            result = _github(
+                source,
                 [
-                    "gh",
                     "api",
                     f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments",
                     "-f",
@@ -598,9 +630,9 @@ def make_post_comments(run_command: CommandRunner) -> Callable[[ReviewerState], 
         # transient gh failure here must not raise -- the verdict already
         # reaches the kernel via this run's typed JSON result (emit_result),
         # so a failed summary post is a best-effort miss, not a run failure.
-        _run(
-            run_command,
-            ["gh", "pr", "comment", branch, "--body", body],
+        _github(
+            source,
+            ["pr", "comment", branch, "--body", body],
             cwd,
             check=False,
         )
@@ -745,6 +777,7 @@ def build_reviewer_graph(
     turn_driver: TurnDriver = dac.drive_turn,
     run_command: CommandRunner | None = None,
     transcript: TranscriptWriter | None = None,
+    session: AgentSession | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Build and compile the Reviewer lane's graph.
 
@@ -766,19 +799,24 @@ def build_reviewer_graph(
     by `make_run_dac`, never carried on `ReviewerState` -- mirrors
     `graphs.coder.build_coder_graph`.
 
+    When supplied, `session` validates the backend worktree and owns every
+    GitHub diff/comment operation. Omitting it preserves the original local
+    command-runner seam used by existing callers and tests.
+
     The returned graph's only async node is `run_DAC`, so it must be driven
     with `.ainvoke`/`.astream` -- never the sync `.invoke`.
     """
     resolved_profile = profile if profile is not None else get_reviewer_profile()
     resolved_run_command = run_command if run_command is not None else _default_run_command
+    github_source: GitHubCommandSource = session if session is not None else resolved_run_command
 
     graph: StateGraph[ReviewerState, Any, Any, Any] = StateGraph(ReviewerState)
     graph.add_node("load_context", load_context)
-    graph.add_node("ensure_worktree", coder.make_ensure_worktree(resolved_run_command))
-    graph.add_node("load_diff", make_load_diff(resolved_run_command))
+    graph.add_node("ensure_worktree", coder.make_ensure_worktree(resolved_run_command, session=session))
+    graph.add_node("load_diff", make_load_diff(github_source))
     graph.add_node("run_DAC", make_run_dac(resolved_profile, agent_factory, turn_driver, checkpointer, transcript))
     graph.add_node("classify", classify)
-    graph.add_node("post_comments", make_post_comments(resolved_run_command))
+    graph.add_node("post_comments", make_post_comments(github_source))
     graph.add_node("emit_result", emit_result)
 
     graph.add_edge(START, "load_context")

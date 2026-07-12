@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/xlyk/clipse/dispatcher"
+	"github.com/xlyk/clipse/internal/backend"
 	"github.com/xlyk/clipse/internal/config"
 	"github.com/xlyk/clipse/internal/linear"
 	"github.com/xlyk/clipse/internal/spawn"
@@ -109,6 +110,21 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 
 	boardDir := resolveBoardDir(flags.boardDir, cfg.BoardDir)
 	workerCommand := resolveWorkerCommand(flags.workerBin, cfg.Worker.Command)
+	var backendManager backend.Manager
+	if cfg.AgentBackend.Type == "daytona" {
+		_, repoSlug, err := backend.CanonicalGitHubRemote(cfg.Repo.Remote)
+		if err != nil {
+			return fmt.Errorf("preflighting daytona backend: invalid repo.remote: %w", err)
+		}
+		backendManager = backend.NewCommandManager(workerCommand, nil, os.Environ(), cfg.Repo.Path)
+		if _, err := backendManager.List(cmd.Context(), backend.ListRequest{
+			Provider: "daytona",
+			RepoSlug: repoSlug,
+			Target:   cfg.AgentBackend.Daytona.Target,
+		}); err != nil {
+			return fmt.Errorf("preflighting daytona backend: %w", err)
+		}
+	}
 
 	if err := os.MkdirAll(boardDir, 0o755); err != nil {
 		return fmt.Errorf("creating board dir %s: %w", boardDir, err)
@@ -159,9 +175,13 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 	}
 
 	spawner := spawn.NewLocalSpawner(workerCommand, boardDir)
-	ws := dispatcher.NewGitWorkspacer(cfg.Repo.Path, cfg.Repo.BaseBranch, worktreeRoot)
+	ws := dispatcher.NewGitWorkspacer(cfg.Repo.Path, cfg.Repo.BaseBranch, worktreeRoot, cfg.AgentBackend.Type == "daytona")
 
-	d := dispatcher.New(*cfg, st, lc, spawner, ws, dispatcher.WithLogger(logger))
+	options := []dispatcher.Option{dispatcher.WithLogger(logger)}
+	if backendManager != nil {
+		options = append(options, dispatcher.WithBackendManager(backendManager))
+	}
+	d := dispatcher.New(*cfg, st, lc, spawner, ws, options...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

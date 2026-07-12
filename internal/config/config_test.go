@@ -260,6 +260,170 @@ worker:
 	}
 }
 
+func TestLoad_AgentBackendDefaultsToLocal(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML)
+	if cfg.AgentBackend.Type != "local" {
+		t.Fatalf("AgentBackend.Type = %q, want local", cfg.AgentBackend.Type)
+	}
+}
+
+func TestLoad_DaytonaBackendDefaults(t *testing.T) {
+	cfg := loadYAML(t, baseValidYAML+`
+agent_backend:
+  type: daytona
+`)
+	if cfg.AgentBackend.Daytona.AutoStopMinutes != 60 {
+		t.Errorf("AutoStopMinutes = %d, want 60", cfg.AgentBackend.Daytona.AutoStopMinutes)
+	}
+	if cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes != 60 {
+		t.Errorf("ReviewerAutoDeleteMinutes = %d, want 60", cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes)
+	}
+}
+
+func TestLoad_LocalBackendAcceptsLegacySSHURLRemote(t *testing.T) {
+	for _, backendBlock := range []string{"", "\nagent_backend:\n  type: local\n"} {
+		path := writeYAML(t, strings.Replace(baseValidYAML, "https://github.com/yourorg/yourrepo.git", "ssh://git@github.example/yourorg/yourrepo.git", 1)+backendBlock)
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("Load local legacy remote: %v", err)
+		}
+		if cfg.Repo.Remote != "ssh://git@github.example/yourorg/yourrepo.git" {
+			t.Fatalf("remote = %q", cfg.Repo.Remote)
+		}
+	}
+}
+
+func TestLoad_DaytonaBackendRejectsInvalidValues(t *testing.T) {
+	tests := []struct {
+		name          string
+		yaml          string
+		wantErrSubstr string
+	}{
+		{
+			name: "unsupported backend type",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: docker
+`,
+			wantErrSubstr: "agent_backend.type",
+		},
+		{
+			name: "zero auto stop interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    auto_stop_minutes: 0
+`,
+			wantErrSubstr: "agent_backend.daytona.auto_stop_minutes",
+		},
+		{
+			name: "negative auto stop interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    auto_stop_minutes: -1
+`,
+			wantErrSubstr: "agent_backend.daytona.auto_stop_minutes",
+		},
+		{
+			name: "zero reviewer auto delete interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    reviewer_auto_delete_minutes: 0
+`,
+			wantErrSubstr: "agent_backend.daytona.reviewer_auto_delete_minutes",
+		},
+		{
+			name: "negative reviewer auto delete interval",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    reviewer_auto_delete_minutes: -1
+`,
+			wantErrSubstr: "agent_backend.daytona.reviewer_auto_delete_minutes",
+		},
+		{
+			name: "explicitly empty snapshot",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    snapshot: ""
+`,
+			wantErrSubstr: "agent_backend.daytona.snapshot",
+		},
+		{
+			name: "explicitly empty target",
+			yaml: baseValidYAML + `
+agent_backend:
+  type: daytona
+  daytona:
+    target: ""
+`,
+			wantErrSubstr: "agent_backend.daytona.target",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeYAML(t, tt.yaml)
+
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatalf("Load: expected error containing %q, got nil", tt.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSubstr) {
+				t.Errorf("Load: error %q does not mention %q", err.Error(), tt.wantErrSubstr)
+			}
+		})
+	}
+}
+
+func TestLoad_RejectsDaytonaVariablesInGeneralEnvAllowlist(t *testing.T) {
+	for _, key := range []string{"DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET"} {
+		t.Run(key, func(t *testing.T) {
+			path := writeYAML(t, baseValidYAML+`
+env_allowlist:
+  - PATH
+  - `+key+`
+`)
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatal("Load error = nil")
+			}
+			if !strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "env_allowlist") {
+				t.Errorf("Load error = %q, want safe env_allowlist rejection naming %s", err, key)
+			}
+		})
+	}
+}
+
+func TestLoad_RejectsCredentialBearingRepoRemoteWithoutLeakingIt(t *testing.T) {
+	path := writeYAML(t, strings.Replace(
+		baseValidYAML,
+		"https://github.com/yourorg/yourrepo.git",
+		"https://user:token-secret@github.com/x/y.git",
+		1,
+	)+"\nagent_backend:\n  type: daytona\n")
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("Load error = nil")
+	}
+	if !strings.Contains(err.Error(), "repo.remote") {
+		t.Errorf("Load error = %q, want repo.remote", err)
+	}
+	for _, forbidden := range []string{"user", "token-secret", "https://"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("Load error %q leaked rejected remote content %q", err, forbidden)
+		}
+	}
+}
+
 // TestLoad_RequireChecksExplicitFalse asserts an explicit repo.require_checks:
 // false is honored (a repo declaring it has no CI at all), distinct from the
 // absent-key default of true.

@@ -142,7 +142,9 @@ type stubWorkspacer struct {
 	mu   sync.Mutex
 	root string
 
-	ensured []string
+	ensured      []string
+	removed      []string
+	removeErrors []error
 }
 
 func newStubWorkspacer(root string) *stubWorkspacer {
@@ -164,12 +166,36 @@ func (w *stubWorkspacer) Ensure(issue store.Issue) (string, error) {
 	return path, nil
 }
 
+func (w *stubWorkspacer) Remove(issue store.Issue) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.removed = append(w.removed, issue.ID)
+	if len(w.removeErrors) > 0 {
+		err := w.removeErrors[0]
+		w.removeErrors = w.removeErrors[1:]
+		return err
+	}
+	return nil
+}
+
+func (w *stubWorkspacer) SetRemoveErrors(errs ...error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.removeErrors = append([]error(nil), errs...)
+}
+
 // EnsuredIssues returns the issue IDs Ensure was called for, in call order,
 // so a test can assert whether a worktree was (or was never) resurrected.
 func (w *stubWorkspacer) EnsuredIssues() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]string(nil), w.ensured...)
+}
+
+func (w *stubWorkspacer) RemovedIssues() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.removed...)
 }
 
 // sequentialRunIDs returns a deterministic run id generator: "run-1",

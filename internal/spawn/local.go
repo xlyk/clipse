@@ -86,6 +86,24 @@ func workerArgs(spec WorkerSpec) []string {
 	if spec.TranscriptPath != "" {
 		args = append(args, "--transcript="+spec.TranscriptPath)
 	}
+	if spec.Backend != "" {
+		args = append(args, "--backend="+spec.Backend)
+	}
+	if spec.SandboxID != "" {
+		args = append(args, "--sandbox-id="+spec.SandboxID)
+	}
+	if spec.RepoURL != "" {
+		args = append(args, "--repo-url="+spec.RepoURL)
+	}
+	if spec.RepoSlug != "" {
+		args = append(args, "--repo-slug="+spec.RepoSlug)
+	}
+	if spec.Branch != "" {
+		args = append(args, "--branch="+spec.Branch)
+	}
+	if spec.Target != "" {
+		args = append(args, "--target="+spec.Target)
+	}
 	return args
 }
 
@@ -127,7 +145,11 @@ func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, e
 	// (Reflex retro). Empty Workspace leaves Dir at the caller's cwd (exec.Cmd
 	// semantics), matching the pre-fix behavior for specs that carry no
 	// worktree.
-	cmd.Dir = spec.Workspace
+	if spec.Backend == "" || spec.Backend == "local" {
+		cmd.Dir = spec.Workspace
+	} else {
+		cmd.Dir = spec.ProjectDir
+	}
 	cmd.Stderr = logFile
 
 	var stdout bytes.Buffer

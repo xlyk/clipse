@@ -82,6 +82,26 @@ func (m Model) detailContent(inner int) string {
 	if bs := blockers(is.Deps, m.identByID, m.statusByID); len(bs) > 0 {
 		b.WriteString(detailField("blocked-by", renderBlockers(bs)))
 	}
+	if workspace := is.Workspace; workspace != nil {
+		b.WriteString("\n")
+		b.WriteString(panelHeadStyle.Render("WORKSPACE"))
+		b.WriteString("\n")
+		b.WriteString(detailField("backend", workspace.Provider))
+		b.WriteString(detailField("role", workspace.Role))
+		b.WriteString(detailField("state", string(workspace.State)))
+		if workspace.ExternalID != "" {
+			b.WriteString(detailField("sandbox", workspace.ExternalID))
+		}
+		if workspace.WorkspacePath != "" {
+			b.WriteString(detailField("remote-path", workspace.WorkspacePath))
+		}
+		if workspace.LastAction != "" {
+			b.WriteString(detailField("last-action", workspace.LastAction))
+		}
+		if workspace.LastError != "" {
+			b.WriteString(detailField("workspace-error", workspace.LastError))
+		}
+	}
 
 	if is.BoardStatus == "blocked" {
 		if reason := blockReason(is.LatestRun); reason != "" {

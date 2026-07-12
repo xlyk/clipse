@@ -13,6 +13,7 @@ package spawn
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/xlyk/clipse/internal/contract"
 )
@@ -48,6 +49,21 @@ type WorkerSpec struct {
 	ThreadID  string
 	Workspace string
 	Env       []string
+
+	// Backend metadata is omitted for local workers. Daytona workers carry
+	// the provisioned sandbox identity and repository coordinates so the
+	// Python launcher can create its remote execution session.
+	Backend   string
+	SandboxID string
+	RepoURL   string
+	RepoSlug  string
+	Branch    string
+	Target    string
+
+	// ProjectDir is the managed host repository used only as the controller
+	// process cwd in Daytona mode. Workspace remains the remote repository
+	// path passed to DAC and must never be used as an exec.Cmd.Dir on host.
+	ProjectDir string
 
 	// CheckpointDB is the absolute path to this issue's LangGraph
 	// checkpointer SQLite database (design doc: one file per issue, outside
@@ -115,6 +131,35 @@ type WorkerSpec struct {
 	// tests) simply omits the flag and the worker runs with transcripts
 	// disabled.
 	TranscriptPath string
+}
+
+// MergeEnv overlays environment entries by variable name while preserving
+// the first occurrence's position. Duplicate entries are removed and new
+// overlay names are appended in overlay order.
+func MergeEnv(base, overlay []string) []string {
+	result := make([]string, 0, len(base)+len(overlay))
+	index := make(map[string]int, len(base)+len(overlay))
+	add := func(entry string, replace bool) {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			return
+		}
+		if i, exists := index[key]; exists {
+			if replace {
+				result[i] = entry
+			}
+			return
+		}
+		index[key] = len(result)
+		result = append(result, entry)
+	}
+	for _, entry := range base {
+		add(entry, false)
+	}
+	for _, entry := range overlay {
+		add(entry, true)
+	}
+	return result
 }
 
 // Spawner starts a worker process for spec and returns a handle to observe

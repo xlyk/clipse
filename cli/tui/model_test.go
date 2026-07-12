@@ -496,6 +496,54 @@ func TestHeaderChips_WorkingWaitingAgreeWithActive(t *testing.T) {
 	}
 }
 
+func TestDetailView_RendersWorkspaceLifecycleMetadata(t *testing.T) {
+	snap := store.Snapshot{
+		CountsByStatus: map[string]int{"running": 1},
+		Issues: []store.IssueSnapshot{{
+			Issue: store.Issue{ID: "issue-1", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "running"},
+			Workspace: &store.AgentWorkspace{
+				Provider:      "daytona",
+				Role:          "coder",
+				State:         store.WorkspaceCleanupPending,
+				ExternalID:    "sb-123456789-full",
+				WorkspacePath: "/home/daytona/workspace/clipse",
+				LastAction:    "delete",
+				LastError:     "delete failed (RuntimeError)",
+			},
+		}},
+	}
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
+	m, _ = m.Update(tui.SnapshotMsg{Snap: snap})
+	m, _ = m.Update(keyEnter)
+	view := m.View()
+	for _, want := range []string{
+		"daytona", "coder", "cleanup_pending", "sb-123456789-full",
+		"/home/daytona/workspace/clipse", "delete", "delete failed (RuntimeError)",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("detail view missing workspace value %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestDetailView_OmitsEmptyWorkspaceError(t *testing.T) {
+	snap := store.Snapshot{
+		CountsByStatus: map[string]int{"running": 1},
+		Issues: []store.IssueSnapshot{{
+			Issue:     store.Issue{ID: "issue-1", Identifier: "CLP-1", LaneLabel: "coder", BoardStatus: "running"},
+			Workspace: &store.AgentWorkspace{Provider: "local", Role: "coder", State: store.WorkspaceActive, WorkspacePath: "/tmp/worktree", LastAction: "ensure"},
+		}},
+	}
+	m := tui.NewModel()
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
+	m, _ = m.Update(tui.SnapshotMsg{Snap: snap})
+	m, _ = m.Update(keyEnter)
+	if view := m.View(); strings.Contains(view, "workspace-error") {
+		t.Fatalf("detail view rendered empty workspace error line:\n%s", view)
+	}
+}
+
 // assertErr is a minimal error implementation for tests that need a
 // specific, comparable error value without importing errors.New into every
 // call site.

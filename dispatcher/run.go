@@ -22,15 +22,17 @@ func (d *Dispatcher) pollIntervalOrDefault() time.Duration {
 	return time.Duration(d.cfg.PollIntervalS) * time.Second
 }
 
-// Run is the dispatcher's daemon loop: it recovers any orphaned runs left by
-// a prior dispatcher process exactly once, then runs Tick immediately and
-// again on every pollInterval tick, until ctx is cancelled.
+// Run is the dispatcher's daemon loop: it reconciles remote workspaces and
+// recovers any orphaned runs left by a prior dispatcher process exactly once,
+// then runs Tick immediately and again on every pollInterval tick, until ctx
+// is cancelled.
 //
 // A Tick error is logged and looped past rather than returned: a single
 // transient failure (e.g. a momentary Linear API blip) should not bring the
 // whole daemon down when the next tick is likely to succeed. Run itself only
-// returns a non-nil error if RecoverOrphans fails at startup, since that is a
-// one-time precondition the rest of the loop depends on.
+// returns a non-nil error when one of its startup reconciliation/recovery
+// preconditions fails, since those one-time passes cannot be retried by the
+// normal Tick loop.
 //
 // On ctx.Done(), Run stops the ticker and returns nil. It does not cancel
 // any in-flight worker spawn contexts — see dispatcher/spawn.go's use of
@@ -41,10 +43,15 @@ func (d *Dispatcher) pollIntervalOrDefault() time.Duration {
 func (d *Dispatcher) Run(ctx context.Context) error {
 	d.logger.Info("dispatcher starting", "poll_interval", d.pollIntervalOrDefault())
 
+	if err := d.reconcileAgentWorkspaces(ctx); err != nil {
+		return fmt.Errorf("run: reconciling agent workspaces at startup: %w", err)
+	}
 	if err := d.RecoverOrphans(ctx); err != nil {
 		return fmt.Errorf("run: recovering orphans at startup: %w", err)
 	}
-
+	if err := d.scheduleRecoveredWorkspaceCleanup(ctx); err != nil {
+		return fmt.Errorf("run: scheduling terminal workspace cleanup after orphan recovery: %w", err)
+	}
 	ticker := time.NewTicker(d.pollIntervalOrDefault())
 	defer ticker.Stop()
 

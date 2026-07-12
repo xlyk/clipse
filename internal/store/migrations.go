@@ -70,6 +70,22 @@ var migrations = []string{
 		created_at INTEGER NOT NULL DEFAULT 0,
 		updated_at INTEGER NOT NULL DEFAULT 0
 	)`,
+	`CREATE TABLE IF NOT EXISTS agent_workspaces (
+		owner_key      TEXT PRIMARY KEY,
+		issue_id       TEXT NOT NULL,
+		run_id         TEXT NOT NULL DEFAULT '',
+		provider       TEXT NOT NULL,
+		role           TEXT NOT NULL,
+		external_id    TEXT NOT NULL DEFAULT '',
+		workspace_path TEXT NOT NULL,
+		state          TEXT NOT NULL,
+		last_action    TEXT NOT NULL DEFAULT '',
+		last_error     TEXT NOT NULL DEFAULT '',
+		created_at     INTEGER NOT NULL,
+		updated_at     INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_agent_workspaces_issue ON agent_workspaces(issue_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_agent_workspaces_cleanup ON agent_workspaces(state)`,
 }
 
 // migrate applies every migration statement in order, then applies any

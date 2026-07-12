@@ -17,7 +17,7 @@ import (
 // configs/clipse.example.yaml's location relative to the test binary.
 const minimalConfigYAML = `
 repo:
-  remote: "https://example.invalid/repo.git"
+  remote: "https://github.com/xlyk/clipse.git"
   path: "/tmp/clipse-test-repo"
   base_branch: "main"
 team_key: "CLI"

@@ -277,6 +277,17 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+
+	workspaces, err := s.currentWorkspacesByIssue(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	for i := range snap.Issues {
+		if workspace, ok := workspaces[snap.Issues[i].ID]; ok {
+			current := workspace
+			snap.Issues[i].Workspace = &current
+		}
+	}
 	for i := range snap.Issues {
 		if unmirrored[snap.Issues[i].ID] {
 			snap.Issues[i].Unmirrored = true
@@ -296,6 +307,52 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 	}
 
 	return snap, nil
+}
+
+// currentWorkspacesByIssue returns the lifecycle row operators need for each
+// issue. The persistent coder workspace remains authoritative throughout the
+// issue; an active reviewer workspace is shown only when no coder row exists.
+func (s *Store) currentWorkspacesByIssue(ctx context.Context) (map[string]AgentWorkspace, error) {
+	const q = `SELECT ` + agentWorkspaceColumns + `
+		FROM agent_workspaces
+		WHERE role = 'coder' OR (role = 'reviewer' AND state = 'active')
+		ORDER BY issue_id,
+			CASE role WHEN 'coder' THEN 0 ELSE 1 END,
+			created_at DESC, owner_key
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("reading current agent workspaces: %w", err)
+	}
+	defer rows.Close()
+
+	byIssue := make(map[string]AgentWorkspace)
+	for rows.Next() {
+		var workspace AgentWorkspace
+		if err := rows.Scan(
+			&workspace.OwnerKey,
+			&workspace.IssueID,
+			&workspace.RunID,
+			&workspace.Provider,
+			&workspace.Role,
+			&workspace.ExternalID,
+			&workspace.WorkspacePath,
+			&workspace.State,
+			&workspace.LastAction,
+			&workspace.LastError,
+			&workspace.CreatedAt,
+			&workspace.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scanning current agent workspace: %w", err)
+		}
+		if _, exists := byIssue[workspace.IssueID]; !exists {
+			byIssue[workspace.IssueID] = workspace
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating current agent workspaces: %w", err)
+	}
+	return byIssue, nil
 }
 
 // recentEventLimit caps how many trailing events ReadSnapshot loads for the

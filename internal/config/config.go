@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/xlyk/clipse/internal/backend"
 )
 
 // Defaults applied to fields absent from the YAML document.
@@ -77,6 +79,12 @@ const (
 	defaultModelReviewer  = "anthropic:claude-opus-4-6"
 )
 
+const (
+	defaultAgentBackendType          = "local"
+	defaultDaytonaAutoStopMinutes    = 60
+	defaultReviewerAutoDeleteMinutes = 60
+)
+
 // defaultEnvAllowlist is the env var allow-list applied when env_allowlist
 // is absent from the YAML document: what a Phase-2 DAC worker needs
 // (ANTHROPIC_API_KEY, PATH, HOME, a scoped gh token under either common var
@@ -103,6 +111,18 @@ type Repo struct {
 	// branch protection alone (a repo with no CI at all). Defaults to true
 	// when absent from the YAML document.
 	RequireChecks bool `yaml:"require_checks"`
+}
+
+type DaytonaBackend struct {
+	AutoStopMinutes           int    `yaml:"auto_stop_minutes"`
+	ReviewerAutoDeleteMinutes int    `yaml:"reviewer_auto_delete_minutes"`
+	Snapshot                  string `yaml:"snapshot"`
+	Target                    string `yaml:"target"`
+}
+
+type AgentBackend struct {
+	Type    string         `yaml:"type"`
+	Daytona DaytonaBackend `yaml:"daytona"`
 }
 
 // PerLaneCaps caps concurrent workers per lane.
@@ -210,7 +230,8 @@ type Shell struct {
 
 // Config is the fully parsed and validated clipse configuration.
 type Config struct {
-	Repo Repo `yaml:"repo"`
+	Repo         Repo         `yaml:"repo"`
+	AgentBackend AgentBackend `yaml:"agent_backend"`
 	// TeamKey is the Linear team key (e.g. "CLI") the candidate-issues query
 	// filters to, so the dispatcher only ever considers issues on the team
 	// it manages.
@@ -306,6 +327,18 @@ type rawRepo struct {
 	RequireChecks *bool  `yaml:"require_checks"`
 }
 
+type rawDaytonaBackend struct {
+	AutoStopMinutes           *int    `yaml:"auto_stop_minutes"`
+	ReviewerAutoDeleteMinutes *int    `yaml:"reviewer_auto_delete_minutes"`
+	Snapshot                  *string `yaml:"snapshot"`
+	Target                    *string `yaml:"target"`
+}
+
+type rawAgentBackend struct {
+	Type    *string           `yaml:"type"`
+	Daytona rawDaytonaBackend `yaml:"daytona"`
+}
+
 // rawPerLaneCaps mirrors PerLaneCaps with pointer fields so we can tell
 // "absent from YAML" (nil, gets a default) apart from "explicitly zero or
 // negative" (non-nil, must fail validation).
@@ -358,9 +391,10 @@ type rawModelParams struct {
 type rawConfig struct {
 	// Repo is rawRepo (not Repo) so require_checks can default to true when
 	// absent — its string fields still copy straight through.
-	Repo    rawRepo `yaml:"repo"`
-	TeamKey string  `yaml:"team_key"`
-	TeamID  string  `yaml:"team_id"`
+	Repo         rawRepo         `yaml:"repo"`
+	AgentBackend rawAgentBackend `yaml:"agent_backend"`
+	TeamKey      string          `yaml:"team_key"`
+	TeamID       string          `yaml:"team_id"`
 	// Worker is plain (not pointer-wrapped) like Repo: it's required, with
 	// no default to apply, so Load copies it straight through and validate
 	// checks it.
@@ -420,6 +454,15 @@ func Load(path string) (*Config, error) {
 			// wait for CI to register rather than merge without it.
 			RequireChecks: boolOrDefault(raw.Repo.RequireChecks, true),
 		},
+		AgentBackend: AgentBackend{
+			Type: stringValueOrDefault(raw.AgentBackend.Type, defaultAgentBackendType),
+			Daytona: DaytonaBackend{
+				AutoStopMinutes:           intOrDefault(raw.AgentBackend.Daytona.AutoStopMinutes, defaultDaytonaAutoStopMinutes),
+				ReviewerAutoDeleteMinutes: intOrDefault(raw.AgentBackend.Daytona.ReviewerAutoDeleteMinutes, defaultReviewerAutoDeleteMinutes),
+				Snapshot:                  stringValueOrDefault(raw.AgentBackend.Daytona.Snapshot, ""),
+				Target:                    stringValueOrDefault(raw.AgentBackend.Daytona.Target, ""),
+			},
+		},
 		TeamKey: raw.TeamKey,
 		TeamID:  raw.TeamID,
 		Worker:  raw.Worker,
@@ -466,6 +509,12 @@ func Load(path string) (*Config, error) {
 	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("validating config %s: %w", path, err)
 	}
+	if raw.AgentBackend.Daytona.Snapshot != nil && cfg.AgentBackend.Daytona.Snapshot == "" {
+		return nil, fmt.Errorf("validating config %s: agent_backend.daytona.snapshot must not be empty when present", path)
+	}
+	if raw.AgentBackend.Daytona.Target != nil && cfg.AgentBackend.Daytona.Target == "" {
+		return nil, fmt.Errorf("validating config %s: agent_backend.daytona.target must not be empty when present", path)
+	}
 
 	return cfg, nil
 }
@@ -489,6 +538,13 @@ func boolOrDefault(v *bool, def bool) bool {
 
 func stringOrDefault(v *string, def string) string {
 	if v == nil || *v == "" {
+		return def
+	}
+	return *v
+}
+
+func stringValueOrDefault(v *string, def string) string {
+	if v == nil {
 		return def
 	}
 	return *v
@@ -534,6 +590,20 @@ func validate(cfg *Config) error {
 	if cfg.Repo.BaseBranch == "" {
 		return fmt.Errorf("repo.base_branch is required")
 	}
+	if cfg.AgentBackend.Type != "local" && cfg.AgentBackend.Type != "daytona" {
+		return fmt.Errorf("agent_backend.type must be \"local\" or \"daytona\", got %q", cfg.AgentBackend.Type)
+	}
+	if cfg.AgentBackend.Type == "daytona" {
+		if _, _, err := backend.CanonicalGitHubRemote(cfg.Repo.Remote); err != nil {
+			return fmt.Errorf("repo.remote is invalid for daytona: %w", err)
+		}
+		if cfg.AgentBackend.Daytona.AutoStopMinutes <= 0 {
+			return fmt.Errorf("agent_backend.daytona.auto_stop_minutes must be positive, got %d", cfg.AgentBackend.Daytona.AutoStopMinutes)
+		}
+		if cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes <= 0 {
+			return fmt.Errorf("agent_backend.daytona.reviewer_auto_delete_minutes must be positive, got %d", cfg.AgentBackend.Daytona.ReviewerAutoDeleteMinutes)
+		}
+	}
 	if cfg.PollIntervalS <= 0 {
 		return fmt.Errorf("poll_interval_s must be positive, got %d", cfg.PollIntervalS)
 	}
@@ -573,6 +643,10 @@ func validate(cfg *Config) error {
 		// rather than let it silently ride along into every worker's env.
 		if key == "LINEAR_API_KEY" {
 			return fmt.Errorf("env_allowlist must not include LINEAR_API_KEY (kernel-only secret, never passed to a worker)")
+		}
+		switch key {
+		case "DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET":
+			return fmt.Errorf("env_allowlist must not include %s (Daytona controller-only variable)", key)
 		}
 	}
 	// team_key/team_id scope every Linear query/mutation the dispatcher

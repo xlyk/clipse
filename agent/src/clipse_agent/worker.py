@@ -28,10 +28,35 @@ import os
 import sys
 import traceback
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
+from daytona import (
+    Daytona,
+    DaytonaAuthenticationError,
+    DaytonaAuthorizationError,
+    DaytonaConnectionError,
+    DaytonaConfig,
+    DaytonaError,
+    DaytonaNotFoundError,
+    DaytonaRateLimitError,
+    DaytonaTimeoutError,
+    DaytonaValidationError,
+)
+from langchain_daytona import DaytonaSandbox
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from pydantic import ValidationError
 
+from clipse_agent.backends.contracts import BackendActionError, BackendActionRequest, BackendActionResult
+from clipse_agent import dac
+from clipse_agent.backends.daytona import (
+    DaytonaLifecycle,
+    DaytonaSession,
+    RepositoryScopedDaytonaSandbox,
+)
+from clipse_agent.backends.github import safe_error
+from clipse_agent.backends.local import LocalSession
+from clipse_agent.backends.session import AgentSession
 from clipse_agent.contract import BlockKind, Lane, Outcome, Tokens, WorkerResult
 from clipse_agent.graphs.coder import build_coder_graph
 from clipse_agent.graphs.reviewer import build_reviewer_graph
@@ -49,8 +74,10 @@ _MAX_TOKENS_ENV_VAR = "CLIPSE_MAX_TOKENS"
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="clipse-worker")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--backend-action", default="")
+    mode.add_argument("--lane", default="coder")
     parser.add_argument("--issue", default="")
-    parser.add_argument("--lane", default="coder")
     parser.add_argument("--run", default="")
     parser.add_argument("--thread", default="")
     parser.add_argument("--workspace", default="")
@@ -64,7 +91,160 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--docs-shell-allow-list", default="")
     parser.add_argument("--transcript", default="")
     parser.add_argument("--base-branch", default="")
+    parser.add_argument("--backend", default="local")
+    parser.add_argument("--backend-provider", default="daytona")
+    parser.add_argument("--backend-role", default="")
+    parser.add_argument("--repo-url", default="")
+    parser.add_argument("--repo-slug", default="")
+    parser.add_argument("--branch", default="")
+    parser.add_argument("--sandbox-id", default="")
+    parser.add_argument("--auto-stop-minutes", type=int, default=None)
+    parser.add_argument("--reviewer-auto-delete-minutes", type=int, default=None)
+    parser.add_argument("--snapshot", default="")
+    parser.add_argument("--target", default="")
     return parser
+
+
+def _backend_result_identity(args: argparse.Namespace) -> tuple[str, str]:
+    """Return contract-valid identity values even for unsupported input."""
+
+    action = args.backend_action if args.backend_action in {"ensure", "delete", "list"} else "ensure"
+    provider = args.backend_provider if args.backend_provider == "daytona" else "daytona"
+    return action, provider
+
+
+def _backend_failure(
+    args: argparse.Namespace,
+    *,
+    kind: str,
+    operation: str,
+    message: str,
+) -> BackendActionResult:
+    action, provider = _backend_result_identity(args)
+    return BackendActionResult(
+        action=action,
+        provider=provider,
+        ok=False,
+        error_kind=kind,
+        error_operation=operation,
+        error=message,
+    )
+
+
+def _backend_request(args: argparse.Namespace) -> BackendActionRequest:
+    return BackendActionRequest(
+        action=args.backend_action,
+        provider=args.backend_provider,
+        repo_url=args.repo_url or None,
+        repo_slug=args.repo_slug,
+        base_branch=args.base_branch or None,
+        branch=args.branch or None,
+        issue_id=args.issue or None,
+        run_id=args.run or None,
+        role=args.backend_role or None,
+        auto_stop_minutes=args.auto_stop_minutes,
+        reviewer_auto_delete_minutes=args.reviewer_auto_delete_minutes,
+        sandbox_id=args.sandbox_id or None,
+        snapshot=args.snapshot or None,
+        target=args.target or None,
+    )
+
+
+def _dispatch_backend_action(args: argparse.Namespace) -> BackendActionResult:
+    """Run one lifecycle action and always return a parseable typed result."""
+
+    if args.backend_provider != "daytona" or args.backend_action not in {"ensure", "delete", "list"}:
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="backend_action",
+            message="unsupported backend provider or action",
+        )
+    if args.backend_role and args.backend_role not in {"coder", "reviewer"}:
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="backend_action",
+            message="unsupported backend role",
+        )
+
+    try:
+        request = _backend_request(args)
+        lifecycle = DaytonaLifecycle()
+        if request.action == "ensure":
+            workspace = lifecycle.ensure(request)
+            return BackendActionResult(
+                action=request.action,
+                provider=request.provider,
+                ok=True,
+                **workspace.model_dump(),
+            )
+        if request.action == "delete":
+            workspace = lifecycle.delete(request)
+            return BackendActionResult(
+                action=request.action,
+                provider=request.provider,
+                ok=True,
+                **workspace.model_dump(),
+            )
+        workspaces = lifecycle.list(request)
+        return BackendActionResult(action=request.action, provider=request.provider, ok=True, workspaces=workspaces)
+    except BackendActionError as exc:
+        return _backend_failure(
+            args,
+            kind=exc.kind,
+            operation=exc.operation,
+            message=str(exc),
+        )
+    except (DaytonaAuthenticationError, DaytonaAuthorizationError):
+        return _backend_failure(
+            args,
+            kind="needs_input",
+            operation="daytona_auth",
+            message="Daytona authentication is required",
+        )
+    except DaytonaValidationError as exc:
+        return _backend_failure(
+            args,
+            kind="needs_input",
+            operation="daytona_config",
+            message=safe_error("daytona configuration", exc),
+        )
+    except (DaytonaTimeoutError, DaytonaConnectionError, DaytonaRateLimitError, DaytonaNotFoundError, TimeoutError) as exc:
+        return _backend_failure(
+            args,
+            kind="transient",
+            operation="daytona",
+            message=safe_error("daytona", exc),
+        )
+    except ValidationError:
+        return _backend_failure(
+            args,
+            kind="needs_input",
+            operation="backend_action",
+            message="invalid backend action request",
+        )
+    except (ImportError, AttributeError, TypeError) as exc:
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="daytona_sdk",
+            message=safe_error("Daytona SDK", exc),
+        )
+    except DaytonaError as exc:
+        return _backend_failure(
+            args,
+            kind="transient",
+            operation="daytona",
+            message=safe_error("daytona provider", exc),
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown failures are not safe to retry automatically
+        return _backend_failure(
+            args,
+            kind="capability",
+            operation="daytona_sdk",
+            message=safe_error("Daytona SDK", exc),
+        )
 
 
 def _resolve_max_tokens(args: argparse.Namespace) -> int | None:
@@ -126,6 +306,55 @@ def _coerce_lane(raw: str) -> Lane | None:
         return Lane(raw)
     except ValueError:
         return None
+
+
+@dataclass(frozen=True)
+class _SessionAttachFailure:
+    summary: str = "clipse-worker: Daytona sandbox attachment failed"
+
+
+def _build_session(args: argparse.Namespace) -> AgentSession | _SessionAttachFailure:
+    """Attach this worker invocation to its local or remote runtime."""
+
+    if args.backend in {"", "local"}:
+        return LocalSession(args.workspace, args.repo_slug)
+    if args.backend != "daytona":
+        raise ValueError(f"unsupported runtime backend: {args.backend}")
+    if not args.sandbox_id:
+        raise ValueError("Daytona runtime requires --sandbox-id")
+
+    try:
+        sdk_sandbox = Daytona(DaytonaConfig(target=args.target or None)).get(args.sandbox_id)
+        daytona_backend = DaytonaSandbox(sandbox=sdk_sandbox)
+        sandbox = RepositoryScopedDaytonaSandbox(daytona_backend, args.workspace)
+    except Exception:  # noqa: BLE001 - discard provider bodies and exception causes at the attach boundary
+        return _SessionAttachFailure()
+    return DaytonaSession(args.workspace, args.repo_slug, sandbox, sdk_sandbox)
+
+
+def _session_agent_factory(session: AgentSession) -> Any:
+    """Bind DAC construction to the session without changing local kwargs."""
+
+    def _build(profile: Any, checkpointer: Any, cwd: str) -> Any:
+        if session.sandbox is None:
+            return dac.build_coder_agent(profile, checkpointer, cwd)
+        profile = replace(
+            profile,
+            system_prompt=(
+                f"{profile.system_prompt}\n\n"
+                f"The absolute repository root in this Daytona sandbox is {session.cwd}. "
+                "Treat that path as the workspace root for every repository operation."
+            ),
+        )
+        return dac.build_coder_agent(
+            profile,
+            checkpointer,
+            cwd,
+            sandbox=session.sandbox,
+            sandbox_type=session.sandbox_type,
+        )
+
+    return _build
 
 
 def _blocked_transient(args: argparse.Namespace, *, lane: Lane, summary: str) -> WorkerResult:
@@ -201,6 +430,7 @@ async def _run_lane_graph(
         "workspace": args.workspace,
         "max_tokens": _resolve_max_tokens(args),
         "base_branch": args.base_branch,
+        "branch": args.branch,
     }
     config: dict[str, Any] = {"configurable": {"thread_id": f"{args.thread}::{lane.value}"}}
 
@@ -233,6 +463,9 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
     """
     lane = _coerce_lane(args.lane)
     if lane == Lane.coder:
+        session = _build_session(args)
+        if isinstance(session, _SessionAttachFailure):
+            return _blocked_transient(args, lane=Lane.coder, summary=session.summary)
         return await _run_lane_graph(
             args,
             build_coder_graph,
@@ -249,9 +482,14 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
                     shell_allow_list=_parse_shell(args.docs_shell_allow_list),
                 ),
                 "transcript": _build_transcript(args.transcript),
+                "session": session,
+                "agent_factory": _session_agent_factory(session),
             },
         )
     if lane == Lane.reviewer:
+        session = _build_session(args)
+        if isinstance(session, _SessionAttachFailure):
+            return _blocked_transient(args, lane=Lane.reviewer, summary=session.summary)
         return await _run_lane_graph(
             args,
             build_reviewer_graph,
@@ -263,6 +501,8 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
                     shell_allow_list=_parse_shell(args.shell_allow_list),
                 ),
                 "transcript": _build_transcript(args.transcript),
+                "session": session,
+                "agent_factory": _session_agent_factory(session),
             },
         )
     return _blocked_transient(
@@ -274,6 +514,11 @@ async def _dispatch(args: argparse.Namespace) -> WorkerResult:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+
+    if args.backend_action:
+        result = _dispatch_backend_action(args)
+        print(result.model_dump_json(exclude_none=True))
+        return 0
 
     try:
         result = asyncio.run(_dispatch(args))

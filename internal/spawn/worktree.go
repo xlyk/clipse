@@ -18,9 +18,9 @@ import (
 // what lets a continuation turn pick up on-disk progress a prior turn left
 // behind, so EnsureWorktree is idempotent by design, not just by accident.
 //
-// If no worktree exists yet, EnsureWorktree creates one, branching a new
-// local branch off baseBranch when branch doesn't already exist locally, or
-// checking out the existing local branch into the new worktree otherwise.
+// If no worktree exists yet, EnsureWorktree creates one, checking out the
+// existing local branch when present. Otherwise it fetches and branches from
+// the matching remote feature ref when present, falling back to baseBranch.
 func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, worktreeRoot string) (string, error) {
 	path := worktreePathFor(worktreeRoot, branch)
 
@@ -46,17 +46,30 @@ func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, w
 	if branchExistsLocally {
 		args = []string{"worktree", "add", path, branch}
 	} else {
+		startPoint := ""
+		if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", branch); err == nil {
+			branchExistsRemotely, err := remoteBranchExists(ctx, primaryClonePath, branch)
+			if err != nil {
+				return "", err
+			}
+			if branchExistsRemotely {
+				startPoint = "origin/" + branch
+			}
+		}
+
 		// Branch from the REMOTE base tip, not the local ref: the primary
 		// clone's local base only advances when something fetches it, and
 		// nothing in the kernel did -- the Reflex build ran an external
 		// fast-forward cron as a workaround, so dependents kept building on a
 		// stale base. A fetch failure (offline dev, no reachable remote)
 		// falls back to the local ref rather than failing the spawn.
-		base := baseBranch
-		if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", baseBranch); err == nil {
-			base = "origin/" + baseBranch
+		if startPoint == "" {
+			startPoint = baseBranch
+			if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", baseBranch); err == nil {
+				startPoint = "origin/" + baseBranch
+			}
 		}
-		args = []string{"worktree", "add", "-b", branch, path, base}
+		args = []string{"worktree", "add", "-b", branch, path, startPoint}
 	}
 	if err := runGitCmd(ctx, primaryClonePath, args...); err != nil {
 		if !isMissingButRegisteredWorktreeErr(err) {
@@ -77,6 +90,55 @@ func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, w
 		}
 	}
 
+	return path, nil
+}
+
+// EnsureRemoteWorktree creates or refreshes the deterministic Git-operator
+// worktree from the authoritative remote feature branch. Unlike the local
+// coder path, it never falls back to a base ref when fetch fails or the
+// feature is missing. Existing dirty state is refused rather than erased;
+// a clean app-owned worktree is recreated from origin/<feature> so rework
+// pushes are visible on the next merge attempt.
+func EnsureRemoteWorktree(ctx context.Context, primaryClonePath, branch, worktreeRoot string) (string, error) {
+	path := worktreePathFor(worktreeRoot, branch)
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		return "", fmt.Errorf("creating worktree root %s: %w", worktreeRoot, err)
+	}
+	refspec := "+refs/heads/" + branch + ":refs/remotes/origin/" + branch
+	if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", refspec); err != nil {
+		return "", fmt.Errorf("fetching required remote feature branch %s: %w", branch, err)
+	}
+	exists, err := remoteBranchExists(ctx, primaryClonePath, branch)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("required remote feature branch %s is missing", branch)
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		status, statusErr := gitOutput(ctx, path, "status", "--porcelain")
+		if statusErr != nil {
+			return "", fmt.Errorf("checking existing remote worktree %s: %w", path, statusErr)
+		}
+		if strings.TrimSpace(status) != "" {
+			return "", fmt.Errorf("existing remote worktree %s is dirty", path)
+		}
+		if err := runGitCmd(ctx, path, "merge-base", "--is-ancestor", "HEAD", "origin/"+branch); err != nil {
+			return "", fmt.Errorf("existing remote worktree %s diverged from origin/%s", path, branch)
+		}
+		if err := runGitCmd(ctx, primaryClonePath, "worktree", "remove", "--force", path); err != nil {
+			return "", fmt.Errorf("refreshing remote worktree %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("checking for existing worktree at %s: %w", path, err)
+	}
+	if err := runGitCmd(ctx, primaryClonePath, "worktree", "prune"); err != nil {
+		return "", fmt.Errorf("pruning worktrees before remote refresh: %w", err)
+	}
+	if err := runGitCmd(ctx, primaryClonePath, "worktree", "add", "-B", branch, path, "origin/"+branch); err != nil {
+		return "", fmt.Errorf("creating strict remote worktree for branch %s at %s: %w", branch, path, err)
+	}
 	return path, nil
 }
 
@@ -112,7 +174,25 @@ func worktreePathFor(worktreeRoot, branch string) string {
 // localBranchExists reports whether branch already exists as a local branch
 // in the repo at primaryClonePath.
 func localBranchExists(ctx context.Context, primaryClonePath, branch string) (bool, error) {
-	err := runGitCmd(ctx, primaryClonePath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	exists, err := gitRefExists(ctx, primaryClonePath, "refs/heads/"+branch)
+	if err != nil {
+		return false, fmt.Errorf("checking whether branch %s exists: %w", branch, err)
+	}
+	return exists, nil
+}
+
+// remoteBranchExists reports whether origin's remote-tracking ref for branch
+// exists in the repo at primaryClonePath.
+func remoteBranchExists(ctx context.Context, primaryClonePath, branch string) (bool, error) {
+	exists, err := gitRefExists(ctx, primaryClonePath, "refs/remotes/origin/"+branch)
+	if err != nil {
+		return false, fmt.Errorf("checking whether remote branch origin/%s exists: %w", branch, err)
+	}
+	return exists, nil
+}
+
+func gitRefExists(ctx context.Context, primaryClonePath, ref string) (bool, error) {
+	err := runGitCmd(ctx, primaryClonePath, "show-ref", "--verify", "--quiet", ref)
 	if err == nil {
 		return true, nil
 	}
@@ -122,20 +202,25 @@ func localBranchExists(ctx context.Context, primaryClonePath, branch string) (bo
 		// doesn't exist, distinct from other failures.
 		return false, nil
 	}
-	return false, fmt.Errorf("checking whether branch %s exists: %w", branch, err)
+	return false, err
 }
 
 // runGitCmd runs `git <args...>` with dir as its working directory,
 // returning an error that wraps the command's stderr output so failures are
 // debuggable from the returned error alone.
 func runGitCmd(ctx context.Context, dir string, args ...string) error {
+	_, err := gitOutput(ctx, dir, args...)
+	return err
+}
+
+func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return string(out), nil
 }
 
 // isMissingButRegisteredWorktreeErr reports whether a `git worktree add`

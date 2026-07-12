@@ -106,10 +106,42 @@ type LinearWrite struct {
 	UpdatedAt int64
 }
 
+// WorkspaceState is the provider-neutral lifecycle state of an agent's
+// execution workspace. Provider-specific states are normalized before they
+// enter the store.
+type WorkspaceState string
+
+const (
+	WorkspaceActive         WorkspaceState = "active"
+	WorkspaceStopped        WorkspaceState = "stopped"
+	WorkspaceCleanupPending WorkspaceState = "cleanup_pending"
+	WorkspaceDeleted        WorkspaceState = "deleted"
+	WorkspaceError          WorkspaceState = "error"
+)
+
+// AgentWorkspace records the durable provider-neutral identity and lifecycle
+// state of one remote agent workspace. Coder workspaces are issue-scoped and
+// persistent; reviewer workspaces also carry their run id.
+type AgentWorkspace struct {
+	OwnerKey      string
+	IssueID       string
+	RunID         string
+	Provider      string
+	Role          string
+	ExternalID    string
+	WorkspacePath string
+	State         WorkspaceState
+	LastAction    string
+	LastError     string
+	CreatedAt     int64
+	UpdatedAt     int64
+}
+
 // IssueSnapshot pairs an Issue with its most recent Run, if any.
 type IssueSnapshot struct {
 	Issue
 	LatestRun *Run
+	Workspace *AgentWorkspace
 
 	// Runs is every run for this issue in chronological order (oldest first:
 	// coder, then reviewer, then git_operator as the card
