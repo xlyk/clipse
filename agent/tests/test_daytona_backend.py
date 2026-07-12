@@ -55,6 +55,11 @@ class _FakeGit:
     current_branch: str = "main"
     created_branches: list[tuple[str, str]] = field(default_factory=list)
     checked_out_branches: list[tuple[str, str]] = field(default_factory=list)
+    local_branches: set[str] = field(default_factory=lambda: {"main"})
+    create_branch_error_after: BaseException | None = None
+    checkout_branch_error_after: BaseException | None = None
+    branches_error_on_calls: set[int] = field(default_factory=set)
+    branches_calls: int = 0
 
     def clone(self, **kwargs: Any) -> None:
         if self.events is not None:
@@ -63,6 +68,7 @@ class _FakeGit:
         if self.raises is not None:
             raise self.raises
         self.current_branch = kwargs["branch"]
+        self.local_branches.add(kwargs["branch"])
 
     def status(self, path: str) -> Any:
         assert path == REMOTE_REPO_ABS
@@ -70,11 +76,22 @@ class _FakeGit:
 
     def create_branch(self, path: str, name: str) -> None:
         self.created_branches.append((path, name))
-        self.current_branch = name
+        self.local_branches.add(name)
+        if self.create_branch_error_after is not None:
+            raise self.create_branch_error_after
 
     def checkout_branch(self, path: str, branch: str) -> None:
         self.checked_out_branches.append((path, branch))
         self.current_branch = branch
+        if self.checkout_branch_error_after is not None:
+            raise self.checkout_branch_error_after
+
+    def branches(self, path: str) -> Any:
+        assert path == REMOTE_REPO_ABS
+        self.branches_calls += 1
+        if self.branches_calls in self.branches_error_on_calls:
+            raise RuntimeError("lost branch-state response canary")
+        return type("Branches", (), {"branches": sorted(self.local_branches)})()
 
 
 @dataclass
@@ -112,6 +129,8 @@ class _FakeClient:
         get_error: BaseException | None = None,
         list_error: BaseException | None = None,
         start_error: BaseException | None = None,
+        create_branch_error_after: BaseException | None = None,
+        branches_error_on_calls: set[int] | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.sandboxes = list(sandboxes or [])
@@ -121,6 +140,8 @@ class _FakeClient:
         self.get_error = get_error
         self.list_error = list_error
         self.start_error = start_error
+        self.create_branch_error_after = create_branch_error_after
+        self.branches_error_on_calls = set(branches_error_on_calls or set())
         self.events = events
         self.list_queries: list[Any] = []
         self.create_params: list[Any] = []
@@ -148,7 +169,12 @@ class _FakeClient:
             id=f"sandbox-{len(self.sandboxes) + 1}",
             labels=dict(params.labels),
             env=dict(params.env_vars or {}),
-            git=_FakeGit(raises=self.clone_error, events=self.events),
+            git=_FakeGit(
+                raises=self.clone_error,
+                events=self.events,
+                create_branch_error_after=self.create_branch_error_after,
+                branches_error_on_calls=set(self.branches_error_on_calls),
+            ),
         )
         self.sandboxes.append(sandbox)
         return sandbox
@@ -303,6 +329,17 @@ def test_ensure_coder_restores_existing_remote_feature_branch() -> None:
     assert client.sandboxes[0].git.current_branch == request.branch
 
 
+def test_ensure_branch_lookup_failure_creates_no_sandbox() -> None:
+    client = _FakeClient()
+
+    with pytest.raises(BackendActionError) as raised:
+        _lifecycle(client, branch_probe_error=TimeoutError("network canary")).ensure(_request())
+
+    assert raised.value.kind == "transient"
+    assert client.create_params == []
+    assert client.sandboxes == []
+
+
 def test_ensure_coder_repairs_reused_sandbox_to_requested_branch() -> None:
     request = _request()
     sandbox = _FakeSandbox(id="sandbox-1", labels=labels_for(request))
@@ -314,6 +351,60 @@ def test_ensure_coder_repairs_reused_sandbox_to_requested_branch() -> None:
     assert workspace.external_id == sandbox.id
     assert sandbox.git.created_branches == [(REMOTE_REPO_ABS, request.branch)]
     assert sandbox.git.checked_out_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert sandbox.git.current_branch == request.branch
+
+
+def test_ensure_coder_recovers_lost_create_response_then_retry_checks_out_existing_branch() -> None:
+    request = _request()
+    client = _FakeClient(
+        create_branch_error_after=RuntimeError("lost create response canary"),
+        delete_error=RuntimeError("lost cleanup response canary"),
+        branches_error_on_calls={2},
+    )
+
+    with pytest.raises(BackendActionError) as first:
+        _lifecycle(client, remote_branch_exists=False).ensure(request)
+    assert first.value.kind == "transient"
+    assert first.value.operation == "clone_cleanup"
+    sandbox = client.sandboxes[0]
+    assert request.branch in sandbox.git.local_branches
+
+    client.delete_error = None
+    client.create_branch_error_after = None
+    sandbox.git.create_branch_error_after = None
+    workspace = _lifecycle(client, remote_branch_exists=False).ensure(request)
+
+    assert workspace.external_id == sandbox.id
+    assert request.branch in sandbox.git.local_branches
+    assert sandbox.git.current_branch == request.branch
+    assert sandbox.git.checked_out_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert sandbox.git.created_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert client.deleted == [sandbox]
+
+
+def test_ensure_coder_checks_out_existing_local_feature_instead_of_recreating() -> None:
+    request = _request()
+    sandbox = _FakeSandbox(id="sandbox-1", labels=labels_for(request))
+    sandbox.git.local_branches.add(request.branch)
+    client = _FakeClient([sandbox])
+
+    _lifecycle(client, remote_branch_exists=False).ensure(request)
+
+    assert sandbox.git.created_branches == []
+    assert sandbox.git.checked_out_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert sandbox.git.current_branch == request.branch
+
+
+def test_ensure_coder_accepts_ambiguous_checkout_when_branch_is_current() -> None:
+    request = _request()
+    sandbox = _FakeSandbox(id="sandbox-1", labels=labels_for(request))
+    sandbox.git.local_branches.add(request.branch)
+    sandbox.git.checkout_branch_error_after = RuntimeError("lost checkout response canary")
+    client = _FakeClient([sandbox])
+
+    workspace = _lifecycle(client, remote_branch_exists=False).ensure(request)
+
+    assert workspace.external_id == sandbox.id
     assert sandbox.git.current_branch == request.branch
 
 

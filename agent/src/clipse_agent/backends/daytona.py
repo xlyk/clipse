@@ -65,6 +65,8 @@ class _Git(Protocol):
 
     def checkout_branch(self, path: str, branch: str) -> None: ...
 
+    def branches(self, path: str) -> Any: ...
+
 
 class _Sandbox(Protocol):
     id: str
@@ -545,6 +547,8 @@ class DaytonaLifecycle:
 
     @staticmethod
     def _failure_kind(exc: BaseException) -> str:
+        if isinstance(exc, BackendActionError):
+            return exc.kind
         if isinstance(
             exc,
             (DaytonaAuthenticationError, DaytonaAuthorizationError, DaytonaValidationError),
@@ -583,6 +587,11 @@ class DaytonaLifecycle:
         assert request.repo_url is not None
         assert request.branch is not None
         assert request.base_branch is not None
+        if request.role == "reviewer":
+            clone_branch = request.branch
+        else:
+            exists = self._remote_feature_exists(request) if remote_feature_exists is None else remote_feature_exists
+            clone_branch = request.branch if exists else request.base_branch
         auto_delete = request.reviewer_auto_delete_minutes if request.role == "reviewer" else None
         params = CreateSandboxFromSnapshotParams(
             name=owner_key(request),
@@ -600,11 +609,6 @@ class DaytonaLifecycle:
                 "daytona_config",
                 safe_error("daytona configuration", exc),
             ) from None
-        if request.role == "reviewer":
-            clone_branch = request.branch
-        else:
-            exists = self._remote_feature_exists(request) if remote_feature_exists is None else remote_feature_exists
-            clone_branch = request.branch if exists else request.base_branch
         try:
             sandbox.git.clone(
                 url=request.repo_url,
@@ -614,8 +618,7 @@ class DaytonaLifecycle:
                 password=token,
             )
             if request.role == "coder" and clone_branch != request.branch:
-                sandbox.git.create_branch(REMOTE_REPO_ABS, request.branch)
-                sandbox.git.checkout_branch(REMOTE_REPO_ABS, request.branch)
+                self._establish_local_feature_branch(sandbox, request.branch)
         except Exception as exc:
             try:
                 self._client.delete(sandbox)
@@ -630,31 +633,76 @@ class DaytonaLifecycle:
             raise BackendActionError(self._failure_kind(exc), "clone", safe_error("clone", exc)) from None
         return sandbox
 
-    def _ensure_coder_branch(self, sandbox: _Sandbox, request: BackendActionRequest) -> _Sandbox:
-        assert request.branch is not None
+    def _branch_state(self, sandbox: _Sandbox) -> tuple[str, set[str]]:
         try:
             current = sandbox.git.status(REMOTE_REPO_ABS).current_branch
+            raw_branches = sandbox.git.branches(REMOTE_REPO_ABS).branches
         except Exception as exc:  # noqa: BLE001 - provider bodies may contain credentials
-            raise BackendActionError("transient", "ensure_branch", safe_error("branch status", exc)) from None
+            raise BackendActionError(
+                self._failure_kind(exc), "ensure_branch", safe_error("branch state", exc)
+            ) from None
+        if not isinstance(current, str) or not isinstance(raw_branches, list) or not all(
+            isinstance(branch, str) for branch in raw_branches
+        ):
+            raise BackendActionError("transient", "ensure_branch", "branch state was malformed")
+        return current, set(raw_branches)
+
+    def _checkout_local_feature(self, sandbox: _Sandbox, branch: str) -> None:
+        try:
+            sandbox.git.checkout_branch(REMOTE_REPO_ABS, branch)
+        except Exception as exc:  # noqa: BLE001 - verify ambiguous provider responses
+            current, _branches = self._branch_state(sandbox)
+            if current == branch:
+                return
+            raise BackendActionError(
+                self._failure_kind(exc), "ensure_branch", safe_error("branch checkout", exc)
+            ) from None
+        current, _branches = self._branch_state(sandbox)
+        if current != branch:
+            raise BackendActionError("transient", "ensure_branch", "branch checkout did not take effect")
+
+    def _establish_local_feature_branch(self, sandbox: _Sandbox, branch: str) -> None:
+        current, branches = self._branch_state(sandbox)
+        if current == branch:
+            return
+        if branch in branches:
+            self._checkout_local_feature(sandbox, branch)
+            return
+        try:
+            sandbox.git.create_branch(REMOTE_REPO_ABS, branch)
+        except Exception as exc:  # noqa: BLE001 - create may have succeeded before response loss
+            current, branches = self._branch_state(sandbox)
+            if current == branch:
+                return
+            if branch in branches:
+                self._checkout_local_feature(sandbox, branch)
+                return
+            raise BackendActionError(
+                self._failure_kind(exc), "ensure_branch", safe_error("branch creation", exc)
+            ) from None
+        current, branches = self._branch_state(sandbox)
+        if current == branch:
+            return
+        if branch not in branches:
+            raise BackendActionError("transient", "ensure_branch", "branch creation did not take effect")
+        self._checkout_local_feature(sandbox, branch)
+
+    def _ensure_coder_branch(self, sandbox: _Sandbox, request: BackendActionRequest) -> _Sandbox:
+        assert request.branch is not None
+        current, _branches = self._branch_state(sandbox)
         if current == request.branch:
             return sandbox
 
-        token = self._token_reader()
         remote_exists = self._remote_feature_exists(request)
         if not remote_exists:
-            try:
-                sandbox.git.create_branch(REMOTE_REPO_ABS, request.branch)
-                sandbox.git.checkout_branch(REMOTE_REPO_ABS, request.branch)
-            except Exception as exc:  # noqa: BLE001
-                raise BackendActionError(
-                    self._failure_kind(exc), "ensure_branch", safe_error("branch creation", exc)
-                ) from None
+            self._establish_local_feature_branch(sandbox, request.branch)
             return sandbox
 
         # A previous buggy provision left this identity on the base branch.
         # Recreate from the pushed feature rather than guessing how much state
         # the incomplete clone has fetched.
         assert self._client is not None
+        token = self._token_reader()
         try:
             self._client.delete(sandbox)
         except Exception as exc:  # noqa: BLE001
