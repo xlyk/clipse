@@ -23,7 +23,7 @@ make build
 make test
 ```
 
-Expected result: the binary prints the `dispatch`, `status`, and `tui` subcommands, then the Go race suite and Python tests pass.
+Expected result: the binary prints the `board`, `dispatch`, `status`, and `tui` subcommands, then the Go race suite and Python tests pass.
 <!-- managed:readme-agents-doc:section=QUICKSTART:END -->
 
 <!-- managed:readme-agents-doc:section=FEATURES:BEGIN -->
@@ -33,6 +33,7 @@ Expected result: the binary prints the `dispatch`, `status`, and `tui` subcomman
 - **Typed worker contract** — JSON Schema generates both Go and Pydantic types, so worker results stay compatible across the process boundary.
 - **Isolated agent tools** — Daytona runs DAC filesystem and shell tools in remote sandboxes; local worktrees remain an explicit option.
 - **Real review and merge lanes** — coder and reviewer lanes run DAC turns; the git-operator merge gate is deterministic Go.
+- **Declarative board bootstrap** — `clipse board plan|apply` reconciles a `board.yaml` of issues, dependencies, and lane labels onto Linear, and a re-apply touches only what changed.
 - **Live operations surface** — `clipse status` prints a SQLite snapshot, and `clipse tui` shows the board, activity, transcripts, and worker tails.
 - **Behavioral evals** — `make eval` runs live-model cases that pin known coder, docs, and reviewer incidents.
 <!-- managed:readme-agents-doc:section=FEATURES:END -->
@@ -58,6 +59,17 @@ $EDITOR configs/clipse.yaml
 The shipped example selects `agent_backend.type: daytona`. Its coder and docs turns reuse one issue-scoped sandbox; each reviewer run gets a fresh disposable sandbox. Sandboxes stop after 60 idle minutes by default. Reviewers also request automatic deletion after 60 minutes as a fallback to explicit cleanup. Daytona setup or provider failures stop the run—Clipse never falls back silently to local execution.
 
 To keep the original host-worktree path, set `agent_backend.type: local` or omit the entire `agent_backend` block. Local mode is supported but is not recommended for new installations.
+
+### Bootstrap a Linear board
+
+A new project needs a board before the dispatcher has work: issues, `blocked-by` dependencies, and `agent:<lane>` labels. Describe it once in a `board.yaml` (shape: `configs/board.example.yaml`), preview the changes, then apply:
+
+```sh
+./bin/clipse board plan board.yaml
+./bin/clipse board apply board.yaml
+```
+
+A second apply skips unchanged issues, updates edited ones, and never deletes — a hidden ref marker in each issue ties it to its spec entry. The repo-versioned `clipse-board-bootstrap` skill (`skills/`) turns a prose project plan into a valid `board.yaml`.
 
 ### Inspect board state
 
