@@ -324,6 +324,7 @@ func TestWorkerArgs(t *testing.T) {
 				RepoURL:   "https://github.com/xlyk/clipse.git",
 				RepoSlug:  "xlyk/clipse",
 				Branch:    "CLP-1-branch",
+				Target:    "us",
 			},
 			want: []string{
 				"--issue=CLP-1",
@@ -336,6 +337,7 @@ func TestWorkerArgs(t *testing.T) {
 				"--repo-url=https://github.com/xlyk/clipse.git",
 				"--repo-slug=xlyk/clipse",
 				"--branch=CLP-1-branch",
+				"--target=us",
 			},
 		},
 	}

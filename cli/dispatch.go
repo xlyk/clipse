@@ -116,7 +116,7 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 		if err != nil {
 			return fmt.Errorf("preflighting daytona backend: invalid repo.remote: %w", err)
 		}
-		backendManager = backend.NewCommandManager(workerCommand, nil, os.Environ())
+		backendManager = backend.NewCommandManager(workerCommand, nil, os.Environ(), cfg.Repo.Path)
 		if _, err := backendManager.List(cmd.Context(), backend.ListRequest{
 			Provider: "daytona",
 			RepoSlug: repoSlug,
@@ -175,7 +175,7 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 	}
 
 	spawner := spawn.NewLocalSpawner(workerCommand, boardDir)
-	ws := dispatcher.NewGitWorkspacer(cfg.Repo.Path, cfg.Repo.BaseBranch, worktreeRoot)
+	ws := dispatcher.NewGitWorkspacer(cfg.Repo.Path, cfg.Repo.BaseBranch, worktreeRoot, cfg.AgentBackend.Type == "daytona")
 
 	options := []dispatcher.Option{dispatcher.WithLogger(logger)}
 	if backendManager != nil {

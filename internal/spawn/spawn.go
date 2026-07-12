@@ -58,6 +58,12 @@ type WorkerSpec struct {
 	RepoURL   string
 	RepoSlug  string
 	Branch    string
+	Target    string
+
+	// ProjectDir is the managed host repository used only as the controller
+	// process cwd in Daytona mode. Workspace remains the remote repository
+	// path passed to DAC and must never be used as an exec.Cmd.Dir on host.
+	ProjectDir string
 
 	// CheckpointDB is the absolute path to this issue's LangGraph
 	// checkpointer SQLite database (design doc: one file per issue, outside

@@ -135,6 +135,9 @@ func TestSpawnAttempt_DaytonaProvisionsPersistsAndSanitizesWorkerSpec(t *testing
 	if spec.RepoURL != "https://github.com/xlyk/clipse.git" || spec.RepoSlug != "xlyk/clipse" || spec.Branch != "issue-1-branch" {
 		t.Errorf("Daytona worker repo metadata = %+v", spec)
 	}
+	if spec.Target != "us" || spec.ProjectDir != cfg.Repo.Path {
+		t.Errorf("Daytona worker controller metadata = %+v", spec)
+	}
 	wantEnv := []string{
 		"ANTHROPIC_API_KEY=model-secret", "PATH=/host/bin", "HOME=/host/home", "CLIPSE_ISSUE_TEXT=task",
 		"DAYTONA_API_KEY=daytona-secret", "DAYTONA_API_URL=https://daytona.example", "DAYTONA_TARGET=us",
@@ -492,6 +495,100 @@ func TestWorkspaceCleanupFailureRemainsPending(t *testing.T) {
 	}
 	if got := manager.deletedWorkspaces(); len(got) != 1 || got[0].ExternalID != "sb-1" {
 		t.Fatalf("Delete calls = %+v", got)
+	}
+}
+
+func TestWorkspaceCleanupRunsDuringLinearPollOutage(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	seedAgentWorkspace(t, s, store.AgentWorkspace{
+		OwnerKey: "daytona:xlyk/clipse:coder:issue-1", IssueID: "issue-1", Provider: "daytona", Role: "coder",
+		ExternalID: "sb-1", WorkspacePath: "/workspace", State: store.WorkspaceCleanupPending,
+		LastAction: "ensure", CreatedAt: 10, UpdatedAt: 10,
+	})
+	manager := &fakeBackendManager{}
+	cfg := testConfig()
+	cfg.AgentBackend.Type = "daytona"
+	cfg.Repo.Remote = "https://github.com/xlyk/clipse.git"
+	d := dispatcher.New(cfg, s, &linear.MockClient{Err: errFakeLinearDown}, newFakeSpawner(), newStubWorkspacer(t.TempDir()),
+		dispatcher.WithBackendManager(manager), dispatcher.WithClock(fixedClock(1000)))
+
+	err := d.Tick(ctx)
+
+	if err == nil || !strings.Contains(err.Error(), "poll") {
+		t.Fatalf("Tick error = %v, want retained poll error", err)
+	}
+	if got := manager.deletedWorkspaces(); len(got) != 1 || got[0].ExternalID != "sb-1" {
+		t.Fatalf("Delete calls = %+v, want cleanup despite poll outage", got)
+	}
+	workspace := mustAgentWorkspace(t, s, "issue-1", "daytona:xlyk/clipse:coder:issue-1")
+	if workspace.State != store.WorkspaceDeleted {
+		t.Fatalf("workspace state = %q, want deleted", workspace.State)
+	}
+}
+
+func TestReviewerSpawnFailureQueuesKnownWorkspaceCleanup(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", string(contract.ColumnReview), 1, 100)
+	spawner := newFakeSpawner()
+	spawner.SpawnErr = errors.New("process start failed")
+	manager := &fakeBackendManager{workspace: backend.Workspace{
+		Provider: "daytona", OwnerKey: "daytona:xlyk/clipse:reviewer:issue-1:run-1",
+		ExternalID: "sandbox-reviewer", WorkspacePath: "/home/daytona/workspace/clipse", State: "active",
+	}}
+	cfg := testConfig()
+	cfg.AgentBackend.Type = "daytona"
+	cfg.Repo.Remote = "https://github.com/xlyk/clipse.git"
+	cfg.RecoverCap = 0
+	d := dispatcher.New(cfg, s, &linear.MockClient{}, spawner, newStubWorkspacer(t.TempDir()),
+		dispatcher.WithBackendManager(manager), dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := mustAgentWorkspace(t, s, "issue-1", manager.workspace.OwnerKey)
+	if workspace.State != store.WorkspaceCleanupPending {
+		t.Fatalf("workspace state = %q, want cleanup_pending", workspace.State)
+	}
+	issue := getIssue(t, s, "issue-1")
+	if issue.BoardStatus != string(contract.ColumnBlocked) {
+		t.Fatalf("issue status = %q, want blocked", issue.BoardStatus)
+	}
+}
+
+func TestReviewerSpawnFailureRetryDoesNotLeakRunOwner(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	seedColumnIssue(t, s, "issue-1", string(contract.ColumnReview), 1, 100)
+	spawner := newFakeSpawner()
+	spawner.SpawnErr = errors.New("process start failed")
+	manager := &fakeBackendManager{workspace: backend.Workspace{
+		Provider: "daytona", OwnerKey: "daytona:xlyk/clipse:reviewer:issue-1:run-1",
+		ExternalID: "sandbox-reviewer", WorkspacePath: "/home/daytona/workspace/clipse", State: "active",
+	}}
+	cfg := testConfig()
+	cfg.AgentBackend.Type = "daytona"
+	cfg.Repo.Remote = "https://github.com/xlyk/clipse.git"
+	cfg.RecoverCap = 1
+	cfg.RecoverBackoffS = 1
+	d := dispatcher.New(cfg, s, &linear.MockClient{}, spawner, newStubWorkspacer(t.TempDir()),
+		dispatcher.WithBackendManager(manager), dispatcher.WithClock(fixedClock(1000)),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := mustAgentWorkspace(t, s, "issue-1", manager.workspace.OwnerKey)
+	if workspace.State != store.WorkspaceCleanupPending {
+		t.Fatalf("workspace state = %q, want cleanup_pending before a new retry owner can be provisioned", workspace.State)
+	}
+	issue := getIssue(t, s, "issue-1")
+	if issue.BoardStatus != string(contract.ColumnReview) || issue.RecoverAttempts != 1 {
+		t.Fatalf("issue after retry schedule = %+v", issue)
 	}
 }
 

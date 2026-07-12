@@ -192,6 +192,100 @@ func TestEnsureWorktree_UsesRemoteFeatureBranchWhenLocalBranchMissing(t *testing
 	}
 }
 
+func TestEnsureRemoteWorktree_RequiresRemoteFeature(t *testing.T) {
+	_, primary := newRemoteAndClone(t, "main")
+
+	_, err := spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, "feat/missing", t.TempDir())
+
+	if err == nil || !strings.Contains(err.Error(), "feat/missing") {
+		t.Fatalf("EnsureRemoteWorktree error = %v, want missing remote feature", err)
+	}
+}
+
+func TestEnsureRemoteWorktree_PropagatesInitialFetchFailure(t *testing.T) {
+	primary := newPrimaryRepo(t, "main")
+
+	_, err := spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, "feat/unreachable", t.TempDir())
+
+	if err == nil || !strings.Contains(err.Error(), "fetching required remote feature") {
+		t.Fatalf("error = %v, want strict fetch failure", err)
+	}
+}
+
+func TestEnsureRemoteWorktree_RefreshesCleanStaleWorktreeFromOrigin(t *testing.T) {
+	origin, primary := newRemoteAndClone(t, "main")
+	daytona := cloneRemote(t, origin, "daytona-refresh")
+	const branch = "feat/CLI-refresh"
+	runGit(t, daytona, "checkout", "-b", branch)
+	writeFile(t, daytona, "remote.txt", "one\n")
+	runGit(t, daytona, "add", "remote.txt")
+	runGit(t, daytona, "commit", "-m", "first")
+	runGit(t, daytona, "push", "origin", "HEAD:"+branch)
+	root := t.TempDir()
+	path, err := spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, branch, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, daytona, "remote.txt", "two\n")
+	runGit(t, daytona, "add", "remote.txt")
+	runGit(t, daytona, "commit", "-m", "second")
+	runGit(t, daytona, "push", "origin", "HEAD:"+branch)
+	want := runGit(t, daytona, "rev-parse", "HEAD")
+
+	gotPath, err := spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, branch, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != path || runGit(t, gotPath, "rev-parse", "HEAD") != want {
+		t.Fatalf("refreshed worktree = %s @ %s, want %s @ %s", gotPath, runGit(t, gotPath, "rev-parse", "HEAD"), path, want)
+	}
+}
+
+func TestEnsureRemoteWorktree_RejectsDirtyExistingWorktree(t *testing.T) {
+	origin, primary := newRemoteAndClone(t, "main")
+	daytona := cloneRemote(t, origin, "daytona-dirty")
+	const branch = "feat/CLI-dirty"
+	runGit(t, daytona, "checkout", "-b", branch)
+	runGit(t, daytona, "push", "origin", "HEAD:"+branch)
+	root := t.TempDir()
+	path, err := spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, branch, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, "dirty.txt", "do not erase\n")
+
+	_, err = spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, branch, root)
+
+	if err == nil || !strings.Contains(err.Error(), "dirty") {
+		t.Fatalf("error = %v, want dirty worktree refusal", err)
+	}
+}
+
+func TestEnsureRemoteWorktree_RejectsCleanDivergentExistingWorktree(t *testing.T) {
+	origin, primary := newRemoteAndClone(t, "main")
+	daytona := cloneRemote(t, origin, "daytona-divergent")
+	const branch = "feat/CLI-divergent"
+	runGit(t, daytona, "checkout", "-b", branch)
+	runGit(t, daytona, "push", "origin", "HEAD:"+branch)
+	root := t.TempDir()
+	path, err := spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, branch, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, path, "config", "user.name", "Clipse Test")
+	runGit(t, path, "config", "user.email", "clipse-test@example.com")
+	writeFile(t, path, "local-only.txt", "must not reset\n")
+	runGit(t, path, "add", "local-only.txt")
+	runGit(t, path, "commit", "-m", "local divergent commit")
+
+	_, err = spawn.EnsureRemoteWorktree(ctxWithTimeout(t), primary, branch, root)
+
+	if err == nil || !strings.Contains(err.Error(), "diverged") {
+		t.Fatalf("error = %v, want divergent worktree refusal", err)
+	}
+}
+
 // writeFile writes name (relative to dir) with contents, failing the test on
 // error.
 func writeFile(t *testing.T, dir, name, contents string) {

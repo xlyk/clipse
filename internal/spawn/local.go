@@ -101,6 +101,9 @@ func workerArgs(spec WorkerSpec) []string {
 	if spec.Branch != "" {
 		args = append(args, "--branch="+spec.Branch)
 	}
+	if spec.Target != "" {
+		args = append(args, "--target="+spec.Target)
+	}
 	return args
 }
 
@@ -144,6 +147,8 @@ func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, e
 	// worktree.
 	if spec.Backend == "" || spec.Backend == "local" {
 		cmd.Dir = spec.Workspace
+	} else {
+		cmd.Dir = spec.ProjectDir
 	}
 	cmd.Stderr = logFile
 

@@ -584,9 +584,6 @@ func validate(cfg *Config) error {
 	if cfg.Repo.Remote == "" {
 		return fmt.Errorf("repo.remote is required")
 	}
-	if _, _, err := backend.CanonicalGitHubRemote(cfg.Repo.Remote); err != nil {
-		return fmt.Errorf("repo.remote is invalid: %w", err)
-	}
 	if cfg.Repo.Path == "" {
 		return fmt.Errorf("repo.path is required")
 	}
@@ -597,6 +594,9 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("agent_backend.type must be \"local\" or \"daytona\", got %q", cfg.AgentBackend.Type)
 	}
 	if cfg.AgentBackend.Type == "daytona" {
+		if _, _, err := backend.CanonicalGitHubRemote(cfg.Repo.Remote); err != nil {
+			return fmt.Errorf("repo.remote is invalid for daytona: %w", err)
+		}
 		if cfg.AgentBackend.Daytona.AutoStopMinutes <= 0 {
 			return fmt.Errorf("agent_backend.daytona.auto_stop_minutes must be positive, got %d", cfg.AgentBackend.Daytona.AutoStopMinutes)
 		}

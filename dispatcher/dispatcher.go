@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -303,14 +304,21 @@ func (d *Dispatcher) ttl() int64 {
 // overall pass reads as a checklist; see the package doc and the phase
 // methods themselves for the reasoning behind the ordering.
 func (d *Dispatcher) Tick(ctx context.Context) error {
-	if err := d.pollAndUpsert(ctx); err != nil {
-		return fmt.Errorf("tick: poll: %w", err)
-	}
-	if err := d.reconcile(ctx); err != nil {
-		return fmt.Errorf("tick: reconcile: %w", err)
-	}
-	if err := d.drainWorkspaceCleanup(ctx); err != nil {
-		return fmt.Errorf("tick: drain workspace cleanup: %w", err)
+	pollErr := d.pollAndUpsert(ctx)
+	reconcileErr := d.reconcile(ctx)
+	cleanupErr := d.drainWorkspaceCleanup(ctx)
+	if pollErr != nil || reconcileErr != nil || cleanupErr != nil {
+		var joined []error
+		if pollErr != nil {
+			joined = append(joined, fmt.Errorf("tick: poll: %w", pollErr))
+		}
+		if reconcileErr != nil {
+			joined = append(joined, fmt.Errorf("tick: reconcile: %w", reconcileErr))
+		}
+		if cleanupErr != nil {
+			joined = append(joined, fmt.Errorf("tick: drain workspace cleanup: %w", cleanupErr))
+		}
+		return errors.Join(joined...)
 	}
 	if err := d.promote(ctx); err != nil {
 		return fmt.Errorf("tick: promote: %w", err)

@@ -25,6 +25,12 @@ type TransitionReq struct {
 	// Empty preserves the original Daytona behavior for existing callers.
 	CleanupWorkspaceProvider string
 
+	// CleanupReviewerWorkspace atomically queues the exact run-scoped
+	// reviewer workspace when a provisioned worker process fails to start.
+	// It is keyed by IssueID+CloseRunID and applied in the same transition
+	// transaction that closes the failed run and clears its claim.
+	CleanupReviewerWorkspace bool
+
 	// SkipReworkBump suppresses the automatic rework_count increment that
 	// NewStatus=="rework" would otherwise apply (see applyIssueTransition).
 	// Set only by dispatcher.requeueOrphan: an orphaned claim's release
@@ -105,6 +111,11 @@ func (s *Store) Transition(ctx context.Context, req TransitionReq) error {
 			return err
 		}
 	}
+	if req.CleanupReviewerWorkspace {
+		if err := applyReviewerWorkspaceCleanup(ctx, tx, req); err != nil {
+			return err
+		}
+	}
 	if req.CloseRunID != "" {
 		if err := applyRunClose(ctx, tx, req); err != nil {
 			return err
@@ -126,6 +137,29 @@ func (s *Store) Transition(ctx context.Context, req TransitionReq) error {
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("transitioning issue %s: committing: %w", req.IssueID, err)
+	}
+	return nil
+}
+
+func applyReviewerWorkspaceCleanup(ctx context.Context, tx *sql.Tx, req TransitionReq) error {
+	if req.CloseRunID == "" {
+		return fmt.Errorf("transitioning issue %s: reviewer workspace cleanup requires a run id", req.IssueID)
+	}
+	const q = `
+		UPDATE agent_workspaces
+		SET state = ?, last_error = '', updated_at = ?
+		WHERE issue_id = ? AND run_id = ? AND provider = 'daytona' AND role = 'reviewer' AND state <> ?
+	`
+	res, err := tx.ExecContext(ctx, q, WorkspaceCleanupPending, req.Event.Ts, req.IssueID, req.CloseRunID, WorkspaceDeleted)
+	if err != nil {
+		return fmt.Errorf("transitioning issue %s: scheduling reviewer workspace cleanup: %w", req.IssueID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("transitioning issue %s: scheduling reviewer workspace cleanup: reading rows affected: %w", req.IssueID, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("transitioning issue %s: scheduling reviewer workspace cleanup: expected one run workspace, updated %d", req.IssueID, n)
 	}
 	return nil
 }

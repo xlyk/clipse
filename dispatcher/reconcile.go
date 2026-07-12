@@ -204,9 +204,10 @@ func (d *Dispatcher) parkOrRetry(ctx context.Context, issue store.Issue, runID, 
 // JSON worth preserving so board-wide token accounting isn't dropped when a
 // blocked turn is retried.
 type retryPayload struct {
-	tokensIn   int
-	tokensOut  int
-	resultJSON string
+	tokensIn                 int
+	tokensOut                int
+	resultJSON               string
+	cleanupReviewerWorkspace bool
 }
 
 // scheduleRetry re-queues issue for a bounded, deterministic auto-retry after a
@@ -227,20 +228,21 @@ func (d *Dispatcher) scheduleRetry(ctx context.Context, issue store.Issue, runID
 	attempt := issue.RecoverAttempts + 1
 	blockedUntil := now + int64(d.cfg.RecoverBackoffS)
 	req := store.TransitionReq{
-		IssueID:             issue.ID,
-		NewStatus:           target,
-		ClearClaim:          true,
-		SkipReworkBump:      true,
-		BumpRecoverAttempts: true,
-		SetBlockedUntil:     blockedUntil,
-		CloseRunID:          runID,
-		RunStatus:           "retry_scheduled",
-		RunError:            reason,
-		ResultJSON:          payload.resultJSON,
-		TokensIn:            payload.tokensIn,
-		TokensOut:           payload.tokensOut,
-		EnqueueSetState:     target != issue.BoardStatus,
-		Comment:             retryComment(attempt, d.cfg.RecoverCap, reason),
+		IssueID:                  issue.ID,
+		NewStatus:                target,
+		ClearClaim:               true,
+		SkipReworkBump:           true,
+		BumpRecoverAttempts:      true,
+		SetBlockedUntil:          blockedUntil,
+		CloseRunID:               runID,
+		RunStatus:                "retry_scheduled",
+		RunError:                 reason,
+		ResultJSON:               payload.resultJSON,
+		TokensIn:                 payload.tokensIn,
+		TokensOut:                payload.tokensOut,
+		CleanupReviewerWorkspace: payload.cleanupReviewerWorkspace,
+		EnqueueSetState:          target != issue.BoardStatus,
+		Comment:                  retryComment(attempt, d.cfg.RecoverCap, reason),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issue.ID),

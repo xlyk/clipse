@@ -13,20 +13,22 @@ type recordingRunner struct {
 	err    error
 	argv   []string
 	env    []string
+	cwd    string
 }
 
-func (r *recordingRunner) Run(_ context.Context, argv, env []string) ([]byte, error) {
+func (r *recordingRunner) Run(_ context.Context, argv, env []string, cwd string) ([]byte, error) {
 	r.argv = append([]string(nil), argv...)
 	r.env = append([]string(nil), env...)
+	r.cwd = cwd
 	return r.stdout, r.err
 }
 
 func TestCommandManagerEnsure_UsesSanitizedDaytonaEnv(t *testing.T) {
-	runner := &recordingRunner{stdout: []byte(`{"ok":true,"provider":"daytona","owner_key":"k","external_id":"sb-1","workspace_path":"/home/daytona/workspace/clipse","state":"active"}`)}
+	runner := &recordingRunner{stdout: []byte(`{"action":"ensure","ok":true,"provider":"daytona","owner_key":"k","external_id":"sb-1","workspace_path":"/home/daytona/workspace/clipse","state":"active"}`)}
 	m := NewCommandManager([]string{"uv", "run", "clipse-worker"}, runner.Run, []string{
 		"PATH=/bin", "HOME=/tmp/home", "DAYTONA_API_KEY=secret", "DAYTONA_API_URL=https://daytona.example", "DAYTONA_TARGET=us",
 		"LINEAR_API_KEY=never", "GH_TOKEN=never-either",
-	})
+	}, "/managed/repo")
 
 	workspace, err := m.Ensure(context.Background(), EnsureRequest{
 		Provider:                  "daytona",
@@ -47,6 +49,9 @@ func TestCommandManagerEnsure_UsesSanitizedDaytonaEnv(t *testing.T) {
 	}
 	if workspace.ExternalID != "sb-1" || workspace.WorkspacePath != "/home/daytona/workspace/clipse" {
 		t.Fatalf("workspace = %+v", workspace)
+	}
+	if runner.cwd != "/managed/repo" {
+		t.Fatalf("lifecycle cwd = %q", runner.cwd)
 	}
 	if slices.Contains(runner.env, "LINEAR_API_KEY=never") || slices.Contains(runner.env, "GH_TOKEN=never-either") {
 		t.Fatalf("kernel or unrelated secret forwarded: %v", runner.env)
@@ -71,8 +76,8 @@ func TestCommandManagerEnsure_UsesSanitizedDaytonaEnv(t *testing.T) {
 
 func TestCommandManagerDeleteAndList_UseLifecycleFlags(t *testing.T) {
 	t.Run("delete", func(t *testing.T) {
-		runner := &recordingRunner{stdout: []byte(`{"ok":true,"provider":"daytona","owner_key":"k","external_id":"sb-1","workspace_path":"/home/daytona/workspace/clipse","state":"deleted"}`)}
-		m := NewCommandManager([]string{"worker"}, runner.Run, nil)
+		runner := &recordingRunner{stdout: []byte(`{"action":"delete","ok":true,"provider":"daytona","owner_key":"k","external_id":"sb-1","workspace_path":"/home/daytona/workspace/clipse","state":"deleted"}`)}
+		m := NewCommandManager([]string{"worker"}, runner.Run, nil, "")
 		err := m.Delete(context.Background(), Workspace{
 			Provider: "daytona", OwnerKey: "k", ExternalID: "sb-1", WorkspacePath: "/home/daytona/workspace/clipse",
 			State: "active", Role: "reviewer", IssueID: "i", RunID: "r", RepoSlug: "x/y",
@@ -88,8 +93,8 @@ func TestCommandManagerDeleteAndList_UseLifecycleFlags(t *testing.T) {
 	})
 
 	t.Run("list", func(t *testing.T) {
-		runner := &recordingRunner{stdout: []byte(`{"ok":true,"provider":"daytona","workspaces":[{"owner_key":"k","external_id":"sb-1","workspace_path":"/home/daytona/workspace/clipse","state":"stopped"}]}`)}
-		m := NewCommandManager([]string{"worker"}, runner.Run, nil)
+		runner := &recordingRunner{stdout: []byte(`{"action":"list","ok":true,"provider":"daytona","workspaces":[{"owner_key":"k","external_id":"sb-1","workspace_path":"/home/daytona/workspace/clipse","state":"stopped"}]}`)}
+		m := NewCommandManager([]string{"worker"}, runner.Run, nil, "")
 		workspaces, err := m.List(context.Background(), ListRequest{Provider: "daytona", RepoSlug: "x/y", Target: "us"})
 		if err != nil {
 			t.Fatal(err)
@@ -114,7 +119,7 @@ func TestCommandManagerErrors_AreTypedAndSanitized(t *testing.T) {
 	}{
 		{
 			name:   "typed needs input",
-			stdout: `{"ok":false,"provider":"daytona","error_kind":"needs_input","error_operation":"github_auth","error":"authenticate GitHub; provider token was secret-token"}`,
+			stdout: `{"action":"ensure","ok":false,"provider":"daytona","error_kind":"needs_input","error_operation":"github_auth","error":"authenticate GitHub; provider token was secret-token"}`,
 			kind:   ErrorKindNeedsInput,
 		},
 		{
@@ -131,7 +136,7 @@ func TestCommandManagerErrors_AreTypedAndSanitized(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			runner := &recordingRunner{stdout: []byte(tt.stdout), err: tt.runErr}
-			m := NewCommandManager([]string{"worker"}, runner.Run, []string{"DAYTONA_API_KEY=secret-token"})
+			m := NewCommandManager([]string{"worker"}, runner.Run, []string{"DAYTONA_API_KEY=secret-token"}, "")
 			_, err := m.Ensure(context.Background(), EnsureRequest{Provider: "daytona"})
 			if err == nil {
 				t.Fatal("Ensure error = nil")
@@ -152,7 +157,7 @@ func TestCommandManagerErrors_AreTypedAndSanitized(t *testing.T) {
 
 func TestCommandManagerRejectsMultipleJSONObjects(t *testing.T) {
 	runner := &recordingRunner{stdout: []byte("{\"ok\":true}\n{\"ok\":true}\n")}
-	m := NewCommandManager([]string{"worker"}, runner.Run, nil)
+	m := NewCommandManager([]string{"worker"}, runner.Run, nil, "")
 	_, err := m.List(context.Background(), ListRequest{Provider: "daytona", RepoSlug: "x/y"})
 	if err == nil {
 		t.Fatal("List error = nil")
@@ -160,6 +165,38 @@ func TestCommandManagerRejectsMultipleJSONObjects(t *testing.T) {
 	var actionErr *ActionError
 	if !errors.As(err, &actionErr) || actionErr.Kind != ErrorKindCapability {
 		t.Fatalf("error = %T %v, want capability ActionError", err, err)
+	}
+}
+
+func TestCommandManagerRejectsLifecycleVersionSkew(t *testing.T) {
+	tests := []struct {
+		name   string
+		action string
+		json   string
+	}{
+		{"wrong action", "ensure", `{"action":"delete","ok":true,"provider":"daytona","owner_key":"k","external_id":"sb","workspace_path":"/ws","state":"active"}`},
+		{"wrong provider", "ensure", `{"action":"ensure","ok":true,"provider":"other","owner_key":"k","external_id":"sb","workspace_path":"/ws","state":"active"}`},
+		{"ensure deleted", "ensure", `{"action":"ensure","ok":true,"provider":"daytona","owner_key":"k","external_id":"sb","workspace_path":"/ws","state":"deleted"}`},
+		{"delete active", "delete", `{"action":"delete","ok":true,"provider":"daytona","owner_key":"k","external_id":"sb","workspace_path":"/ws","state":"active"}`},
+		{"list deleted", "list", `{"action":"list","ok":true,"provider":"daytona","workspaces":[{"owner_key":"k","external_id":"sb","workspace_path":"/ws","state":"deleted"}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &recordingRunner{stdout: []byte(tt.json)}
+			m := NewCommandManager([]string{"worker"}, runner.Run, nil, "")
+			var err error
+			switch tt.action {
+			case "ensure":
+				_, err = m.Ensure(context.Background(), EnsureRequest{Provider: "daytona"})
+			case "delete":
+				err = m.Delete(context.Background(), Workspace{Provider: "daytona"})
+			case "list":
+				_, err = m.List(context.Background(), ListRequest{Provider: "daytona"})
+			}
+			if err == nil || !strings.Contains(err.Error(), "malformed") {
+				t.Fatalf("error = %v, want sanitized malformed response", err)
+			}
+		})
 	}
 }
 

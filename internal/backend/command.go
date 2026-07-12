@@ -21,19 +21,20 @@ var lifecycleEnvKeys = map[string]struct{}{
 
 // RunFunc executes a complete argv with an explicit environment and returns
 // stdout. CommandManager accepts it as a seam for deterministic tests.
-type RunFunc func(context.Context, []string, []string) ([]byte, error)
+type RunFunc func(context.Context, []string, []string, string) ([]byte, error)
 
 // CommandManager invokes clipse-worker's lifecycle command protocol.
 type CommandManager struct {
-	command []string
-	run     RunFunc
-	env     []string
-	secrets []string
+	command    []string
+	run        RunFunc
+	env        []string
+	secrets    []string
+	projectDir string
 }
 
 // NewCommandManager builds a lifecycle manager from the same configured
 // worker-command prefix used for agent turns. A nil runner uses os/exec.
-func NewCommandManager(command []string, runner RunFunc, environ []string) *CommandManager {
+func NewCommandManager(command []string, runner RunFunc, environ []string, projectDir string) *CommandManager {
 	if runner == nil {
 		runner = runCommand
 	}
@@ -46,10 +47,11 @@ func NewCommandManager(command []string, runner RunFunc, environ []string) *Comm
 		}
 	}
 	return &CommandManager{
-		command: append([]string(nil), command...),
-		run:     runner,
-		env:     env,
-		secrets: secrets,
+		command:    append([]string(nil), command...),
+		run:        runner,
+		env:        env,
+		secrets:    secrets,
+		projectDir: projectDir,
 	}
 }
 
@@ -150,7 +152,7 @@ func (m *CommandManager) action(ctx context.Context, action string, flags []stri
 		return commandResult{}, &ActionError{Kind: ErrorKindCapability, Op: action, Msg: "worker command is not configured"}
 	}
 	argv := append(append([]string(nil), m.command...), flags...)
-	stdout, err := m.run(ctx, argv, append([]string(nil), m.env...))
+	stdout, err := m.run(ctx, argv, append([]string(nil), m.env...), m.projectDir)
 	if err != nil {
 		return commandResult{}, &ActionError{Kind: ErrorKindTransient, Op: action, Msg: "lifecycle command failed"}
 	}
@@ -163,6 +165,9 @@ func (m *CommandManager) action(ctx context.Context, action string, flags []stri
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
+		return commandResult{}, malformedActionError(action)
+	}
+	if result.Action != action || result.Provider != "daytona" {
 		return commandResult{}, malformedActionError(action)
 	}
 	if !result.OK {
@@ -180,13 +185,13 @@ func (m *CommandManager) action(ctx context.Context, action string, flags []stri
 			return commandResult{}, malformedActionError(action)
 		}
 		for _, workspace := range result.Workspaces {
-			if !validWorkspace(workspace.OwnerKey, workspace.ExternalID, workspace.WorkspacePath, workspace.State) {
+			if !validWorkspaceForAction(action, workspace.OwnerKey, workspace.ExternalID, workspace.WorkspacePath, workspace.State) {
 				return commandResult{}, malformedActionError(action)
 			}
 		}
 		return result, nil
 	}
-	if !validWorkspace(result.OwnerKey, result.ExternalID, result.WorkspacePath, result.State) {
+	if !validWorkspaceForAction(action, result.OwnerKey, result.ExternalID, result.WorkspacePath, result.State) {
 		return commandResult{}, malformedActionError(action)
 	}
 	return result, nil
@@ -200,13 +205,17 @@ func validErrorKind(kind ErrorKind) bool {
 	return kind == ErrorKindTransient || kind == ErrorKindCapability || kind == ErrorKindNeedsInput
 }
 
-func validWorkspace(ownerKey, externalID, workspacePath string, state WorkspaceState) bool {
+func validWorkspaceForAction(action, ownerKey, externalID, workspacePath string, state WorkspaceState) bool {
 	if ownerKey == "" || externalID == "" || workspacePath == "" {
 		return false
 	}
-	switch state {
-	case WorkspaceActive, WorkspaceStopped, WorkspaceCleanupPending, WorkspaceDeleted, WorkspaceError:
-		return true
+	switch action {
+	case "ensure":
+		return state == WorkspaceActive || state == WorkspaceStopped
+	case "delete":
+		return state == WorkspaceDeleted
+	case "list":
+		return state == WorkspaceActive || state == WorkspaceStopped || state == WorkspaceCleanupPending || state == WorkspaceError
 	default:
 		return false
 	}
@@ -253,12 +262,13 @@ func lifecycleEnv(environ []string) []string {
 	return env
 }
 
-func runCommand(ctx context.Context, argv, env []string) ([]byte, error) {
+func runCommand(ctx context.Context, argv, env []string, cwd string) ([]byte, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("backend command is empty")
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = env
+	cmd.Dir = cwd
 	return cmd.Output()
 }
 

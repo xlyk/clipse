@@ -280,6 +280,19 @@ agent_backend:
 	}
 }
 
+func TestLoad_LocalBackendAcceptsLegacySSHURLRemote(t *testing.T) {
+	for _, backendBlock := range []string{"", "\nagent_backend:\n  type: local\n"} {
+		path := writeYAML(t, strings.Replace(baseValidYAML, "https://github.com/yourorg/yourrepo.git", "ssh://git@github.example/yourorg/yourrepo.git", 1)+backendBlock)
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("Load local legacy remote: %v", err)
+		}
+		if cfg.Repo.Remote != "ssh://git@github.example/yourorg/yourrepo.git" {
+			t.Fatalf("remote = %q", cfg.Repo.Remote)
+		}
+	}
+}
+
 func TestLoad_DaytonaBackendRejectsInvalidValues(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -396,7 +409,7 @@ func TestLoad_RejectsCredentialBearingRepoRemoteWithoutLeakingIt(t *testing.T) {
 		"https://github.com/yourorg/yourrepo.git",
 		"https://user:token-secret@github.com/x/y.git",
 		1,
-	))
+	)+"\nagent_backend:\n  type: daytona\n")
 	_, err := config.Load(path)
 	if err == nil {
 		t.Fatal("Load error = nil")

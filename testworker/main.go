@@ -25,6 +25,7 @@ func main() {
 
 func run() error {
 	var issue, lane, runID, thread, workspace, scenario, baseBranch string
+	var backendName, sandboxID, repoURL, repoSlug, branch, target string
 	flag.StringVar(&issue, "issue", "", "Linear issue identifier")
 	flag.StringVar(&lane, "lane", "", "worker lane")
 	flag.StringVar(&runID, "run", "", "dispatcher-assigned run id")
@@ -37,6 +38,12 @@ func run() error {
 	// every lane (see internal/spawn.workerArgs). testworker must at least
 	// parse it, even though only the real coder graph syncs a worktree.
 	flag.StringVar(&baseBranch, "base-branch", "", "repo base branch (accepted, unused by testworker)")
+	flag.StringVar(&backendName, "backend", "", "agent backend (accepted, unused by testworker)")
+	flag.StringVar(&sandboxID, "sandbox-id", "", "sandbox id (accepted, unused by testworker)")
+	flag.StringVar(&repoURL, "repo-url", "", "repository URL (accepted, unused by testworker)")
+	flag.StringVar(&repoSlug, "repo-slug", "", "repository slug (accepted, unused by testworker)")
+	flag.StringVar(&branch, "branch", "", "feature branch (accepted, unused by testworker)")
+	flag.StringVar(&target, "target", "", "backend target (accepted, unused by testworker)")
 	flag.Parse()
 
 	// The Spawner builds args strictly from WorkerSpec's fixed fields
@@ -83,6 +90,12 @@ func run() error {
 			return fmt.Errorf("testworker pwd: reading working directory: %w", wdErr)
 		}
 		summary = wd
+	} else if scenario == "agents" {
+		guidance, readErr := os.ReadFile("AGENTS.md")
+		if readErr != nil {
+			return fmt.Errorf("testworker agents: reading AGENTS.md: %w", readErr)
+		}
+		summary = string(guidance)
 	}
 
 	result := contract.WorkerResult{
@@ -109,7 +122,7 @@ func run() error {
 // emit. block_kind is set iff outcome is "blocked" (schema requirement).
 func outcomeFor(scenario string) (contract.WorkerResultOutcome, *contract.BlockKind, error) {
 	switch scenario {
-	case "done", "pwd":
+	case "done", "pwd", "agents":
 		return contract.WorkerResultOutcomeDone, nil, nil
 	case "needs_review":
 		return contract.WorkerResultOutcomeNeedsReview, nil, nil

@@ -89,7 +89,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		}
 		cause := fmt.Errorf("preparing workspace: %w", err)
 		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), kind, d.now(), retryPayload{}, func() error {
-			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, false)
 		})
 	}
 
@@ -111,7 +111,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 			delete(d.inflight, runID)
 			cause := fmt.Errorf("persisting provisioned workspace: %w", err)
 			return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, now, retryPayload{}, func() error {
-				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, false)
 			})
 		}
 	} else {
@@ -120,7 +120,7 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 			delete(d.inflight, runID)
 			cause := err
 			return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, now, retryPayload{}, func() error {
-				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+				return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, false)
 			})
 		}
 	}
@@ -179,6 +179,8 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		RepoURL:            daytonaOnly(d.cfg.AgentBackend.Type, repoURL),
 		RepoSlug:           repoSlug,
 		Branch:             daytonaOnly(d.cfg.AgentBackend.Type, issue.BranchName),
+		Target:             daytonaOnly(d.cfg.AgentBackend.Type, d.cfg.AgentBackend.Daytona.Target),
+		ProjectDir:         daytonaOnly(d.cfg.AgentBackend.Type, d.cfg.Repo.Path),
 	}
 
 	// Root the worker's timeout at a context that keeps ctx's values but
@@ -197,8 +199,10 @@ func (d *Dispatcher) spawnAttempt(ctx context.Context, issue store.Issue, runID,
 		// not survive it either.
 		delete(d.inflight, runID)
 		cause := fmt.Errorf("spawning worker: %w", err)
-		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), retryPayload{}, func() error {
-			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause)
+		cleanupReviewer := d.cfg.AgentBackend.Type == "daytona" && lane == string(contract.LaneReviewer)
+		payload := retryPayload{cleanupReviewerWorkspace: cleanupReviewer}
+		return d.parkOrRetry(ctx, issue, runID, lane, cause.Error(), contract.BlockKindTransient, d.now(), payload, func() error {
+			return d.blockOnSpawnFailure(ctx, issue.ID, runID, lane, cause, cleanupReviewer)
 		})
 	}
 
@@ -410,17 +414,18 @@ func (d *Dispatcher) shellFor(lane string) (shell, docsShell string) {
 // blockOnSpawnFailure transitions issue straight to blocked when the
 // Spawner/Workspacer machinery itself fails (never got a process to Wait
 // on), rather than going through applyResult.
-func (d *Dispatcher) blockOnSpawnFailure(ctx context.Context, issueID, runID, lane string, cause error) error {
+func (d *Dispatcher) blockOnSpawnFailure(ctx context.Context, issueID, runID, lane string, cause error, cleanupReviewer bool) error {
 	now := d.now()
 	req := store.TransitionReq{
-		IssueID:         issueID,
-		NewStatus:       "blocked",
-		ClearClaim:      true,
-		CloseRunID:      runID,
-		RunStatus:       "blocked",
-		RunError:        cause.Error(),
-		EnqueueSetState: true,
-		Comment:         blockedComment("", cause.Error()),
+		IssueID:                  issueID,
+		NewStatus:                "blocked",
+		ClearClaim:               true,
+		CloseRunID:               runID,
+		RunStatus:                "blocked",
+		RunError:                 cause.Error(),
+		CleanupReviewerWorkspace: cleanupReviewer,
+		EnqueueSetState:          true,
+		Comment:                  blockedComment("", cause.Error()),
 		Event: store.Event{
 			Ts:      now,
 			IssueID: nullString(issueID),

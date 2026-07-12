@@ -93,6 +93,55 @@ func EnsureWorktree(ctx context.Context, primaryClonePath, branch, baseBranch, w
 	return path, nil
 }
 
+// EnsureRemoteWorktree creates or refreshes the deterministic Git-operator
+// worktree from the authoritative remote feature branch. Unlike the local
+// coder path, it never falls back to a base ref when fetch fails or the
+// feature is missing. Existing dirty state is refused rather than erased;
+// a clean app-owned worktree is recreated from origin/<feature> so rework
+// pushes are visible on the next merge attempt.
+func EnsureRemoteWorktree(ctx context.Context, primaryClonePath, branch, worktreeRoot string) (string, error) {
+	path := worktreePathFor(worktreeRoot, branch)
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		return "", fmt.Errorf("creating worktree root %s: %w", worktreeRoot, err)
+	}
+	refspec := "+refs/heads/" + branch + ":refs/remotes/origin/" + branch
+	if err := runGitCmd(ctx, primaryClonePath, "fetch", "origin", refspec); err != nil {
+		return "", fmt.Errorf("fetching required remote feature branch %s: %w", branch, err)
+	}
+	exists, err := remoteBranchExists(ctx, primaryClonePath, branch)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("required remote feature branch %s is missing", branch)
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		status, statusErr := gitOutput(ctx, path, "status", "--porcelain")
+		if statusErr != nil {
+			return "", fmt.Errorf("checking existing remote worktree %s: %w", path, statusErr)
+		}
+		if strings.TrimSpace(status) != "" {
+			return "", fmt.Errorf("existing remote worktree %s is dirty", path)
+		}
+		if err := runGitCmd(ctx, path, "merge-base", "--is-ancestor", "HEAD", "origin/"+branch); err != nil {
+			return "", fmt.Errorf("existing remote worktree %s diverged from origin/%s", path, branch)
+		}
+		if err := runGitCmd(ctx, primaryClonePath, "worktree", "remove", "--force", path); err != nil {
+			return "", fmt.Errorf("refreshing remote worktree %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("checking for existing worktree at %s: %w", path, err)
+	}
+	if err := runGitCmd(ctx, primaryClonePath, "worktree", "prune"); err != nil {
+		return "", fmt.Errorf("pruning worktrees before remote refresh: %w", err)
+	}
+	if err := runGitCmd(ctx, primaryClonePath, "worktree", "add", "-B", branch, path, "origin/"+branch); err != nil {
+		return "", fmt.Errorf("creating strict remote worktree for branch %s at %s: %w", branch, path, err)
+	}
+	return path, nil
+}
+
 // RemoveWorktree removes the git worktree at worktreePath and deletes the
 // local branch, for use on terminal states (Done/Cancelled). It tolerates a
 // worktree or branch that is already gone (e.g. a retried cleanup), so
@@ -160,13 +209,18 @@ func gitRefExists(ctx context.Context, primaryClonePath, ref string) (bool, erro
 // returning an error that wraps the command's stderr output so failures are
 // debuggable from the returned error alone.
 func runGitCmd(ctx context.Context, dir string, args ...string) error {
+	_, err := gitOutput(ctx, dir, args...)
+	return err
+}
+
+func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return string(out), nil
 }
 
 // isMissingButRegisteredWorktreeErr reports whether a `git worktree add`

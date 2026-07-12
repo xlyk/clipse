@@ -169,6 +169,34 @@ func TestLocalSpawner_RunsInWorkspaceDir(t *testing.T) {
 	}
 }
 
+func TestLocalSpawner_DaytonaControllerRunsInHostProjectDir(t *testing.T) {
+	bin := buildTestworker(t)
+	boardDir := t.TempDir()
+	s := spawn.NewLocalSpawner([]string{bin}, boardDir)
+	projectDir := t.TempDir()
+	const managedGuidance = "managed target repository guidance"
+	if err := os.WriteFile(filepath.Join(projectDir, "AGENTS.md"), []byte(managedGuidance), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := spawn.WorkerSpec{
+		Issue: "CLP-1", Lane: "coder", RunID: "run-1", ThreadID: "thread-1",
+		Workspace: "/home/daytona/workspace/clipse", ProjectDir: projectDir, Backend: "daytona",
+		Env: append(os.Environ(), "TESTWORKER_SCENARIO=agents"),
+	}
+
+	handle, err := s.Spawn(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := handle.Wait()
+	if err != nil || res.Err != nil {
+		t.Fatalf("Wait = (%+v, %v)", res, err)
+	}
+	if res.Worker.Summary != managedGuidance {
+		t.Fatalf("worker guidance = %q, want managed repo AGENTS.md", res.Worker.Summary)
+	}
+}
+
 // TestLocalSpawner_MultiElementCommand asserts a configured command PREFIX
 // longer than one element (e.g. the ["uv", "--project", ..., "run",
 // "clipse-worker"] shape config.Worker.Command documents) execs correctly:
