@@ -48,7 +48,9 @@ class BackendActionRequest(BaseModel):
     def validate_action_scope(self) -> Self:
         if self.action == "list":
             return self
-        scoped = ("issue_id", "run_id", "role")
+        scoped = ["issue_id", "role"]
+        if self.action == "ensure" or self.role == "reviewer":
+            scoped.append("run_id")
         missing = [field for field in scoped if getattr(self, field) is None]
         if self.action == "delete":
             if self.sandbox_id is None:

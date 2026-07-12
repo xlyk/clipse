@@ -15,6 +15,7 @@ from daytona import (
     DaytonaAuthenticationError,
     DaytonaAuthorizationError,
     DaytonaConfig,
+    DaytonaConflictError,
     DaytonaNotFoundError,
     DaytonaValidationError,
     ListSandboxesQuery,
@@ -343,6 +344,23 @@ class DaytonaSession:
                 password=token,
                 branch=base_branch,
                 remote="origin",
+            )
+        except DaytonaConflictError:
+            # Daytona updates origin/<base> before reporting the conflict but
+            # does not leave MERGE_HEAD or conflict markers behind. Materialize
+            # the merge with the already-fetched ref so the coder graph can
+            # enumerate and resolve the actual conflicted files.
+            return self.run(
+                [
+                    "git",
+                    "-c",
+                    f"user.name={GIT_AUTHOR_NAME}",
+                    "-c",
+                    f"user.email={GIT_AUTHOR_EMAIL}",
+                    "merge",
+                    "--no-edit",
+                    f"origin/{base_branch}",
+                ]
             )
         except Exception as exc:  # noqa: BLE001 - SDK errors may contain credentials
             return CommandResult(1, stderr=safe_error("git pull", exc))

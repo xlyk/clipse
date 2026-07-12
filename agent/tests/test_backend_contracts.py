@@ -126,6 +126,12 @@ def test_ensure_request_requires_scoped_fields() -> None:
         BackendActionRequest(action="ensure", provider="daytona", repo_slug="xlyk/clipse")
 
 
+@pytest.mark.parametrize("role", ["coder", "reviewer"])
+def test_ensure_request_requires_run_id_for_every_role(role: str) -> None:
+    with pytest.raises(ValidationError):
+        _request(role=role, run_id=None)
+
+
 def test_delete_request_requires_scope_and_sandbox_id() -> None:
     with pytest.raises(ValidationError):
         BackendActionRequest(
@@ -135,6 +141,31 @@ def test_delete_request_requires_scope_and_sandbox_id() -> None:
             issue_id="issue-1",
             run_id="run-1",
             role="coder",
+        )
+
+
+def test_coder_delete_does_not_require_run_id() -> None:
+    request = BackendActionRequest(
+        action="delete",
+        provider="daytona",
+        repo_slug="xlyk/clipse",
+        issue_id="issue-1",
+        role="coder",
+        sandbox_id="sandbox-1",
+    )
+
+    assert request.run_id is None
+
+
+def test_reviewer_delete_requires_run_id() -> None:
+    with pytest.raises(ValidationError):
+        BackendActionRequest(
+            action="delete",
+            provider="daytona",
+            repo_slug="xlyk/clipse",
+            issue_id="issue-1",
+            role="reviewer",
+            sandbox_id="sandbox-1",
         )
 
 

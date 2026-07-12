@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from daytona import DaytonaConnectionError, DaytonaNotFoundError, DaytonaValidationError
+from daytona import DaytonaConflictError, DaytonaConnectionError, DaytonaNotFoundError, DaytonaValidationError
 from deepagents.backends.protocol import ExecuteResponse
 
 from clipse_agent.backends.contracts import BackendActionRequest, BackendWorkspace
@@ -655,15 +655,18 @@ class _FakeExecuteResponse:
 @dataclass
 class _FakeDaytonaBackend:
     calls: list[str] = field(default_factory=list)
+    output: str = "remote output"
+    exit_code: int | None = 0
 
     def execute(self, command: str, *, timeout: int | None = None) -> _FakeExecuteResponse:
         self.calls.append(command)
-        return _FakeExecuteResponse(output="remote output", exit_code=0)
+        return _FakeExecuteResponse(output=self.output, exit_code=self.exit_code)
 
 
 @dataclass
 class _FakeSessionGit:
     pull_calls: list[dict[str, Any]] = field(default_factory=list)
+    pull_error: BaseException | None = None
     add_calls: list[dict[str, Any]] = field(default_factory=list)
     commit_calls: list[dict[str, Any]] = field(default_factory=list)
     push_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -672,6 +675,8 @@ class _FakeSessionGit:
     def pull(self, path: str, /, **kwargs: Any) -> None:
         self.pull_calls.append({"path": path, **kwargs})
         self.transcript.append({"event": "git.pull", "branch": kwargs["branch"]})
+        if self.pull_error is not None:
+            raise self.pull_error
 
     def add(self, path: str, files: list[str]) -> None:
         self.add_calls.append({"path": path, "files": files})
@@ -777,6 +782,50 @@ def test_daytona_session_git_credentials_are_read_just_in_time() -> None:
             "set_upstream": True,
         }
     ]
+
+
+def test_daytona_session_sync_base_materializes_sdk_conflict_with_remote_merge() -> None:
+    canary = "provider-body-ghp_conflict_canary"
+    backend = _FakeDaytonaBackend(output="README.md: needs merge", exit_code=1)
+    sdk_sandbox = _FakeSessionSandbox(
+        git=_FakeSessionGit(pull_error=DaytonaConflictError(canary, status_code=409))
+    )
+    session = DaytonaSession(
+        REMOTE_REPO_ABS,
+        "xlyk/clipse",
+        backend,
+        sdk_sandbox,
+        token_reader=lambda: "pull-token",
+        host_runner=lambda _argv: "unused",
+    )
+
+    result = session.sync_base("main")
+
+    assert sdk_sandbox.git.pull_calls == [
+        {
+            "path": REMOTE_REPO_ABS,
+            "username": "x-access-token",
+            "password": "pull-token",
+            "branch": "main",
+            "remote": "origin",
+        }
+    ]
+    assert backend.calls == [
+        shlex.join(
+            [
+                "git",
+                "-c",
+                "user.name=clipse",
+                "-c",
+                "user.email=clipse@users.noreply.github.com",
+                "merge",
+                "--no-edit",
+                "origin/main",
+            ]
+        )
+    ]
+    assert result == CommandResult(1, stdout="README.md: needs merge")
+    assert canary not in repr(result)
 
 
 def test_daytona_authenticated_git_calls_leave_no_credential_surface(monkeypatch) -> None:
