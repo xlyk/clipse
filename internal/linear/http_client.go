@@ -1,23 +1,14 @@
 package linear
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
 	"sync"
-	"time"
 )
 
 // apiURL is Linear's GraphQL endpoint.
 const apiURL = "https://api.linear.app/graphql"
-
-// apiKeyEnvVar is the environment variable HTTPClient reads its Linear
-// API key from.
-const apiKeyEnvVar = "LINEAR_API_KEY"
 
 // cancelledRecencyDays bounds how long a Linear-cancelled issue stays in
 // CandidateIssuesQuery's scope after its last update. The dispatcher only
@@ -157,14 +148,6 @@ type graphqlRequest struct {
 	Variables map[string]any `json:"variables"`
 }
 
-// graphqlResponse is the wire shape of a GraphQL response: a "data" payload
-// alongside an optional "errors" list, per the GraphQL spec.
-type graphqlResponse struct {
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
-}
-
 // BuildCandidateIssuesRequest builds the request body for CandidateIssuesQuery,
 // scoped to teamKey and to issues carrying a labelPrefix-prefixed lane label.
 // Factored out from the HTTP call so tests can assert the exact payload
@@ -214,12 +197,10 @@ func marshalGraphQLRequest(query string, variables map[string]any) ([]byte, erro
 // the LINEAR_API_KEY environment variable, scoped to a single configured
 // team.
 type HTTPClient struct {
-	apiKey      string
-	baseURL     string
+	*transport
 	teamKey     string
 	teamID      string
 	labelPrefix string
-	httpClient  *http.Client
 
 	// mu guards stateIDs, the lazily-resolved and cached name(lowercase)->id
 	// map for teamID (see state_resolver.go). The dispatch loop is
@@ -248,17 +229,15 @@ func NewHTTPClientWithBaseURL(baseURL, teamKey, teamID, labelPrefix string) (*HT
 }
 
 func newHTTPClient(baseURL, teamKey, teamID, labelPrefix string) (*HTTPClient, error) {
-	apiKey := os.Getenv(apiKeyEnvVar)
-	if apiKey == "" {
-		return nil, fmt.Errorf("building linear http client: %s is not set", apiKeyEnvVar)
+	tr, err := newTransport(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("building linear http client: %w", err)
 	}
 	return &HTTPClient{
-		apiKey:      apiKey,
-		baseURL:     baseURL,
+		transport:   tr,
 		teamKey:     teamKey,
 		teamID:      teamID,
 		labelPrefix: labelPrefix,
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
@@ -350,41 +329,4 @@ func (c *HTTPClient) IssueComments(ctx context.Context, issueID string) ([]Comme
 		comments = append(comments, Comment{Body: n.Body, CreatedAt: n.CreatedAt})
 	}
 	return comments, nil
-}
-
-// do POSTs a prebuilt GraphQL request body to Linear's API and returns the
-// raw response body, after checking the HTTP status and any GraphQL-level
-// "errors" array.
-func (c *HTTPClient) do(ctx context.Context, reqBody []byte) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", c.apiKey)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("linear api returned status %d: %s", resp.StatusCode, respBody)
-	}
-
-	var gqlResp graphqlResponse
-	if err := json.Unmarshal(respBody, &gqlResp); err != nil {
-		return nil, fmt.Errorf("decoding response envelope: %w", err)
-	}
-	if len(gqlResp.Errors) > 0 {
-		return nil, fmt.Errorf("linear api returned errors: %s", gqlResp.Errors[0].Message)
-	}
-
-	return respBody, nil
 }

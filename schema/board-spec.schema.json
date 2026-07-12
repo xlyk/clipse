@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "clipse board spec",
+  "description": "Reference schema for board.yaml consumed by `clipse board plan|apply`. Authoring aid and documentation only: it is NOT codegen'd and NOT loaded at runtime; the Go applier validates a hand-written yaml struct (internal/board).",
+  "type": "object",
+  "required": ["team", "issues"],
+  "properties": {
+    "team": { "type": "string", "minLength": 1 },
+    "base_branch": { "type": "string" },
+    "default_labels": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ref", "title"],
+        "properties": {
+          "ref": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "milestone": { "type": "string" },
+          "labels": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "deps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "human": { "type": "boolean" },
+          "body": { "type": "string" },
+          "body_file": { "type": "string" }
+        },
+        "oneOf": [{ "required": ["body"] }, { "required": ["body_file"] }],
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

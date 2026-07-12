@@ -28,7 +28,7 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
   `agent/evals/README.md`.
 - `make smoke-daytona-backend` — opt-in production-path Daytona smoke; opens a draft PR, runs coder/reviewer DAC turns, never merges, and cleans all live resources.
 
-Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard). Kernel tests need **no** network or LLM.
+Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard), `clipse board plan|apply` (bootstrap a Linear board from a `board.yaml` spec — see Board bootstrap below). Kernel tests need **no** network or LLM.
 
 <!-- managed:readme-agents-doc:section=STYLE:BEGIN -->
 ## Code style
@@ -82,11 +82,13 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 ## Layout
 
 - `cmd/clipse` — thin entrypoint → `cli.NewRootCmd()`.
-- `cli/` — cobra subcommands (`dispatch`, `status`, `tui`); `cli/tui/` is the bubbletea model.
+- `cli/` — cobra subcommands (`dispatch`, `status`, `tui`, `board`); `cli/tui/` is the bubbletea model.
 - `dispatcher/` — the daemon and the deterministic `Tick` loop.
 - `internal/config` — typed `clipse.yaml` load + validation + defaults.
 - `internal/store` — SQLite kernel (issues / runs / events / linear_writes), CAS claim, outbox.
 - `internal/board` — pure state machine (`Next`, `Promote`).
+- `internal/boardspec` — pure board-bootstrap: parse/validate `board.yaml`, the ref+sha content marker, and the create/update/skip reconciliation plan (no network, no LLM). Distinct from `internal/board` (the kernel state machine).
+- `internal/linear/bootstrap` — the Linear mutation client (`issueCreate`/`issueUpdate`/`issueRelationCreate`/label ensure) that executes a `boardspec` plan. Walled off from `internal/linear.HTTPClient` so the dispatcher can never create or delete issues.
 - `internal/spawn` — `Spawner` + local impl, `testworker` process control, git worktree lifecycle, orphan reaping.
 - `internal/backend` — provider-neutral lifecycle manager and command-backed Daytona protocol.
 - `internal/linear` — GraphQL `Client`, normalize, in-memory mock, writes.
@@ -95,7 +97,28 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 - `agent/` — uv Python project; `clipse-worker` entrypoint; `contract.py` is **generated**.
 - `agent/src/clipse_agent/backends/` — local/Daytona sessions, lifecycle contracts, and trusted host GitHub helpers.
 - `testworker/` — Go fake worker emitting canned schema-valid JSON (kernel regression harness; stays in the tree permanently).
-- `configs/clipse.example.yaml` — config shape.
+- `configs/clipse.example.yaml` — config shape; `configs/board.example.yaml` — board-spec shape (see `schema/board-spec.schema.json`, a reference-only schema, not codegen'd).
+- `skills/clipse-board-bootstrap` — repo-versioned skill: turns a prose project plan into a schema-valid `board.yaml` for `clipse board apply`. The LLM decomposition lives here, never in Go.
+
+## Board bootstrap
+
+Starting clipse on a new project needs a Linear board: issues, a `blocked-by`
+dependency DAG, `agent:<lane>` labels, and a start state. That is now a
+first-class flow, not a smoke-script side effect:
+
+1. The `clipse-board-bootstrap` skill turns a prose plan into a `board.yaml`
+   (+ `body_file` markdowns) — the only LLM step, kept out of the kernel.
+2. `clipse board plan board.yaml` previews the reconciliation; `clipse board
+   apply board.yaml` executes it.
+
+Re-runs are **idempotent**: each created issue carries a hidden
+`<!-- clipse-ref: <ref> sha:<hash> -->` marker in its Linear description, so a
+re-apply creates only new issues, updates changed ones (sha differs), skips
+unchanged ones, and never touches issues absent from the spec (reported as
+orphans, never deleted). `board.yaml` `ref`s are the stable, tracker-agnostic
+identity clipse reconciles on. Follow-up: migrate `scripts/smoke/smoke.sh`'s
+`seed()` onto `clipse board apply` (retiring the `linear`-CLI stdout scraping)
+once the tool has a live-Linear run behind it.
 
 ## Kernel invariants (do not violate)
 
