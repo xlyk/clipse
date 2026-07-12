@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import subprocess
+import json
 from collections.abc import Callable, Sequence
+from urllib.parse import quote
 
 from clipse_agent.backends.contracts import BackendActionError
 
 HostRunner = Callable[[list[str]], str]
 AuthPreflight = Callable[[], None]
+BranchExists = Callable[[str, str], bool]
 
 
 def _operation(argv: Sequence[str]) -> str:
@@ -89,6 +92,37 @@ def github_token(run_host: HostRunner = subprocess_host_runner) -> str:
     return token
 
 
+def github_branch_exists(repo_slug: str, branch: str) -> bool:
+    """Return whether GitHub has exactly ``refs/heads/<branch>``.
+
+    The matching-refs endpoint returns a successful empty array when a ref is
+    absent. Every command/protocol failure is instead a sanitized transient;
+    it must never be mistaken for "branch missing" and cause a divergent
+    feature branch to be created from the base.
+    """
+
+    endpoint = f"repos/{repo_slug}/git/matching-refs/heads/{quote(branch, safe='')}"
+    try:
+        completed = subprocess.run(
+            ["gh", "api", endpoint],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        payload = json.loads(completed.stdout)
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        raise BackendActionError("transient", "github_branch", "GitHub branch lookup failed") from None
+    if not isinstance(payload, list):
+        raise BackendActionError("transient", "github_branch", "GitHub branch lookup failed")
+    refs: list[str] = []
+    for item in payload:
+        if not isinstance(item, dict) or not isinstance(item.get("ref"), str):
+            raise BackendActionError("transient", "github_branch", "GitHub branch lookup failed")
+        refs.append(item["ref"])
+    exact = f"refs/heads/{branch}"
+    return exact in refs
+
+
 def safe_error(operation: str, exc: BaseException) -> str:
     """Describe a failure without ever echoing exception text or credentials."""
 
@@ -97,10 +131,12 @@ def safe_error(operation: str, exc: BaseException) -> str:
 
 __all__ = [
     "AuthPreflight",
+    "BranchExists",
     "BackendActionError",
     "HostRunner",
     "canonical_github_command",
     "github_auth_preflight",
+    "github_branch_exists",
     "github_token",
     "safe_error",
     "subprocess_host_runner",

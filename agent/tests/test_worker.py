@@ -336,7 +336,7 @@ def test_dispatch_builds_daytona_session_for_each_graph(
     raw_sandbox = SimpleNamespace(git=SimpleNamespace())
     backend = object()
     client = SimpleNamespace(get=lambda sandbox_id: raw_sandbox)
-    monkeypatch.setattr(worker, "Daytona", lambda: client)
+    monkeypatch.setattr(worker, "Daytona", lambda *_args, **_kwargs: client)
     monkeypatch.setattr(worker, "DaytonaSandbox", lambda *, sandbox: backend)
     dac_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     monkeypatch.setattr(
@@ -398,7 +398,7 @@ def test_daytona_session_attach_failure_is_sanitized_transient(
             raise RuntimeError(canary)
         return object()
 
-    monkeypatch.setattr(worker, "Daytona", lambda: SimpleNamespace(get=get))
+    monkeypatch.setattr(worker, "Daytona", lambda *_args, **_kwargs: SimpleNamespace(get=get))
     monkeypatch.setattr(worker, "DaytonaSandbox", attach)
 
     exit_code = worker.main(
@@ -423,6 +423,33 @@ def test_daytona_session_attach_failure_is_sanitized_transient(
     assert result.block_kind == BlockKind.transient
     assert result.summary == "clipse-worker: Daytona sandbox attachment failed"
     assert canary not in result.model_dump_json()
+
+
+def test_daytona_session_uses_explicit_target_over_environment(monkeypatch) -> None:
+    monkeypatch.setenv("DAYTONA_TARGET", "eu")
+    configs: list[Any] = []
+    raw_sandbox = SimpleNamespace(git=SimpleNamespace())
+
+    def daytona(config: Any) -> Any:
+        configs.append(config)
+        return SimpleNamespace(get=lambda _sandbox_id: raw_sandbox)
+
+    monkeypatch.setattr(worker, "Daytona", daytona)
+    monkeypatch.setattr(worker, "DaytonaSandbox", lambda *, sandbox: SimpleNamespace(id=sandbox))
+    args = worker._build_parser().parse_args(
+        [
+            f"--workspace={REMOTE_REPO_ABS}",
+            "--backend=daytona",
+            "--sandbox-id=sandbox-1",
+            "--repo-slug=xlyk/clipse",
+            "--target=us",
+        ]
+    )
+
+    session = worker._build_session(args)
+
+    assert isinstance(session, DaytonaSession)
+    assert configs[0].target == "us"
 
 
 # ---------------------------------------------------------------------------

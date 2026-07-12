@@ -12,6 +12,8 @@ from typing import Any, Protocol, TypeVar
 from daytona import (
     CreateSandboxFromSnapshotParams,
     Daytona,
+    DaytonaAuthenticationError,
+    DaytonaAuthorizationError,
     DaytonaConfig,
     DaytonaNotFoundError,
     DaytonaValidationError,
@@ -38,8 +40,10 @@ from clipse_agent.backends.contracts import (
 )
 from clipse_agent.backends.github import (
     AuthPreflight,
+    BranchExists,
     canonical_github_command,
     github_auth_preflight,
+    github_branch_exists,
     github_token,
     safe_error,
 )
@@ -54,6 +58,12 @@ class _Git(Protocol):
     def clone(self, **kwargs: Any) -> None: ...
 
     def add(self, path: str, files: list[str]) -> None: ...
+
+    def status(self, path: str) -> Any: ...
+
+    def create_branch(self, path: str, name: str) -> None: ...
+
+    def checkout_branch(self, path: str, branch: str) -> None: ...
 
 
 class _Sandbox(Protocol):
@@ -493,10 +503,12 @@ class DaytonaLifecycle:
         client_factory: ClientFactory = _default_client_factory,
         token_reader: TokenReader = github_token,
         auth_preflight: AuthPreflight = github_auth_preflight,
+        branch_exists: BranchExists = github_branch_exists,
     ) -> None:
         self._client_factory = client_factory
         self._token_reader = token_reader
         self._auth_preflight = auth_preflight
+        self._branch_exists = branch_exists
         self._client: _DaytonaClient | None = None
 
     def _prepare(self, request: BackendActionRequest) -> None:
@@ -531,7 +543,39 @@ class DaytonaLifecycle:
             return False
         return True
 
-    def _create_and_clone(self, request: BackendActionRequest, token: str) -> _Sandbox:
+    @staticmethod
+    def _failure_kind(exc: BaseException) -> str:
+        if isinstance(
+            exc,
+            (DaytonaAuthenticationError, DaytonaAuthorizationError, DaytonaValidationError),
+        ):
+            return "needs_input"
+        return "transient"
+
+    @classmethod
+    def _combined_failure_kind(cls, *errors: BaseException) -> str:
+        if any(cls._failure_kind(error) == "needs_input" for error in errors):
+            return "needs_input"
+        return "transient"
+
+    def _remote_feature_exists(self, request: BackendActionRequest) -> bool:
+        assert request.branch is not None
+        try:
+            return self._branch_exists(request.repo_slug, request.branch)
+        except BackendActionError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - sanitize host gh boundary
+            raise BackendActionError(
+                "transient", "github_branch", safe_error("GitHub branch lookup", exc)
+            ) from None
+
+    def _create_and_clone(
+        self,
+        request: BackendActionRequest,
+        token: str,
+        *,
+        remote_feature_exists: bool | None = None,
+    ) -> _Sandbox:
         assert self._client is not None
         assert request.role is not None
         assert request.auto_stop_minutes is not None
@@ -556,7 +600,11 @@ class DaytonaLifecycle:
                 "daytona_config",
                 safe_error("daytona configuration", exc),
             ) from None
-        clone_branch = request.branch if request.role == "reviewer" else request.base_branch
+        if request.role == "reviewer":
+            clone_branch = request.branch
+        else:
+            exists = self._remote_feature_exists(request) if remote_feature_exists is None else remote_feature_exists
+            clone_branch = request.branch if exists else request.base_branch
         try:
             sandbox.git.clone(
                 url=request.repo_url,
@@ -565,6 +613,9 @@ class DaytonaLifecycle:
                 username="x-access-token",
                 password=token,
             )
+            if request.role == "coder" and clone_branch != request.branch:
+                sandbox.git.create_branch(REMOTE_REPO_ABS, request.branch)
+                sandbox.git.checkout_branch(REMOTE_REPO_ABS, request.branch)
         except Exception as exc:
             try:
                 self._client.delete(sandbox)
@@ -573,9 +624,44 @@ class DaytonaLifecycle:
                     f"clone failed and cleanup failed for sandbox {sandbox.id} "
                     f"({type(cleanup_exc).__name__})"
                 )
-                raise BackendActionError("needs_input", "clone_cleanup", message) from None
-            raise BackendActionError("transient", "clone", safe_error("clone", exc)) from None
+                raise BackendActionError(
+                    self._combined_failure_kind(exc, cleanup_exc), "clone_cleanup", message
+                ) from None
+            raise BackendActionError(self._failure_kind(exc), "clone", safe_error("clone", exc)) from None
         return sandbox
+
+    def _ensure_coder_branch(self, sandbox: _Sandbox, request: BackendActionRequest) -> _Sandbox:
+        assert request.branch is not None
+        try:
+            current = sandbox.git.status(REMOTE_REPO_ABS).current_branch
+        except Exception as exc:  # noqa: BLE001 - provider bodies may contain credentials
+            raise BackendActionError("transient", "ensure_branch", safe_error("branch status", exc)) from None
+        if current == request.branch:
+            return sandbox
+
+        token = self._token_reader()
+        remote_exists = self._remote_feature_exists(request)
+        if not remote_exists:
+            try:
+                sandbox.git.create_branch(REMOTE_REPO_ABS, request.branch)
+                sandbox.git.checkout_branch(REMOTE_REPO_ABS, request.branch)
+            except Exception as exc:  # noqa: BLE001
+                raise BackendActionError(
+                    self._failure_kind(exc), "ensure_branch", safe_error("branch creation", exc)
+                ) from None
+            return sandbox
+
+        # A previous buggy provision left this identity on the base branch.
+        # Recreate from the pushed feature rather than guessing how much state
+        # the incomplete clone has fetched.
+        assert self._client is not None
+        try:
+            self._client.delete(sandbox)
+        except Exception as exc:  # noqa: BLE001
+            raise BackendActionError(
+                self._failure_kind(exc), "ensure_branch", safe_error("sandbox recreation", exc)
+            ) from None
+        return self._create_and_clone(request, token, remote_feature_exists=True)
 
     def ensure(self, request: BackendActionRequest) -> BackendWorkspace:
         self._prepare(request)
@@ -601,6 +687,8 @@ class DaytonaLifecycle:
         else:
             token = self._token_reader()
             sandbox = self._create_and_clone(request, token)
+        if request.role == "coder":
+            sandbox = self._ensure_coder_branch(sandbox, request)
         return workspace_from(sandbox, request)
 
     def delete(self, request: BackendActionRequest) -> BackendWorkspace:

@@ -17,6 +17,7 @@ from clipse_agent.backends.daytona import labels_for, owner_key, repo_label
 from clipse_agent.backends.github import (
     BackendActionError,
     github_auth_preflight,
+    github_branch_exists,
     github_token,
     safe_error,
     subprocess_host_runner,
@@ -265,3 +266,17 @@ def test_subprocess_host_runner_preserves_only_safe_no_pr_signal(monkeypatch) ->
 
     assert str(raised.value) == "no pull requests found"
     assert token not in str(raised.value)
+
+
+@pytest.mark.parametrize("payload", [{"ref": "refs/heads/feat/CLI-1"}, [{}], [{"ref": 7}]])
+def test_github_branch_exists_rejects_malformed_success_payload(monkeypatch, payload: object) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr=""),
+    )
+
+    with pytest.raises(BackendActionError) as raised:
+        github_branch_exists("xlyk/clipse", "feat/CLI-1")
+
+    assert raised.value.kind == "transient"

@@ -263,7 +263,8 @@ def make_load_diff(source: GitHubCommandSource) -> Callable[[ReviewerState], dic
     the authoritative PR diff through host GitHub; the legacy no-session seam
     retains its injected local runner. Both paths degrade to a note (never
     raise) if the diff cannot be produced and cap an oversized diff so one huge
-    PR cannot blow the token budget.
+    PR cannot blow the token budget. Diff failures fail closed before DAC:
+    a reviewer that did not receive the authoritative diff cannot PASS.
     """
 
     def _node(state: ReviewerState) -> dict[str, Any]:
@@ -288,10 +289,7 @@ def make_load_diff(source: GitHubCommandSource) -> Callable[[ReviewerState], dic
             result = _run(source, ["git", "diff", f"{diff_base}...HEAD"], cwd, check=False)
         truncation_note = ""
         if result.returncode != 0:
-            diff_block = (
-                f"(could not compute `{diff_label}` "
-                f"(exit {result.returncode}): {result.stderr.strip()})"
-            )
+            raise ReviewerGraphError("authoritative PR diff unavailable")
         else:
             diff = result.stdout
             if len(diff) > _MAX_DIFF_CHARS:

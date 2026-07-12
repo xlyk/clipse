@@ -350,7 +350,10 @@ async def run_smoke() -> None:
         known.append((coder_workspace, coder_request))
         print(f"coder sandbox: {coder_workspace.external_id}", flush=True)
         coder = attach(coder_workspace, slug)
-        require_command_ok("feature branch checkout", coder.run(["git", "checkout", "-b", branch]))
+        coder_branch = coder.run(["git", "branch", "--show-current"])
+        require_command_ok("lifecycle feature branch verification", coder_branch)
+        if coder_branch.stdout.strip() != branch:
+            raise SmokeError("coder lifecycle did not leave the repository on the requested feature branch")
 
         coder_model = os.getenv("CLIPSE_SMOKE_CODER_MODEL", DEFAULT_CODER_MODEL)
         await run_agent_turn(

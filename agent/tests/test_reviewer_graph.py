@@ -460,7 +460,7 @@ def test_load_diff_falls_back_to_local_base_when_fetch_fails(tmp_path):
     assert not any(c.argv[:2] == ["git", "diff"] and "origin/main...HEAD" in c.argv for c in runner.calls)
 
 
-def test_load_diff_degrades_gracefully_when_git_diff_fails(tmp_path):
+def test_load_diff_fails_closed_when_local_git_diff_fails(tmp_path):
     runner = _base_runner()
     runner.rules.insert(0, (_starts_with("git", "diff"), coder.CommandResult(128, "", "fatal: bad revision 'main...HEAD'")))
     turn_calls: list[dict[str, Any]] = []
@@ -479,11 +479,24 @@ def test_load_diff_degrades_gracefully_when_git_diff_fails(tmp_path):
         "issue_text": "x",
     }
 
-    # A failing `git diff` must NOT raise -- the review still runs, with a note.
-    order, result = asyncio.run(_drive(graph, input_state, {"configurable": {"thread_id": "thread-9b"}}))
-    assert "load_diff" in order
-    assert "could not compute" in turn_calls[0]["task_text"]
-    assert result.outcome == Outcome.done
+    with pytest.raises(reviewer.ReviewerGraphError, match="authoritative PR diff unavailable"):
+        asyncio.run(graph.ainvoke(input_state, {"configurable": {"thread_id": "thread-9b"}}))
+    assert turn_calls == []
+
+
+@pytest.mark.parametrize("stderr", ["authentication failed ghp_secret", "rate limit", "network unavailable"])
+def test_load_diff_fails_closed_and_sanitized_when_host_github_diff_fails(stderr: str) -> None:
+    class FailedSession:
+        def github(self, _argv: Sequence[str]) -> coder.CommandResult:
+            return coder.CommandResult(1, stderr=stderr)
+
+    node = reviewer.make_load_diff(FailedSession())
+
+    with pytest.raises(reviewer.ReviewerGraphError) as raised:
+        node({"cwd": REMOTE_REPO_ABS, "branch": "feat/CLI-1", "task_text": "review"})
+
+    assert str(raised.value) == "authoritative PR diff unavailable"
+    assert stderr not in str(raised.value)
 
 
 def test_load_diff_truncated_names_the_omitted_files(tmp_path):

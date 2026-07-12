@@ -36,6 +36,7 @@ from daytona import (
     DaytonaAuthenticationError,
     DaytonaAuthorizationError,
     DaytonaConnectionError,
+    DaytonaConfig,
     DaytonaError,
     DaytonaNotFoundError,
     DaytonaRateLimitError,
@@ -323,7 +324,7 @@ def _build_session(args: argparse.Namespace) -> AgentSession | _SessionAttachFai
         raise ValueError("Daytona runtime requires --sandbox-id")
 
     try:
-        sdk_sandbox = Daytona().get(args.sandbox_id)
+        sdk_sandbox = Daytona(DaytonaConfig(target=args.target or None)).get(args.sandbox_id)
         daytona_backend = DaytonaSandbox(sandbox=sdk_sandbox)
         sandbox = RepositoryScopedDaytonaSandbox(daytona_backend, args.workspace)
     except Exception:  # noqa: BLE001 - discard provider bodies and exception causes at the attach boundary

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from daytona import DaytonaNotFoundError
+from daytona import DaytonaConnectionError, DaytonaNotFoundError, DaytonaValidationError
 from deepagents.backends.protocol import ExecuteResponse
 
 from clipse_agent.backends.contracts import BackendActionRequest, BackendWorkspace
@@ -52,6 +52,9 @@ class _FakeGit:
     config: dict[str, str] = field(default_factory=dict)
     raises: BaseException | None = None
     events: list[str] | None = None
+    current_branch: str = "main"
+    created_branches: list[tuple[str, str]] = field(default_factory=list)
+    checked_out_branches: list[tuple[str, str]] = field(default_factory=list)
 
     def clone(self, **kwargs: Any) -> None:
         if self.events is not None:
@@ -59,6 +62,19 @@ class _FakeGit:
         self.clone_calls.append(kwargs)
         if self.raises is not None:
             raise self.raises
+        self.current_branch = kwargs["branch"]
+
+    def status(self, path: str) -> Any:
+        assert path == REMOTE_REPO_ABS
+        return type("Status", (), {"current_branch": self.current_branch})()
+
+    def create_branch(self, path: str, name: str) -> None:
+        self.created_branches.append((path, name))
+        self.current_branch = name
+
+    def checkout_branch(self, path: str, branch: str) -> None:
+        self.checked_out_branches.append((path, branch))
+        self.current_branch = branch
 
 
 @dataclass
@@ -163,6 +179,8 @@ def _lifecycle(
     *,
     preflights: list[str] | None = None,
     token_error: BaseException | None = None,
+    remote_branch_exists: bool = False,
+    branch_probe_error: BaseException | None = None,
 ) -> DaytonaLifecycle:
     token_reads = tokens if tokens is not None else []
 
@@ -178,16 +196,23 @@ def _lifecycle(
         if preflights is not None:
             preflights.append("status")
 
+    def branch_probe(_repo_slug: str, _branch: str) -> bool:
+        if branch_probe_error is not None:
+            raise branch_probe_error
+        return remote_branch_exists
+
     return DaytonaLifecycle(
         client_factory=lambda _request: client,
         token_reader=read_token,
         auth_preflight=preflight,
+        branch_exists=branch_probe,
     )
 
 
 def test_ensure_reuses_and_starts_single_stopped_match_without_reading_token() -> None:
     request = _request()
     sandbox = _FakeSandbox(id="sandbox-1", state="stopped", labels=labels_for(request))
+    sandbox.git.current_branch = request.branch
     client = _FakeClient([sandbox])
     token_reads: list[str] = []
 
@@ -244,6 +269,9 @@ def test_ensure_creates_coder_without_auto_delete_and_clones_secret_safely() -> 
             "password": "ghp_clone_secret",
         }
     ]
+    assert client.sandboxes[0].git.created_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert client.sandboxes[0].git.checked_out_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert client.sandboxes[0].git.current_branch == request.branch
     assert "ghp_clone_secret" not in repr(client.sandboxes[0].env)
     assert "ghp_clone_secret" not in repr(client.sandboxes[0].git.config)
 
@@ -262,6 +290,45 @@ def test_ensure_creates_reviewer_with_auto_delete_and_run_scoped_labels() -> Non
     assert client.sandboxes[0].git.clone_calls[0]["branch"] == request.branch
     assert "ghp_clone_secret" not in repr(client.sandboxes[0].env)
     assert "ghp_clone_secret" not in repr(client.sandboxes[0].git.config)
+
+
+def test_ensure_coder_restores_existing_remote_feature_branch() -> None:
+    request = _request()
+    client = _FakeClient()
+
+    _lifecycle(client, remote_branch_exists=True).ensure(request)
+
+    assert client.sandboxes[0].git.clone_calls[0]["branch"] == request.branch
+    assert client.sandboxes[0].git.created_branches == []
+    assert client.sandboxes[0].git.current_branch == request.branch
+
+
+def test_ensure_coder_repairs_reused_sandbox_to_requested_branch() -> None:
+    request = _request()
+    sandbox = _FakeSandbox(id="sandbox-1", labels=labels_for(request))
+    sandbox.git.current_branch = request.base_branch
+    client = _FakeClient([sandbox])
+
+    workspace = _lifecycle(client, remote_branch_exists=False).ensure(request)
+
+    assert workspace.external_id == sandbox.id
+    assert sandbox.git.created_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert sandbox.git.checked_out_branches == [(REMOTE_REPO_ABS, request.branch)]
+    assert sandbox.git.current_branch == request.branch
+
+
+def test_ensure_coder_recreates_wrong_branch_from_pushed_remote_feature() -> None:
+    request = _request()
+    stale = _FakeSandbox(id="sandbox-stale", labels=labels_for(request))
+    stale.git.current_branch = request.base_branch
+    client = _FakeClient([stale])
+
+    workspace = _lifecycle(client, remote_branch_exists=True).ensure(request)
+
+    assert workspace.external_id == "sandbox-2"
+    assert client.deleted == [stale]
+    assert client.sandboxes[-1].git.clone_calls[0]["branch"] == request.branch
+    assert client.sandboxes[-1].git.current_branch == request.branch
 
 
 def test_list_returns_only_matching_typed_workspaces() -> None:
@@ -327,10 +394,25 @@ def test_ensure_deletes_new_sandbox_when_clone_fails() -> None:
     assert [sandbox.id for sandbox in client.deleted] == ["sandbox-1"]
 
 
-def test_ensure_surfaces_cleanup_failure_instead_of_hiding_poisoned_identity() -> None:
+def test_ensure_classifies_temporary_clone_and_cleanup_failure_as_transient() -> None:
     client = _FakeClient(
-        clone_error=RuntimeError("clone failed with ghp_secret"),
-        delete_error=RuntimeError("delete failed with ghp_secret"),
+        clone_error=DaytonaConnectionError("clone failed with ghp_secret"),
+        delete_error=DaytonaConnectionError("delete failed with ghp_secret"),
+    )
+
+    with pytest.raises(BackendActionError) as raised:
+        _lifecycle(client).ensure(_request())
+
+    assert raised.value.kind == "transient"
+    assert raised.value.operation == "clone_cleanup"
+    assert str(raised.value) == "clone failed and cleanup failed for sandbox sandbox-1 (DaytonaConnectionError)"
+    assert "ghp_secret" not in str(raised.value)
+
+
+def test_ensure_classifies_validation_clone_cleanup_failure_as_needs_input() -> None:
+    client = _FakeClient(
+        clone_error=DaytonaValidationError("invalid clone"),
+        delete_error=RuntimeError("delete lost response"),
     )
 
     with pytest.raises(BackendActionError) as raised:
@@ -338,8 +420,20 @@ def test_ensure_surfaces_cleanup_failure_instead_of_hiding_poisoned_identity() -
 
     assert raised.value.kind == "needs_input"
     assert raised.value.operation == "clone_cleanup"
-    assert str(raised.value) == "clone failed and cleanup failed for sandbox sandbox-1 (RuntimeError)"
-    assert "ghp_secret" not in str(raised.value)
+    assert [sandbox.id for sandbox in client.sandboxes] == ["sandbox-1"]
+
+
+def test_ensure_classifies_validation_cleanup_after_transient_clone_as_needs_input() -> None:
+    client = _FakeClient(
+        clone_error=DaytonaConnectionError("temporary clone"),
+        delete_error=DaytonaValidationError("invalid delete configuration"),
+    )
+
+    with pytest.raises(BackendActionError) as raised:
+        _lifecycle(client).ensure(_request())
+
+    assert raised.value.kind == "needs_input"
+    assert raised.value.operation == "clone_cleanup"
 
 
 def test_ensure_recreates_reused_sandbox_when_repository_is_incomplete() -> None:
