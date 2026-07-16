@@ -1,6 +1,9 @@
 package boardspec
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+)
 
 // Action is what BuildPlan decided for one spec issue.
 type Action int
@@ -48,29 +51,38 @@ type RelationOp struct {
 
 // Plan is the full reconciliation plan. It mutates nothing on its own.
 type Plan struct {
-	Issues    []IssueOp
-	Relations []RelationOp
-	Orphans   []string
+	Issues         []IssueOp
+	Relations      []RelationOp
+	StaleRelations []RelationOp
+	Orphans        []string
 }
 
 // BuildPlan diffs a validated spec against the current board (matched by
 // marker ref) and returns the reconciliation plan.
-func BuildPlan(spec *Spec, board []BoardIssue) *Plan {
+func BuildPlan(spec *Spec, board []BoardIssue) (*Plan, error) {
 	existingByRef := map[string]BoardIssue{}
 	for _, bi := range board {
 		if ref, _, ok := ParseMarker(bi.Description); ok {
+			if existing, duplicate := existingByRef[ref]; duplicate {
+				return nil, fmt.Errorf("duplicate clipse-ref %q on Linear issues %s and %s", ref, boardIssueName(existing), boardIssueName(bi))
+			}
 			existingByRef[ref] = bi
 		}
 	}
+	refByID := make(map[string]string, len(existingByRef))
+	for ref, issue := range existingByRef {
+		refByID[issue.ID] = ref
+	}
 	specRefs := map[string]bool{}
 	p := &Plan{}
+	staleSeen := map[RelationOp]bool{}
 	for _, is := range spec.Issues {
 		specRefs[is.Ref] = true
 		op := IssueOp{Ref: is.Ref, Issue: is}
 		if bi, ok := existingByRef[is.Ref]; ok {
 			op.ExistingID = bi.ID
 			_, sha, _ := ParseMarker(bi.Description)
-			if sha == ContentSHA(is) {
+			if sha == ContentSHA(spec, is) {
 				op.Action = Skip
 			} else {
 				op.Action = Update
@@ -85,6 +97,20 @@ func BuildPlan(spec *Spec, board []BoardIssue) *Plan {
 			}
 			p.Relations = append(p.Relations, RelationOp{FromRef: is.Ref, ToRef: d})
 		}
+		if existing, ok := existingByRef[is.Ref]; ok {
+			desired := make(map[string]bool, len(is.Deps))
+			for _, dep := range is.Deps {
+				desired[dep] = true
+			}
+			for _, blockerID := range existing.BlockedBy {
+				blockerRef, managed := refByID[blockerID]
+				stale := RelationOp{FromRef: is.Ref, ToRef: blockerRef}
+				if managed && !desired[blockerRef] && !staleSeen[stale] {
+					p.StaleRelations = append(p.StaleRelations, stale)
+					staleSeen[stale] = true
+				}
+			}
+		}
 	}
 	for ref := range existingByRef {
 		if !specRefs[ref] {
@@ -92,7 +118,20 @@ func BuildPlan(spec *Spec, board []BoardIssue) *Plan {
 		}
 	}
 	sort.Strings(p.Orphans)
-	return p
+	sort.Slice(p.StaleRelations, func(i, j int) bool {
+		if p.StaleRelations[i].FromRef == p.StaleRelations[j].FromRef {
+			return p.StaleRelations[i].ToRef < p.StaleRelations[j].ToRef
+		}
+		return p.StaleRelations[i].FromRef < p.StaleRelations[j].FromRef
+	})
+	return p, nil
+}
+
+func boardIssueName(issue BoardIssue) string {
+	if issue.Identifier != "" {
+		return issue.Identifier
+	}
+	return issue.ID
 }
 
 // relationExists reports whether the board already records fromRef as

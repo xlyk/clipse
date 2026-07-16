@@ -42,6 +42,25 @@ func TestValidateRejectsMissingBody(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsUnsafeRef(t *testing.T) {
+	for _, ref := range []string{"has space", "bad-->marker", "-leading"} {
+		t.Run(ref, func(t *testing.T) {
+			s := specWith(Issue{Ref: ref, Title: "A", Body: "x"})
+			if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "safe identifier") {
+				t.Fatalf("want safe-ref error for %q, got %v", ref, err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsEmptyDefaultLabel(t *testing.T) {
+	s := specWith(Issue{Ref: "a", Title: "A", Body: "x"})
+	s.DefaultLabels = []string{"agent:coder", ""}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "empty default label") {
+		t.Fatalf("want empty default-label error, got %v", err)
+	}
+}
+
 func TestValidateAcceptsValidDAGAndTopoOrders(t *testing.T) {
 	s := specWith(
 		Issue{Ref: "b", Title: "B", Body: "y", Deps: []string{"a"}},

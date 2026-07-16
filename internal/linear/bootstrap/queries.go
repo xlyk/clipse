@@ -5,21 +5,24 @@ package bootstrap
 // inverse blocking relations (the issues that block this one). It mirrors
 // internal/linear.CandidateIssuesQuery's team-key filter and inverseRelations
 // convention, but is unfiltered by label/state: board reconciliation must see
-// every clipse-managed issue, not only the dispatchable ones. first:250 is
-// Linear's max page (pagination is a known v1 limitation).
-const TeamIssuesQuery = `query TeamIssues($teamKey: String!) {
-  issues(first: 250, filter: { team: { key: { eq: $teamKey } } }) {
+// every clipse-managed issue, not only the dispatchable ones. The client walks
+// every top-level page; nested inverse relations fail closed if they exceed the
+// maximum page so an incomplete dependency snapshot is never reconciled.
+const TeamIssuesQuery = `query TeamIssues($teamKey: String!, $after: String) {
+  issues(first: 250, after: $after, filter: { team: { key: { eq: $teamKey } } }) {
     nodes {
       id
       identifier
       description
-      inverseRelations {
+      inverseRelations(first: 250) {
         nodes {
           type
           issue { id }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
+    pageInfo { hasNextPage endCursor }
   }
 }`
 
@@ -29,14 +32,21 @@ const TeamIssuesQuery = `query TeamIssues($teamKey: String!) {
 const TeamMetaQuery = `query TeamMeta($teamKey: String!) {
   team(key: $teamKey) {
     id
-    states { nodes { id name type } }
-    labels { nodes { id name } }
+    states(first: 250) {
+      nodes { id name type }
+      pageInfo { hasNextPage endCursor }
+    }
+    labels(first: 250) {
+      nodes { id name }
+      pageInfo { hasNextPage endCursor }
+    }
   }
 }`
 
 // IssueLabelCreateMutation creates a team label by name.
 const IssueLabelCreateMutation = `mutation IssueLabelCreate($name: String!, $teamId: String!) {
   issueLabelCreate(input: { name: $name, teamId: $teamId }) {
+    success
     issueLabel { id }
   }
 }`
@@ -45,6 +55,7 @@ const IssueLabelCreateMutation = `mutation IssueLabelCreate($name: String!, $tea
 // returning its id and human identifier.
 const IssueCreateMutation = `mutation IssueCreate($teamId: String!, $title: String!, $description: String!, $stateId: String!, $labelIds: [String!]) {
   issueCreate(input: { teamId: $teamId, title: $title, description: $description, stateId: $stateId, labelIds: $labelIds }) {
+    success
     issue { id identifier }
   }
 }`

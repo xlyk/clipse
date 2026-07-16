@@ -6,7 +6,9 @@
 package boardspec
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -43,8 +45,29 @@ func Parse(path string) (*Spec, error) {
 		return nil, fmt.Errorf("reading spec %s: %w", path, err)
 	}
 	var spec Spec
-	if err := yaml.Unmarshal(raw, &spec); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&spec); err != nil {
 		return nil, fmt.Errorf("parsing spec %s: %w", path, err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parsing spec %s: multiple YAML documents are not supported", path)
+		}
+		return nil, fmt.Errorf("parsing spec %s: %w", path, err)
+	}
+	bodySources, err := issueBodySources(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parsing spec %s: %w", path, err)
+	}
+	if len(bodySources) != len(spec.Issues) {
+		return nil, fmt.Errorf("parsing spec %s: issue source count mismatch", path)
+	}
+	for i, source := range bodySources {
+		if source.body == source.bodyFile {
+			return nil, fmt.Errorf("parsing spec %s: issue %q must set exactly one of body or body_file", path, spec.Issues[i].Ref)
+		}
 	}
 	dir := filepath.Dir(path)
 	for i := range spec.Issues {
@@ -60,4 +83,51 @@ func Parse(path string) (*Spec, error) {
 		spec.Issues[i].BodyFile = ""
 	}
 	return &spec, nil
+}
+
+type bodySource struct {
+	body     bool
+	bodyFile bool
+}
+
+// issueBodySources records which mutually-exclusive body keys appeared in the
+// YAML before body_file is resolved into Body. The resolved Spec cannot retain
+// this distinction because both sources intentionally converge on Issue.Body.
+func issueBodySources(raw []byte) ([]bodySource, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Content) == 0 || len(doc.Content[0].Content) == 0 {
+		return nil, nil
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("document root must be a mapping")
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "issues" {
+			continue
+		}
+		issues := root.Content[i+1]
+		if issues.Kind != yaml.SequenceNode {
+			return nil, fmt.Errorf("issues must be a sequence")
+		}
+		out := make([]bodySource, len(issues.Content))
+		for issueIndex, issue := range issues.Content {
+			if issue.Kind != yaml.MappingNode {
+				return nil, fmt.Errorf("issue %d must be a mapping", issueIndex+1)
+			}
+			for j := 0; j+1 < len(issue.Content); j += 2 {
+				switch issue.Content[j].Value {
+				case "body":
+					out[issueIndex].body = true
+				case "body_file":
+					out[issueIndex].bodyFile = true
+				}
+			}
+		}
+		return out, nil
+	}
+	return nil, nil
 }
