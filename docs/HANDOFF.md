@@ -1,5 +1,10 @@
 # Clipse — session handoff
 
+> [!WARNING]
+> Archived session snapshot from 2026-07-02. Do not use this as the current
+> implementation guide; see [AGENTS.md](../AGENTS.md) and [README.md](../README.md).
+> Historical shipped details below are retained for provenance.
+
 **Date:** 2026-07-02 · **Branch:** `feat/phase-3-pipeline` · **Gate:** `make test` + `go test -race ./...` + `make lint` green.
 
 Resume brief for a fresh session. Read this, then the guide + design + plan, then continue.
