@@ -35,7 +35,7 @@ type Outcome string
 const (
 	// OutcomeMerged means the PR merged cleanly. The dispatcher maps this
 	// to a "done" outcome from the merging column (board.Next transitions
-	// merging -> documentation). Run has already removed the worktree and
+	// merging -> done). Run has already removed the worktree and
 	// local branch, and created Spec.Tag if one was set, by the time this
 	// is returned.
 	OutcomeMerged Outcome = "merged"

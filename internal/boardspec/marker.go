@@ -10,12 +10,13 @@ import (
 
 var markerRE = regexp.MustCompile(`(?m)\n*<!-- clipse-ref: (\S+) sha:(\S+) -->\s*$`)
 
-// ContentSHA is a short digest over an issue's reconciled content (title,
-// body, labels, deps) — NOT its ref. A re-run compares this to the sha stored
-// in the on-board marker to decide create/update/skip. Labels and deps are
-// sorted so ordering never changes the digest.
-func ContentSHA(is Issue) string {
-	labels := append([]string(nil), is.Labels...)
+// ContentSHA is a short digest over an issue's fully resolved desired content
+// (title, body, effective labels, deps) — NOT its ref. A re-run compares this
+// to the sha stored in the on-board marker to decide create/update/skip.
+// Effective labels include inherited defaults and the human classification;
+// labels and deps are sorted so ordering never changes the digest.
+func ContentSHA(spec *Spec, is Issue) string {
+	labels := append([]string(nil), effectiveLabels(spec, is)...)
 	deps := append([]string(nil), is.Deps...)
 	sort.Strings(labels)
 	sort.Strings(deps)
@@ -32,8 +33,8 @@ func RenderMarker(ref, sha string) string {
 
 // WithBody is the full Linear description for an issue: its body followed by
 // the marker carrying its ref and current content sha.
-func WithBody(is Issue) string {
-	return strings.TrimRight(is.Body, "\n") + "\n\n" + RenderMarker(is.Ref, ContentSHA(is))
+func WithBody(spec *Spec, is Issue) string {
+	return strings.TrimRight(is.Body, "\n") + "\n\n" + RenderMarker(is.Ref, ContentSHA(spec, is))
 }
 
 // ParseMarker extracts (ref, sha) from a Linear description's trailer.

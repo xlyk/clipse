@@ -79,7 +79,11 @@ func runBoardPlan(cmd *cobra.Command, specPath string) error {
 	if err != nil {
 		return fmt.Errorf("reading team issues: %w", err)
 	}
-	fmt.Fprint(cmd.OutOrStdout(), planText(spec, issues))
+	text, err := planText(spec, issues)
+	if err != nil {
+		return fmt.Errorf("building plan: %w", err)
+	}
+	fmt.Fprint(cmd.OutOrStdout(), text)
 	return nil
 }
 
@@ -94,7 +98,10 @@ func runBoardApply(cmd *cobra.Command, specPath string) error {
 	if err != nil {
 		return fmt.Errorf("reading team issues: %w", err)
 	}
-	plan := boardspec.BuildPlan(spec, issues)
+	plan, err := boardspec.BuildPlan(spec, issues)
+	if err != nil {
+		return fmt.Errorf("building plan: %w", err)
+	}
 	fmt.Fprint(cmd.OutOrStdout(), plan.Render())
 	if err := boardspec.Apply(ctx, client, spec, plan); err != nil {
 		return fmt.Errorf("applying plan: %w", err)
@@ -105,6 +112,10 @@ func runBoardApply(cmd *cobra.Command, specPath string) error {
 
 // planText is the pure core of the plan command: build the plan and render
 // it. Split out so it can be unit-tested without a network call.
-func planText(spec *boardspec.Spec, issues []boardspec.BoardIssue) string {
-	return boardspec.BuildPlan(spec, issues).Render()
+func planText(spec *boardspec.Spec, issues []boardspec.BoardIssue) (string, error) {
+	plan, err := boardspec.BuildPlan(spec, issues)
+	if err != nil {
+		return "", err
+	}
+	return plan.Render(), nil
 }

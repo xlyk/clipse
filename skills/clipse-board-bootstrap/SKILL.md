@@ -21,7 +21,7 @@ A `board.yaml` validated against `schema/board-spec.schema.json`, plus one markd
 
 - **Small, single-concern issues.** One coherent unit of work each — the size a coder agent can land in one PR. Split "build the CLI" into parser, config, wiring, etc.
 - **Dependency DAG via `deps`.** If issue B builds on A's code, `B.deps: [A.ref]`. clipse gates each issue on its blockers and dispatches in dependency order. Keep it acyclic.
-- **Stable `ref` per issue.** A short, tracker-agnostic id (`core-1`, `cli-parser`). This is the immutable identity clipse matches on across re-runs — never reuse or renumber one after apply.
+- **Stable `ref` per issue.** A short, tracker-agnostic id (`core-1`, `cli-parser`) matching `[A-Za-z0-9][A-Za-z0-9._-]*`. This is the immutable identity clipse matches on across re-runs — never reuse or renumber one after apply.
 - **Lane labels.** Agent-worked issues carry an `agent:<lane>` label (almost always `agent:coder`). Set `default_labels: [agent:coder]` at the top and omit per-issue `labels` unless an issue needs a different lane.
 - **Human tickets.** Work a person must do (design calls, credential setup, external approvals) gets `human: true` — it is labeled `human`, left in Todo, and never picked up by an agent. Downstream agent issues can still `deps:` on it.
 - **Bodies are the task spec the coder reads.** Write each body as a clear, self-contained task: context, what to build, acceptance criteria. Put anything longer than a couple lines in a `body_file`.
@@ -58,7 +58,7 @@ See `configs/board.example.yaml` for a complete example and `schema/board-spec.s
 2. Decompose into issues with refs, deps, labels, and human flags per the rules above.
 3. Write `board.yaml` and the `specs/<ref>.md` body files.
 4. Validate mentally against the schema (required: `team`, and per issue `ref`+`title`+ exactly one of `body`/`body_file`; deps must reference defined refs; no cycles).
-5. Hand off: tell the human to review, then run `clipse board plan board.yaml` to preview and `clipse board apply board.yaml` to reconcile. Re-runs are idempotent — safe to amend the spec and re-apply.
+5. Hand off: tell the human to review, then run `clipse board plan board.yaml` to preview and `clipse board apply board.yaml` to reconcile. Re-runs are idempotent for issue content and additions. Removed dependency edges are reported as stale and deliberately left for operator cleanup.
 
 ## Do not
 

@@ -2,6 +2,8 @@
 # reconciliation; `clipse board apply board.yaml` executes it. Re-runs are
 # idempotent — only what changed is created/updated, matched by a hidden
 # ref marker written into each Linear issue's description.
+# Refs must match [A-Za-z0-9][A-Za-z0-9._-]*. Removed dependency edges are
+# reported as stale and left for explicit operator cleanup.
 team: CLI
 base_branch: main
 default_labels: [agent:coder]

@@ -43,6 +43,11 @@ type Client struct {
 	labelByName map[string]string // label name -> id
 }
 
+type pageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
+}
+
 // NewClient builds a Client scoped to teamKey against Linear's real API,
 // reading the key from LINEAR_API_KEY.
 func NewClient(teamKey string) (*Client, error) {
@@ -67,47 +72,64 @@ func NewClientWithBaseURL(baseURL, teamKey string) (*Client, error) {
 // it: id, identifier, description (carrying the ref marker), and the Linear
 // ids of its blockers (inverseRelations of type "blocks").
 func (c *Client) TeamIssues(ctx context.Context) ([]boardspec.BoardIssue, error) {
-	reqBody, err := marshalGraphQL(TeamIssuesQuery, map[string]any{"teamKey": c.teamKey})
-	if err != nil {
-		return nil, fmt.Errorf("team issues: %w", err)
-	}
-	resp, err := c.do(ctx, reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("team issues: %w", err)
-	}
-	var payload struct {
-		Data struct {
-			Issues struct {
-				Nodes []struct {
-					ID               string `json:"id"`
-					Identifier       string `json:"identifier"`
-					Description      string `json:"description"`
-					InverseRelations struct {
-						Nodes []struct {
-							Type  string `json:"type"`
-							Issue struct {
-								ID string `json:"id"`
-							} `json:"issue"`
-						} `json:"nodes"`
-					} `json:"inverseRelations"`
-				} `json:"nodes"`
-			} `json:"issues"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(resp, &payload); err != nil {
-		return nil, fmt.Errorf("team issues: decoding: %w", err)
-	}
-	out := make([]boardspec.BoardIssue, 0, len(payload.Data.Issues.Nodes))
-	for _, n := range payload.Data.Issues.Nodes {
-		bi := boardspec.BoardIssue{ID: n.ID, Identifier: n.Identifier, Description: n.Description}
-		for _, r := range n.InverseRelations.Nodes {
-			if r.Type == "blocks" {
-				bi.BlockedBy = append(bi.BlockedBy, r.Issue.ID)
-			}
+	var out []boardspec.BoardIssue
+	var after any
+	seenCursors := map[string]bool{}
+	for {
+		reqBody, err := marshalGraphQL(TeamIssuesQuery, map[string]any{"teamKey": c.teamKey, "after": after})
+		if err != nil {
+			return nil, fmt.Errorf("team issues: %w", err)
 		}
-		out = append(out, bi)
+		resp, err := c.do(ctx, reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("team issues: %w", err)
+		}
+		var payload struct {
+			Data struct {
+				Issues struct {
+					Nodes []struct {
+						ID               string `json:"id"`
+						Identifier       string `json:"identifier"`
+						Description      string `json:"description"`
+						InverseRelations struct {
+							Nodes []struct {
+								Type  string `json:"type"`
+								Issue struct {
+									ID string `json:"id"`
+								} `json:"issue"`
+							} `json:"nodes"`
+							PageInfo pageInfo `json:"pageInfo"`
+						} `json:"inverseRelations"`
+					} `json:"nodes"`
+					PageInfo pageInfo `json:"pageInfo"`
+				} `json:"issues"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(resp, &payload); err != nil {
+			return nil, fmt.Errorf("team issues: decoding: %w", err)
+		}
+		for _, n := range payload.Data.Issues.Nodes {
+			if n.InverseRelations.PageInfo.HasNextPage {
+				return nil, fmt.Errorf("team issues: issue %s inverse-relation pagination exceeds 250; refusing an incomplete board snapshot", n.Identifier)
+			}
+			bi := boardspec.BoardIssue{ID: n.ID, Identifier: n.Identifier, Description: n.Description}
+			for _, r := range n.InverseRelations.Nodes {
+				if r.Type == "blocks" {
+					bi.BlockedBy = append(bi.BlockedBy, r.Issue.ID)
+				}
+			}
+			out = append(out, bi)
+		}
+		info := payload.Data.Issues.PageInfo
+		if !info.HasNextPage {
+			return out, nil
+		}
+		if info.EndCursor == "" || seenCursors[info.EndCursor] {
+			return nil, fmt.Errorf("team issues: invalid repeated or empty pagination cursor")
+		}
+		seenCursors[info.EndCursor] = true
+		after = info.EndCursor
 	}
-	return out, nil
 }
 
 // resolve lazily fetches and caches the team's id, workflow states, and
@@ -136,12 +158,14 @@ func (c *Client) resolve(ctx context.Context) error {
 						Name string `json:"name"`
 						Type string `json:"type"`
 					} `json:"nodes"`
+					PageInfo pageInfo `json:"pageInfo"`
 				} `json:"states"`
 				Labels struct {
 					Nodes []struct {
 						ID   string `json:"id"`
 						Name string `json:"name"`
 					} `json:"nodes"`
+					PageInfo pageInfo `json:"pageInfo"`
 				} `json:"labels"`
 			} `json:"team"`
 		} `json:"data"`
@@ -152,6 +176,12 @@ func (c *Client) resolve(ctx context.Context) error {
 	t := payload.Data.Team
 	if t.ID == "" {
 		return fmt.Errorf("team %q not found", c.teamKey)
+	}
+	if t.States.PageInfo.HasNextPage {
+		return fmt.Errorf("team %q states require pagination beyond 250; refusing incomplete metadata", c.teamKey)
+	}
+	if t.Labels.PageInfo.HasNextPage {
+		return fmt.Errorf("team %q labels require pagination beyond 250; refusing incomplete metadata", c.teamKey)
 	}
 	c.teamID = t.ID
 	c.stateByName = make(map[string]string, len(t.States.Nodes))
@@ -191,6 +221,7 @@ func (c *Client) EnsureLabels(ctx context.Context, names []string) error {
 		var payload struct {
 			Data struct {
 				IssueLabelCreate struct {
+					Success    bool `json:"success"`
 					IssueLabel struct {
 						ID string `json:"id"`
 					} `json:"issueLabel"`
@@ -200,8 +231,12 @@ func (c *Client) EnsureLabels(ctx context.Context, names []string) error {
 		if err := json.Unmarshal(resp, &payload); err != nil {
 			return fmt.Errorf("decoding label create %q: %w", name, err)
 		}
+		created := payload.Data.IssueLabelCreate
+		if !created.Success || created.IssueLabel.ID == "" {
+			return fmt.Errorf("creating label %q: mutation returned success=%t id=%q", name, created.Success, created.IssueLabel.ID)
+		}
 		c.mu.Lock()
-		c.labelByName[name] = payload.Data.IssueLabelCreate.IssueLabel.ID
+		c.labelByName[name] = created.IssueLabel.ID
 		c.mu.Unlock()
 	}
 	return nil
@@ -271,7 +306,8 @@ func (c *Client) CreateIssue(ctx context.Context, in boardspec.CreateInput) (str
 	var payload struct {
 		Data struct {
 			IssueCreate struct {
-				Issue struct {
+				Success bool `json:"success"`
+				Issue   struct {
 					ID string `json:"id"`
 				} `json:"issue"`
 			} `json:"issueCreate"`
@@ -280,7 +316,11 @@ func (c *Client) CreateIssue(ctx context.Context, in boardspec.CreateInput) (str
 	if err := json.Unmarshal(resp, &payload); err != nil {
 		return "", fmt.Errorf("decoding issue create: %w", err)
 	}
-	return payload.Data.IssueCreate.Issue.ID, nil
+	created := payload.Data.IssueCreate
+	if !created.Success || created.Issue.ID == "" {
+		return "", fmt.Errorf("creating issue: mutation returned success=%t id=%q", created.Success, created.Issue.ID)
+	}
+	return created.Issue.ID, nil
 }
 
 // UpdateIssue updates an existing issue. Implements boardspec.Linear.
@@ -301,8 +341,22 @@ func (c *Client) UpdateIssue(ctx context.Context, id string, in boardspec.Update
 	if err != nil {
 		return err
 	}
-	if _, err := c.do(ctx, reqBody); err != nil {
+	resp, err := c.do(ctx, reqBody)
+	if err != nil {
 		return err
+	}
+	var payload struct {
+		Data struct {
+			IssueUpdate struct {
+				Success bool `json:"success"`
+			} `json:"issueUpdate"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &payload); err != nil {
+		return fmt.Errorf("decoding issue update %q: %w", id, err)
+	}
+	if !payload.Data.IssueUpdate.Success {
+		return fmt.Errorf("updating issue %q: mutation returned success=false", id)
 	}
 	return nil
 }
@@ -318,8 +372,22 @@ func (c *Client) AddBlockedBy(ctx context.Context, dependentID, blockerID string
 	if err != nil {
 		return err
 	}
-	if _, err := c.do(ctx, reqBody); err != nil {
+	resp, err := c.do(ctx, reqBody)
+	if err != nil {
 		return err
+	}
+	var payload struct {
+		Data struct {
+			IssueRelationCreate struct {
+				Success bool `json:"success"`
+			} `json:"issueRelationCreate"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &payload); err != nil {
+		return fmt.Errorf("decoding blocked-by relation %q -> %q: %w", dependentID, blockerID, err)
+	}
+	if !payload.Data.IssueRelationCreate.Success {
+		return fmt.Errorf("creating blocked-by relation %q -> %q: mutation returned success=false", dependentID, blockerID)
 	}
 	return nil
 }
