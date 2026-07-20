@@ -280,3 +280,38 @@ func (s *Store) CompleteDrain(ctx context.Context, instanceID string, now int64)
 	}
 	return nil
 }
+
+// UnregisterDispatcher clears liveness metadata on an ordinary clean exit.
+// It deliberately leaves an unfinished drain target intact so a replacement
+// can record dispatcher_drain_interrupted before orphan recovery.
+func (s *Store) UnregisterDispatcher(ctx context.Context, instanceID string, now int64) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE dispatcher_control
+		SET active_instance_id = '', active_pid = 0, instance_started_at = 0, heartbeat_at = ?
+		WHERE id = 1 AND active_instance_id = ?
+	`, now, instanceID); err != nil {
+		return fmt.Errorf("unregistering dispatcher %s: %w", instanceID, err)
+	}
+	return nil
+}
+
+// DispatcherRuntimeCounts reads the durable execution and side-effect
+// backlog used by drain completion and status rendering.
+func (s *Store) DispatcherRuntimeCounts(ctx context.Context) (DispatcherRuntimeCounts, error) {
+	var counts DispatcherRuntimeCounts
+	queries := []struct {
+		name  string
+		query string
+		dest  *int
+	}{
+		{name: "active runs", query: `SELECT COUNT(*) FROM runs WHERE status = 'running'`, dest: &counts.ActiveRuns},
+		{name: "pending outbox", query: `SELECT COUNT(*) FROM linear_writes WHERE status = 'pending'`, dest: &counts.PendingOutbox},
+		{name: "pending cleanup", query: `SELECT COUNT(*) FROM agent_workspaces WHERE state = 'cleanup_pending'`, dest: &counts.PendingCleanup},
+	}
+	for _, item := range queries {
+		if err := s.db.QueryRowContext(ctx, item.query).Scan(item.dest); err != nil {
+			return DispatcherRuntimeCounts{}, fmt.Errorf("counting dispatcher %s: %w", item.name, err)
+		}
+	}
+	return counts, nil
+}

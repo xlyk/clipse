@@ -44,6 +44,14 @@ type DispatcherRegistration struct {
 	DrainInterrupted bool
 }
 
+// DispatcherRuntimeCounts are the durable quantities used to decide drain
+// completion and render restart safety.
+type DispatcherRuntimeCounts struct {
+	ActiveRuns     int
+	PendingOutbox  int
+	PendingCleanup int
+}
+
 // Issue mirrors a row in the issues table: a cache of Linear issue state
 // plus dispatcher-owned claim fields. Deps is a JSON array (of issue ids)
 // encoded as TEXT.
@@ -212,6 +220,11 @@ type IssueSnapshot struct {
 type Snapshot struct {
 	Issues         []IssueSnapshot
 	CountsByStatus map[string]int
+
+	// DispatcherControl and RuntimeCounts make pause/drain state and restart
+	// safety available to every status surface from the same DB snapshot.
+	DispatcherControl DispatcherControl
+	RuntimeCounts     DispatcherRuntimeCounts
 
 	// TotalTokensIn / TotalTokensOut sum tokens across every run of every
 	// issue — the board-wide cumulative spend the dashboard header shows.

@@ -2,6 +2,7 @@ package dispatcher_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,131 @@ func buildTestworker(t *testing.T) string {
 		t.Fatalf("building testworker: %v\n%s", err, out)
 	}
 	return bin
+}
+
+func TestRun_EndToEnd_DrainRestartResumeUsesReplacementConfig(t *testing.T) {
+	bin := buildTestworker(t)
+	boardDir := t.TempDir()
+	releaseFile := filepath.Join(t.TempDir(), "release")
+	s := openTestStore(t)
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 10)
+	seedReadyIssue(t, s, "issue-2", "coder", 1, 20)
+	cfg := testConfig()
+	cfg.MaxRuntimeS = 30
+	cfg.Caps.Global = 1
+	cfg.Caps.PerLane.Coder = 1
+	cfg.Caps.PerLane.Reviewer = 0
+
+	oldSpawner := spawn.NewLocalSpawner([]string{bin}, boardDir)
+	d1 := dispatcher.New(cfg, s, &linear.MockClient{}, oldSpawner, newStubWorkspacer(t.TempDir()),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+		dispatcher.WithPollInterval(10*time.Millisecond),
+		dispatcher.WithInstanceID("old-instance"),
+		dispatcher.WithEnvFor(func(store.Issue) []string {
+			return append(os.Environ(), "TESTWORKER_SCENARIO=wait_file", "TESTWORKER_RELEASE_FILE="+releaseFile)
+		}),
+	)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	done1 := make(chan error, 1)
+	go func() { done1 <- d1.Run(ctx1) }()
+	waitFor(t, 5*time.Second, func() bool {
+		control, err := s.ReadDispatcherControl(context.Background())
+		counts, countErr := s.DispatcherRuntimeCounts(context.Background())
+		return err == nil && countErr == nil && control.ActiveInstanceID == "old-instance" && counts.ActiveRuns == 1
+	}, "real worker claim")
+	if err := s.RequestDrain(context.Background(), "drain-e2e", time.Now().Unix(), false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		control, err := s.ReadDispatcherControl(context.Background())
+		return err == nil && control.ObservedMode == store.ObservedDraining
+	}, "real dispatcher drain acknowledgment")
+	queued, err := s.GetIssue(context.Background(), "issue-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.ClaimLock.Valid {
+		t.Fatal("second issue was claimed after the drain barrier")
+	}
+	if err := os.WriteFile(releaseFile, []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done1:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("old dispatcher did not exit after real worker completion")
+	}
+
+	newSpawner := spawn.NewLocalSpawner([]string{bin}, boardDir)
+	d2 := dispatcher.New(cfg, s, &linear.MockClient{}, newSpawner, newStubWorkspacer(t.TempDir()),
+		dispatcher.WithRunIDGenerator(sequentialRunIDs()),
+		dispatcher.WithPollInterval(10*time.Millisecond),
+		dispatcher.WithInstanceID("new-instance"),
+		dispatcher.WithEnvFor(func(store.Issue) []string {
+			return append(os.Environ(), "TESTWORKER_SCENARIO=report_env", "TESTWORKER_CONFIG_MARKER=replacement-v2")
+		}),
+	)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- d2.Run(ctx2) }()
+	waitFor(t, 5*time.Second, func() bool {
+		control, err := s.ReadDispatcherControl(context.Background())
+		return err == nil && control.ActiveInstanceID == "new-instance" && control.DesiredMode == store.SchedulingPaused
+	}, "replacement registration while paused")
+	time.Sleep(50 * time.Millisecond)
+	queued, err = s.GetIssue(context.Background(), "issue-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.ClaimLock.Valid {
+		t.Fatal("replacement claimed work before explicit resume")
+	}
+	if err := s.RequestResume(context.Background(), "resume-e2e", time.Now().Unix(), false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		issue, err := s.GetIssue(context.Background(), "issue-2")
+		return err == nil && issue.BoardStatus == string(contract.ColumnReview) && !issue.ClaimLock.Valid
+	}, "first post-resume worker result")
+	cancel2()
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement dispatcher did not stop")
+	}
+
+	snap, err := s.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacementResult contract.WorkerResult
+	for _, issue := range snap.Issues {
+		if issue.ID != "issue-2" || issue.LatestRun == nil || !issue.LatestRun.ResultJSON.Valid {
+			continue
+		}
+		if err := json.Unmarshal([]byte(issue.LatestRun.ResultJSON.String), &replacementResult); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if replacementResult.Summary != "replacement-v2" {
+		t.Fatalf("first post-resume worker summary = %q, want replacement config marker", replacementResult.Summary)
+	}
+	events, err := s.ListEvents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == "orphan_requeue" || event.Kind == "orphan_blocked" {
+			t.Fatalf("planned restart emitted orphan event: %+v", event)
+		}
+	}
 }
 
 // findRepoRoot walks up from the working directory to the module root

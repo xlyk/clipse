@@ -2,9 +2,13 @@ package dispatcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 )
+
+var errDrainComplete = errors.New("dispatcher drain complete")
 
 // WithPollInterval overrides the default Tick interval Run uses (which is
 // otherwise time.Duration(cfg.PollIntervalS)*time.Second). Tests use this to
@@ -41,7 +45,26 @@ func (d *Dispatcher) pollIntervalOrDefault() time.Duration {
 // still live, that worker becomes an orphan the next dispatcher's
 // RecoverOrphans reaps.
 func (d *Dispatcher) Run(ctx context.Context) error {
-	d.logger.Info("dispatcher starting", "poll_interval", d.pollIntervalOrDefault())
+	registration, err := d.store.RegisterDispatcher(ctx, d.instanceID, os.Getpid(), d.now())
+	if err != nil {
+		return fmt.Errorf("run: registering dispatcher: %w", err)
+	}
+	d.registered = true
+	defer func() {
+		if !d.registered {
+			return
+		}
+		if err := d.store.UnregisterDispatcher(context.Background(), d.instanceID, d.now()); err != nil {
+			d.logger.Error("unregistering dispatcher failed", "instance_id", d.instanceID, "error", err)
+		}
+		d.registered = false
+	}()
+	d.logger.Info("dispatcher starting",
+		"poll_interval", d.pollIntervalOrDefault(),
+		"instance_id", d.instanceID,
+		"desired_mode", registration.Control.DesiredMode,
+		"drain_interrupted", registration.DrainInterrupted,
+	)
 
 	if err := d.reconcileAgentWorkspaces(ctx); err != nil {
 		return fmt.Errorf("run: reconciling agent workspaces at startup: %w", err)
@@ -55,7 +78,9 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	ticker := time.NewTicker(d.pollIntervalOrDefault())
 	defer ticker.Stop()
 
-	d.tickAndLog(ctx)
+	if d.tickAndLog(ctx) {
+		return nil
+	}
 
 	for {
 		select {
@@ -63,7 +88,9 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			d.logger.Info("dispatcher shutting down gracefully")
 			return nil
 		case <-ticker.C:
-			d.tickAndLog(ctx)
+			if d.tickAndLog(ctx) {
+				return nil
+			}
 		}
 	}
 }
@@ -71,8 +98,16 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 // tickAndLog runs one Tick, logging (but not propagating) any error: see
 // Run's doc comment for why a transient Tick failure keeps the daemon
 // looping instead of exiting.
-func (d *Dispatcher) tickAndLog(ctx context.Context) {
-	if err := d.Tick(ctx); err != nil {
+func (d *Dispatcher) tickAndLog(ctx context.Context) bool {
+	err := d.Tick(ctx)
+	if errors.Is(err, errDrainComplete) {
+		if !errors.Is(err, context.Canceled) && err.Error() != errDrainComplete.Error() {
+			d.logger.Warn("dispatcher drained with non-blocking tick errors", "error", err)
+		}
+		return true
+	}
+	if err != nil {
 		d.logger.Error("tick failed", "error", err)
 	}
+	return false
 }

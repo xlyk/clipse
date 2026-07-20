@@ -382,10 +382,59 @@ func (m Model) renderHeader(cw int, now int64) string {
 			countChip("⇅", "unmirrored", m.unmirroredCount, cAmber))
 	}
 
+	control := m.renderDispatcherControl(textW, now)
 	row3 := padBetween(m.renderProgress(), m.renderTokens(), textW)
 
-	body := lipgloss.JoinVertical(lipgloss.Left, row1, chips, row3)
+	body := lipgloss.JoinVertical(lipgloss.Left, row1, chips, control, row3)
 	return panelBorderStyle.Width(cw).BorderForeground(cCyan).Render(body)
+}
+
+func (m Model) renderDispatcherControl(width int, now int64) string {
+	desired := m.control.DesiredMode
+	observed := m.control.ObservedMode
+	if desired == "" {
+		desired = store.SchedulingRunning
+	}
+	if observed == "" {
+		observed = store.ObservedRunning
+	}
+	instance := m.control.ActiveInstanceID
+	if instance == "" {
+		instance = "-"
+	} else if len(instance) > 8 {
+		instance = instance[:8]
+	}
+	requestAge := "-"
+	if now > 0 && m.control.RequestedAt > 0 {
+		requestAge = formatAge(maxInt64(now-m.control.RequestedAt, 0))
+	}
+	pid := "-"
+	if m.control.ActivePID > 0 {
+		pid = fmt.Sprintf("%d", m.control.ActivePID)
+	}
+	left := fmt.Sprintf("control %s/%s  ·  instance %s pid %s  ·  request %s  ·  runs %d  ·  outbox %d  ·  cleanup %d",
+		desired, observed, instance, pid, requestAge, m.runtimeCounts.ActiveRuns, m.runtimeCounts.PendingOutbox, m.runtimeCounts.PendingCleanup)
+	if target := m.control.DrainTargetInstanceID; target != "" {
+		if len(target) > 8 {
+			target = target[:8]
+		}
+		left += "  ·  drain " + target
+	}
+	safe := desired == store.SchedulingPaused && m.runtimeCounts.ActiveRuns == 0 &&
+		(m.control.DrainTargetInstanceID == "" || m.control.DrainedAt > 0)
+	safeText := waitingStyle.Render("safe restart no")
+	if safe {
+		safeText = liveStyle.Render("safe restart yes")
+	}
+	leftBudget := maxInt(width-lipgloss.Width(safeText)-1, 8)
+	return padBetween(dimStyle.Render(truncatePlain(left, leftBudget)), safeText, width)
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // renderTabs draws the view switcher (dashboard / board) as a chip row with a

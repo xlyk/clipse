@@ -72,6 +72,19 @@ func run() error {
 		// Exit 0 but with output that fails schema-valid JSON parsing.
 		fmt.Print("{not json")
 		return nil
+	case "wait_file":
+		releaseFile := os.Getenv("TESTWORKER_RELEASE_FILE")
+		if releaseFile == "" {
+			return fmt.Errorf("testworker wait_file: TESTWORKER_RELEASE_FILE is empty")
+		}
+		for {
+			if _, err := os.Stat(releaseFile); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				return fmt.Errorf("testworker wait_file: checking release file: %w", err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 
 	outcome, blockKind, err := outcomeFor(scenario)
@@ -96,6 +109,8 @@ func run() error {
 			return fmt.Errorf("testworker agents: reading AGENTS.md: %w", readErr)
 		}
 		summary = string(guidance)
+	} else if scenario == "report_env" {
+		summary = os.Getenv("TESTWORKER_CONFIG_MARKER")
 	}
 
 	result := contract.WorkerResult{
@@ -124,7 +139,7 @@ func outcomeFor(scenario string) (contract.WorkerResultOutcome, *contract.BlockK
 	switch scenario {
 	case "done", "pwd", "agents":
 		return contract.WorkerResultOutcomeDone, nil, nil
-	case "needs_review":
+	case "needs_review", "wait_file", "report_env":
 		return contract.WorkerResultOutcomeNeedsReview, nil, nil
 	case "changes":
 		return contract.WorkerResultOutcomeChangesRequested, nil, nil

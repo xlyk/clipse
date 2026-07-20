@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -84,6 +85,30 @@ func runStatus(cmd *cobra.Command, boardDir string) error {
 // wiring to the CLI.
 func RenderStatus(w io.Writer, snap store.Snapshot) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	if snap.DispatcherControl.DesiredMode != "" {
+		safe, reason := dispatcherRestartSafety(snap.DispatcherControl, snap.RuntimeCounts)
+		if _, err := fmt.Fprintln(tw, "DISPATCHER\tVALUE"); err != nil {
+			return fmt.Errorf("writing dispatcher header: %w", err)
+		}
+		controlRows := [][2]string{
+			{"desired / observed", fmt.Sprintf("%s / %s", snap.DispatcherControl.DesiredMode, snap.DispatcherControl.ObservedMode)},
+			{"active instance / pid", fmt.Sprintf("%s / %s", displayControlValue(snap.DispatcherControl.ActiveInstanceID), displayControlPID(snap.DispatcherControl.ActivePID))},
+			{"request / age", fmt.Sprintf("%s / %s", displayControlValue(snap.DispatcherControl.RequestID), controlRequestAge(snap.DispatcherControl.RequestedAt, time.Now()))},
+			{"drain target", displayControlValue(snap.DispatcherControl.DrainTargetInstanceID)},
+			{"active runs", fmt.Sprintf("%d", snap.RuntimeCounts.ActiveRuns)},
+			{"pending outbox", fmt.Sprintf("%d", snap.RuntimeCounts.PendingOutbox)},
+			{"pending cleanup", fmt.Sprintf("%d", snap.RuntimeCounts.PendingCleanup)},
+			{"safe to restart", fmt.Sprintf("%s (%s)", yesNo(safe), reason)},
+		}
+		for _, row := range controlRows {
+			if _, err := fmt.Fprintf(tw, "%s\t%s\n", row[0], row[1]); err != nil {
+				return fmt.Errorf("writing dispatcher row %s: %w", row[0], err)
+			}
+		}
+		if _, err := fmt.Fprintln(tw); err != nil {
+			return fmt.Errorf("writing dispatcher separator: %w", err)
+		}
+	}
 
 	if _, err := fmt.Fprintln(tw, "STATUS\tCOUNT"); err != nil {
 		return fmt.Errorf("writing status header: %w", err)

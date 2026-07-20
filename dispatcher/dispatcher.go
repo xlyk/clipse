@@ -103,6 +103,9 @@ type Dispatcher struct {
 
 	results  chan runResult
 	inflight map[string]inflightRun
+
+	instanceID string
+	registered bool
 }
 
 // Option configures optional Dispatcher fields at construction. Most callers
@@ -163,6 +166,12 @@ func WithResultsBuffer(n int) Option {
 	return func(d *Dispatcher) { d.results = make(chan runResult, n) }
 }
 
+// WithInstanceID installs a deterministic daemon identity. Production uses
+// a random id; tests use this to target a drain without inspecting internals.
+func WithInstanceID(id string) Option {
+	return func(d *Dispatcher) { d.instanceID = id }
+}
+
 // defaultResultsBuffer is the floor New sizes d.results to (see
 // resultsBufferSize): at least this many slots regardless of cfg.Caps.Global,
 // generous for the common case.
@@ -208,6 +217,7 @@ func New(cfg config.Config, st *store.Store, lc linear.Client, spawner spawn.Spa
 		logger:         slog.Default(),
 		results:        make(chan runResult, resultsBufferSize(cfg)),
 		inflight:       make(map[string]inflightRun),
+		instanceID:     newRandomRunID(),
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -304,32 +314,100 @@ func (d *Dispatcher) ttl() int64 {
 // overall pass reads as a checklist; see the package doc and the phase
 // methods themselves for the reasoning behind the ordering.
 func (d *Dispatcher) Tick(ctx context.Context) error {
+	var tickErrs []error
 	pollErr := d.pollAndUpsert(ctx)
 	reconcileErr := d.reconcile(ctx)
 	cleanupErr := d.drainWorkspaceCleanup(ctx)
 	if pollErr != nil || reconcileErr != nil || cleanupErr != nil {
-		var joined []error
 		if pollErr != nil {
-			joined = append(joined, fmt.Errorf("tick: poll: %w", pollErr))
+			tickErrs = append(tickErrs, fmt.Errorf("tick: poll: %w", pollErr))
 		}
 		if reconcileErr != nil {
-			joined = append(joined, fmt.Errorf("tick: reconcile: %w", reconcileErr))
+			tickErrs = append(tickErrs, fmt.Errorf("tick: reconcile: %w", reconcileErr))
 		}
 		if cleanupErr != nil {
-			joined = append(joined, fmt.Errorf("tick: drain workspace cleanup: %w", cleanupErr))
+			tickErrs = append(tickErrs, fmt.Errorf("tick: drain workspace cleanup: %w", cleanupErr))
 		}
-		return errors.Join(joined...)
 	}
-	if err := d.promote(ctx); err != nil {
-		return fmt.Errorf("tick: promote: %w", err)
+
+	// Preserve the existing fail-closed scheduling posture: any failure in
+	// poll/reconcile/cleanup suppresses promotion and claims for this pass,
+	// while outbox/control maintenance below still gets a chance to run.
+	preScheduleHealthy := pollErr == nil && reconcileErr == nil && cleanupErr == nil
+	if preScheduleHealthy {
+		if err := d.promote(ctx); err != nil {
+			tickErrs = append(tickErrs, fmt.Errorf("tick: promote: %w", err))
+			preScheduleHealthy = false
+		}
 	}
-	if err := d.selectAndClaim(ctx); err != nil {
-		return fmt.Errorf("tick: select and claim: %w", err)
+
+	control, controlErr := d.store.ReadDispatcherControl(ctx)
+	if controlErr != nil {
+		tickErrs = append(tickErrs, fmt.Errorf("tick: read dispatcher control: %w", controlErr))
+	} else if preScheduleHealthy && control.DesiredMode == store.SchedulingRunning {
+		if err := d.selectAndClaim(ctx); err != nil && !errors.Is(err, store.ErrSchedulingPaused) {
+			tickErrs = append(tickErrs, fmt.Errorf("tick: select and claim: %w", err))
+		}
 	}
+
 	if err := d.drainOutbox(ctx); err != nil {
-		return fmt.Errorf("tick: drain outbox: %w", err)
+		tickErrs = append(tickErrs, fmt.Errorf("tick: drain outbox: %w", err))
 	}
-	return nil
+
+	if d.registered {
+		completed, err := d.updateControlAndMaybeCompleteDrain(ctx, reconcileErr == nil)
+		if err != nil {
+			tickErrs = append(tickErrs, fmt.Errorf("tick: update dispatcher control: %w", err))
+		}
+		if completed {
+			return errors.Join(append([]error{errDrainComplete}, tickErrs...)...)
+		}
+	}
+	return errors.Join(tickErrs...)
+}
+
+func (d *Dispatcher) updateControlAndMaybeCompleteDrain(ctx context.Context, reconciled bool) (bool, error) {
+	control, err := d.store.ReadDispatcherControl(ctx)
+	if err != nil {
+		return false, err
+	}
+	observed := store.ObservedRunning
+	if control.DesiredMode == store.SchedulingPaused {
+		observed = store.ObservedPaused
+		if control.DrainTargetInstanceID == d.instanceID {
+			observed = store.ObservedDraining
+		}
+	}
+	now := d.now()
+	if err := d.store.HeartbeatDispatcher(ctx, d.instanceID, observed, now); err != nil {
+		return false, err
+	}
+	if control.DrainTargetInstanceID != d.instanceID || observed != store.ObservedDraining {
+		return false, nil
+	}
+
+	counts, err := d.store.DispatcherRuntimeCounts(ctx)
+	if err != nil {
+		return false, err
+	}
+	executionQuiescent := reconciled && len(d.inflight) == 0 && len(d.results) == 0 && counts.ActiveRuns == 0
+	strictComplete := !control.DrainStrict || (counts.PendingOutbox == 0 && counts.PendingCleanup == 0)
+	if !executionQuiescent || !strictComplete {
+		return false, nil
+	}
+	d.logger.Info("dispatcher drain complete",
+		"request_id", control.RequestID,
+		"instance_id", d.instanceID,
+		"active_runs", counts.ActiveRuns,
+		"pending_outbox", counts.PendingOutbox,
+		"pending_cleanup", counts.PendingCleanup,
+		"strict", control.DrainStrict,
+	)
+	if err := d.store.CompleteDrain(ctx, d.instanceID, now); err != nil {
+		return false, err
+	}
+	d.registered = false
+	return true, nil
 }
 
 // inflightLaneCounts returns the current in-flight run count, both globally

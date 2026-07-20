@@ -306,6 +306,17 @@ func (s *Store) ReadSnapshot(ctx context.Context) (Snapshot, error) {
 		}
 	}
 
+	control, err := s.ReadDispatcherControl(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snap.DispatcherControl = control
+	counts, err := s.DispatcherRuntimeCounts(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snap.RuntimeCounts = counts
+
 	return snap, nil
 }
 

@@ -170,6 +170,8 @@ type Model struct {
 	// unmirroredCount is how many issues have a pending (unmirrored) Linear
 	// outbox write — surfaced as an amber header chip when > 0.
 	unmirroredCount int
+	control         store.DispatcherControl
+	runtimeCounts   store.DispatcherRuntimeCounts
 
 	// recentEvents / lastEventAt back the activity feed and the "updated Ns
 	// ago" liveness readout (age is computed in View, never in Update).
@@ -653,6 +655,8 @@ func (m *Model) fold(snap store.Snapshot) {
 	m.totalIssues = len(snap.Issues)
 	m.doneCount = snap.CountsByStatus["done"]
 	m.unmirroredCount = snap.UnmirroredCount
+	m.control = snap.DispatcherControl
+	m.runtimeCounts = snap.RuntimeCounts
 	m.recentEvents = snap.RecentEvents
 	m.lastEventAt = snap.LastEventAt
 

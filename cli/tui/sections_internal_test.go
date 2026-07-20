@@ -179,6 +179,26 @@ func TestHeader_UnmirroredChip(t *testing.T) {
 	}
 }
 
+func TestHeader_DispatcherControlAndRestartSafety(t *testing.T) {
+	m := NewModel()
+	m, _ = m.Update(SnapshotMsg{Snap: store.Snapshot{
+		DispatcherControl: store.DispatcherControl{
+			DesiredMode:      store.SchedulingPaused,
+			ObservedMode:     store.ObservedPaused,
+			ActiveInstanceID: "instance-abcdef",
+			ActivePID:        1234,
+			RequestedAt:      10,
+		},
+		RuntimeCounts: store.DispatcherRuntimeCounts{PendingOutbox: 2, PendingCleanup: 1},
+	}})
+	header := m.renderHeader(158, 20)
+	for _, want := range []string{"control paused/paused", "instance instance pid 1234", "request 10s", "outbox 2", "cleanup 1", "safe restart yes"} {
+		if !strings.Contains(header, want) {
+			t.Errorf("header missing %q:\n%s", want, header)
+		}
+	}
+}
+
 // TestPRNumber asserts the trailing PR number extraction used by the DONE
 // summary (P6): a GitHub PR URL yields "#<n>", anything else yields "".
 func TestPRNumber(t *testing.T) {
