@@ -23,7 +23,7 @@ make build
 make test
 ```
 
-Expected result: the binary prints the `board`, `dispatch`, `status`, and `tui` subcommands, then the Go race suite and Python tests pass.
+Expected result: the binary prints the `board`, `configure`, `dispatch`, `status`, and `tui` subcommands, then the Go race suite and Python tests pass.
 <!-- managed:readme-agents-doc:section=QUICKSTART:END -->
 
 <!-- managed:readme-agents-doc:section=FEATURES:BEGIN -->
@@ -43,6 +43,35 @@ Expected result: the binary prints the `board`, `dispatch`, `status`, and `tui` 
 ## Usage
 
 ### Configure a dispatcher
+
+The recommended path is the interactive configuration synthesizer:
+
+```sh
+make build
+./bin/clipse configure
+```
+
+It walks through the repository, Linear team and state mode, Daytona, models,
+shell posture, limits, and isolated runtime paths. Before writing, it shows the
+exact YAML and runs read-only GitHub, Linear, worker, model-auth, and Daytona
+preflights. `F4` discovers Linear teams, `F5` opens the Codex OAuth command,
+and `F3` toggles the optional procedural techno soundtrack. Music uses a
+host player when available and silently degrades when unavailable; it never
+affects readiness.
+
+For a second independent instance or to edit an existing file:
+
+```sh
+./bin/clipse configure --output configs/product-a.local.yaml
+./bin/clipse configure --from configs/product-a.local.yaml --mode advanced
+```
+
+Named `*.local.yaml` configs are gitignored. Each instance should keep unique
+absolute `board_dir` and `checkpoints_dir` values. The wizard never writes
+credentials to YAML and never creates Linear objects, GitHub objects, Daytona
+sandboxes, or model calls during its readiness scan.
+
+For non-interactive setup, copy and edit the example manually.
 
 Install and authenticate `gh`, then provide the Daytona key to the dispatcher:
 

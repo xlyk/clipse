@@ -6,6 +6,53 @@ Clipse uses one YAML configuration and one dispatcher process for each Linear te
 
 ## Configuration model
 
+### Interactive wizard
+
+Build Clipse and launch the recommended terminal setup flow:
+
+```sh
+make build
+./bin/clipse configure
+```
+
+The Bubble Tea wizard guides the operator through every current YAML field and
+uses Daytona as the new-config preset. Its Review screen shows the exact YAML,
+an imported-file diff when `--from` is used, and a read-only readiness report
+covering host tools, repository/base-branch access, GitHub, Linear team/state
+ownership, candidate discovery, the worker command, model authentication, and
+Daytona's lifecycle `list` preflight.
+
+Useful controls:
+
+- `Up`/`Down`, `Tab`, and `Enter` move through fields.
+- `Esc` returns to the previous step; `Ctrl+C` exits without writing.
+- `F2` toggles advanced fields.
+- `F4` discovers teams visible to the current `LINEAR_API_KEY`.
+- `F5` temporarily hands the terminal to `dcode` for `openai_codex` `/auth`.
+- `F3` toggles an optional, procedurally generated techno loop.
+- `R` reruns readiness checks; `W` writes from Review.
+
+The soundtrack uses `afplay` on macOS or `pw-play`/`paplay`/`aplay` on Linux
+when present. It is opt-in in the default `--music auto` mode, never blocks
+configuration, and has a silent fallback. Use `--music on|off`,
+`--no-animation`, or `--no-color` to pin the desired behavior.
+
+Create or import a named instance with:
+
+```sh
+./bin/clipse configure --output configs/product-a.local.yaml
+./bin/clipse configure --from configs/product-a.local.yaml --mode advanced
+```
+
+The wizard writes mode `0600`, backs up an existing destination only after a
+second confirmation, reloads the final file with the production parser, and
+creates the selected board/checkpoint directories. It does not persist secret
+values or mutate Linear, GitHub, Daytona, or model-provider resources. A live
+Daytona smoke remains the separate, explicit verification step described
+below.
+
+### Configuration ownership
+
 Each dispatcher owns four distinct kinds of state:
 
 | Concern | Configuration source | Isolation requirement |

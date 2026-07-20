@@ -28,7 +28,7 @@ Full rationale + decision log: `docs/design/2026-07-01-clipse-design.md`. Phased
   `agent/evals/README.md`.
 - `make smoke-daytona-backend` — opt-in production-path Daytona smoke; opens a draft PR, runs coder/reviewer DAC turns, never merges, and cleans all live resources.
 
-Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard), `clipse board plan|apply` (bootstrap a Linear board from a `board.yaml` spec — see Board bootstrap below). Kernel tests need **no** network or LLM.
+Binary subcommands: `clipse configure` (interactive config + read-only readiness wizard), `clipse dispatch` (the daemon), `clipse status` (one-shot SQLite snapshot table), `clipse tui` (live dashboard), `clipse board plan|apply` (bootstrap a Linear board from a `board.yaml` spec — see Board bootstrap below). Kernel tests need **no** network or LLM.
 
 <!-- managed:readme-agents-doc:section=STYLE:BEGIN -->
 ## Code style
@@ -82,7 +82,8 @@ Binary subcommands: `clipse dispatch` (the daemon), `clipse status` (one-shot SQ
 ## Layout
 
 - `cmd/clipse` — thin entrypoint → `cli.NewRootCmd()`.
-- `cli/` — cobra subcommands (`dispatch`, `status`, `tui`, `board`); `cli/tui/` is the bubbletea model.
+- `cli/` — cobra subcommands (`configure`, `dispatch`, `status`, `tui`, `board`); `cli/tui/` is the dashboard bubbletea model.
+- `cli/configureui/` + `internal/setup/` — Bubble Tea configuration wizard plus model-neutral config rendering, read-only readiness checks, atomic writes, and optional procedural audio.
 - `dispatcher/` — the daemon and the deterministic `Tick` loop.
 - `internal/config` — typed `clipse.yaml` load + validation + defaults.
 - `internal/store` — SQLite kernel (issues / runs / events / linear_writes), CAS claim, outbox.

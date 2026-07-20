@@ -4,7 +4,9 @@
 package setup
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/xlyk/clipse/internal/config"
@@ -15,6 +17,18 @@ import (
 type Draft struct {
 	Instance string
 	Config   config.Config
+}
+
+// DefaultStateRoot returns the platform-appropriate host-local state root
+// used for named Clipse instances.
+func DefaultStateRoot(home string) string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(home, "Library", "Application Support", "clipse")
+	}
+	if state := os.Getenv("XDG_STATE_HOME"); state != "" {
+		return filepath.Join(state, "clipse")
+	}
+	return filepath.Join(home, ".local", "state", "clipse")
 }
 
 // NewDraft returns the recommended Daytona-first starting point for one

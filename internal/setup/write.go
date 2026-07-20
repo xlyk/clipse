@@ -86,8 +86,14 @@ func WriteConfig(path string, raw []byte, opts WriteOptions) (WriteResult, error
 	if err := syncDir(parent); err != nil {
 		return WriteResult{}, err
 	}
-	if _, err := config.Load(path); err != nil {
+	cfg, err := config.Load(path)
+	if err != nil {
 		return WriteResult{}, fmt.Errorf("round-tripping written config: %w", err)
+	}
+	for _, dir := range []string{cfg.BoardDir, cfg.CheckpointsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return WriteResult{}, fmt.Errorf("creating runtime directory %s: %w", dir, err)
+		}
 	}
 	return result, nil
 }
