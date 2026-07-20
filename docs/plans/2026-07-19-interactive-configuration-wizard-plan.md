@@ -204,18 +204,20 @@ Always print copyable, instance-specific `dispatch`, `status`, and `tui` command
 The visual language is “late-90s keygen/configurator,” not “fake hacker console”:
 
 - near-black canvas with electric cyan, magenta, violet, and acid-green accents;
-- an ASCII Clipse mark and compact “CONFIG SYNTH” title;
+- an ASCII Clipse mark and compact “CONFIG OVERDRIVE” title;
 - a step rail styled like tracker channels;
 - a live resolved-config panel styled like a hex/serial readout;
-- animated spectrum bars driven by the same low-frequency tick as the header;
+- a multicolor `NEON BUS`, animated spectrum, cycling step glyphs, focus pulse,
+  neon rules, and persistent `HYPERDRIVE` status chrome;
 - real probe results as crisp `PASS`, `WARN`, and `BLOCK` chips;
 - no fake loading pauses, fake checksums, or random serial numbers presented as meaningful data.
 
 Illustrative wide layout:
 
 ```text
-┌─ CLIPSE // CONFIG SYNTH ───────────── 04/09 ── ♫ 125 BPM ─┐
-│ 01 INSTANCE  ✓ │ LINEAR LINK                              │
+◢◤ CLIPSE // CONFIG OVERDRIVE ◥◣  04/09 HYPERDRIVE ♫174 BPM
+NEON BUS ✦ ▁▆▄█▂▇▅▃▆▁▇▄▂█▅
+│ 01 INSTANCE  ✓ │ [ 04 // LINEAR LINK ]                    │
 │ 02 HOST      ✓ │                                           │
 │ 03 REPO      ✓ │  Team   SPA — Spacelift                  │
 │ 04 LINEAR    ◆ │  State  clipse: labels                   │
@@ -225,7 +227,7 @@ Illustrative wide layout:
 │ 08 REVIEW    · │                                           │
 │ 09 FINISH    · │  ↑↓ select  enter continue  ? help       │
 ├────────────────┴───────────────────────────────────────────┤
-│ ▁▂▄▇▅▃▆▇▃▂▅▇  CONFIG STREAM  agent:coder // clipse:ready  │
+│ HYPERDRIVE // SYSTEM ARMED // CONFIG CHANNEL OPEN         │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -250,9 +252,12 @@ Accessibility and terminal compatibility:
 
 A terminal emulator has no portable streaming-audio protocol. Music is still practical without a GUI by using an optional host audio player beside the TUI.
 
-V1 soundtrack design:
+Current soundtrack design:
 
-1. Generate an original, deterministic, low-volume PCM WAV in Go using only the standard library: roughly 125 BPM, four-on-the-floor kick, short hi-hat noise, and a small arpeggiated bass pattern.
+1. Generate an original, deterministic 174 BPM stereo PCM WAV in Go using only
+   the standard library: gabber kick, rumble and reverse bass, side-chained
+   acid and reese layers, breakbeat ghosts, snare rolls, rave stabs, glitch
+   gates, shrieks, and risers across an eight-bar arrangement.
 2. Write it to a private temporary file.
 3. Detect a supported host player: `afplay` on macOS; `pw-play`, `paplay`, then `aplay` on Linux. Unsupported systems remain silent.
 4. Start the player with `exec.CommandContext`, discard its output, and restart it at track end while music remains enabled.

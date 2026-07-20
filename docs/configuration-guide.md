@@ -29,13 +29,17 @@ Useful controls:
 - `F2` toggles advanced fields.
 - `F4` discovers teams visible to the current `LINEAR_API_KEY`.
 - `F5` temporarily hands the terminal to `dcode` for `openai_codex` `/auth`.
-- `F3` toggles an optional, procedurally generated techno loop.
+- `F3` toggles an optional, procedurally generated 174 BPM DnB/hardstyle loop.
 - `R` reruns readiness checks; `W` writes from Review.
 
-The soundtrack uses `afplay` on macOS or `pw-play`/`paplay`/`aplay` on Linux
-when present. It is opt-in in the default `--music auto` mode, never blocks
-configuration, and has a silent fallback. Use `--music on|off`,
-`--no-animation`, or `--no-color` to pin the desired behavior.
+The original stereo soundtrack layers gabber kicks, rumble and reverse bass,
+side-chained acid and reese lines, breakbeat ghosts, hats, metallic rides,
+snare rolls, rave stabs, glitch gates, FM shrieks, and noise risers across an
+eight-bar boot/rise/fake-out/drop arc. It uses `afplay` on macOS or
+`pw-play`/`paplay`/`aplay` on Linux when present. It is opt-in in the default
+`--music auto` mode, never blocks configuration, and has a silent fallback.
+Use `--music on|off`, `--no-animation`, or `--no-color` to pin the desired
+behavior.
 
 Create or import a named instance with:
 

@@ -153,6 +153,7 @@ func NewModel(opts Options) Model {
 		original:    append([]byte(nil), opts.Original...),
 	}
 	m.fields = newFields(opts.Draft, opts.OutputPath)
+	m.resizeInputs()
 	m.syncFocus()
 	return m
 }
@@ -169,7 +170,7 @@ func (m Model) Init() tea.Cmd {
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m Model) Result() Result { return m.result }

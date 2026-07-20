@@ -55,9 +55,11 @@ It walks through the repository, Linear team and state mode, Daytona, models,
 shell posture, limits, and isolated runtime paths. Before writing, it shows the
 exact YAML and runs read-only GitHub, Linear, worker, model-auth, and Daytona
 preflights. `F4` discovers Linear teams, `F5` opens the Codex OAuth command,
-and `F3` toggles the optional procedural techno soundtrack. Music uses a
-host player when available and silently degrades when unavailable; it never
-affects readiness.
+and `F3` toggles the optional procedural 174 BPM DnB/hardstyle soundtrack. The
+stereo loop layers gabber kicks, reverse bass, acid and reese lines, breakbeat
+ghosts, snare rolls, rave stabs, glitch gates, and an eight-bar
+boot/rise/fake-out/drop arc. Music uses a host player when available and
+silently degrades when unavailable; it never affects readiness.
 
 For a second independent instance or to edit an existing file:
 

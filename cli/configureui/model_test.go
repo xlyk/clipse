@@ -3,6 +3,7 @@ package configureui_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -114,6 +115,7 @@ func TestModelCancelNeverWrites(t *testing.T) {
 }
 
 func TestNarrowMonochromeViewStillShowsCurrentField(t *testing.T) {
+	t.Setenv("TERM", "dumb")
 	m := testModel(t)
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 58, Height: 18})
 	m = next.(configureui.Model)
@@ -123,6 +125,76 @@ func TestNarrowMonochromeViewStillShowsCurrentField(t *testing.T) {
 	}
 	if !contains(view, "INSTANCE") || !contains(view, "Output file") {
 		t.Fatalf("narrow View missing current step/field:\n%s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if len(line) > 58 {
+			t.Errorf("narrow View line is %d columns, want <= 58:\n%s", len(line), line)
+		}
+	}
+}
+
+func TestAnimatedViewUsesOverdriveKeygenChrome(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	draft := setup.NewDraft("test", "/opt/clipse", t.TempDir())
+	m := configureui.NewModel(configureui.Options{
+		Draft:      draft,
+		OutputPath: filepath.Join(t.TempDir(), "clipse.yaml"),
+		NoColor:    true,
+	})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+	view := next.(configureui.Model).View()
+	for _, want := range []string{"CONFIG OVERDRIVE", "HARD-SYNC CONFIG CRACKTRO", "LOAD SEQUENCE", "NEON BUS", "HYPERDRIVE"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("animated View missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestWideUnicodeViewHasCyberpunkFlashStructure(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
+	draft := setup.NewDraft("nightcity", "/opt/clipse", t.TempDir())
+	m := configureui.NewModel(configureui.Options{
+		Draft:      draft,
+		OutputPath: filepath.Join(t.TempDir(), "clipse.yaml"),
+		NoColor:    true,
+	})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 118, Height: 34})
+	view := next.(configureui.Model).View()
+	for _, want := range []string{"CLIPSE NETWORK", "UPLINK", "N3K0 NODE", "PROTOCOL", "ACTIVE NODE", "ฅ^•ﻌ•^ฅ"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("wide View missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestDumbTerminalChromeIsASCIIOnly(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	draft := setup.NewDraft("test", "/opt/clipse", t.TempDir())
+	m := configureui.NewModel(configureui.Options{
+		Draft:      draft,
+		OutputPath: filepath.Join(t.TempDir(), "clipse.yaml"),
+		NoColor:    true,
+	})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+	view := next.(configureui.Model).View()
+	for _, want := range []string{"CLIPSE NETWORK", "HARD-SYNC CONFIG CRACKTRO", "[>_<] N3K0 NODE", "[ ACTIVE NODE 01 ]"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("ASCII View missing %q:\n%s", want, view)
+		}
+	}
+	for _, forbidden := range []string{"◢", "◤", "◆", "╭", "╰", "─", "↑", "♫", "ฅ"} {
+		if strings.Contains(view, forbidden) {
+			t.Errorf("ASCII View contains decorative Unicode %q:\n%s", forbidden, view)
+		}
+	}
+}
+
+func TestReducedMotionHidesAnimatedPulseLayer(t *testing.T) {
+	m := testModel(t)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 110, Height: 30})
+	view := next.(configureui.Model).View()
+	if strings.Contains(view, "NEON BUS") {
+		t.Fatalf("reduced-motion View contains animated pulse layer:\n%s", view)
 	}
 }
 

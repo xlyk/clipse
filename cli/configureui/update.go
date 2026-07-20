@@ -2,6 +2,7 @@ package configureui
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -9,12 +10,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/xlyk/clipse/internal/setup"
+	setupaudio "github.com/xlyk/clipse/internal/setup/audio"
 )
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.resizeInputs()
 		return m, nil
 	case tickMsg:
 		m.phase++
@@ -27,19 +30,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.report = msg.report
 		m.haveReport = true
-		m.status = "Readiness scan complete: " + string(msg.report.Outcome)
+		m.status = "ORACLE RETURNED // readiness " + strings.ToUpper(string(msg.report.Outcome))
 		return m, nil
 	case teamsMsg:
 		m.busy = false
 		if msg.err != nil {
 			m.err = msg.err
-			m.status = "Linear team discovery failed"
+			m.status = "TRACKER UPLINK FAILED // Linear team discovery"
 			return m, nil
 		}
 		m.teams = msg.teams
 		m.teamCursor = 0
 		if len(m.teams) == 0 {
-			m.status = "No Linear teams are visible to this credential"
+			m.status = "TRACKER UPLINK EMPTY // no visible Linear teams"
 		} else if len(m.teams) == 1 {
 			m.chooseTeam(0)
 			m.teams = nil
@@ -49,13 +52,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.busy = false
 		if msg.needsReplace {
 			m.replace = true
-			m.status = "File exists. Press y to back it up and replace it, or Esc to cancel."
+			m.status = "COLLISION DETECTED // Y backup + replace // ESC preserve"
 			return m, nil
 		}
 		if msg.err != nil {
 			m.err = msg.err
 			m.result.Err = msg.err
-			m.status = "Write failed"
+			m.status = "DISK BURN FAILED // configuration untouched"
 			return m, nil
 		}
 		m.result.WrittenPath = msg.result.Path
@@ -65,29 +68,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.result.Err = nil
 		m.err = nil
 		m.page = pageFinish
-		m.status = "Configuration written"
+		m.status = "CONFIG SEALED // private bytes landed safely"
 		return m, nil
 	case audioMsg:
 		if msg.err != nil {
 			m.musicOn = false
-			m.status = "Soundtrack unavailable: " + msg.err.Error()
+			m.status = "AUDIO BUS OFFLINE // " + msg.err.Error()
 			return m, nil
 		}
 		m.musicOn = msg.active
 		if msg.active {
-			m.status = "Soundtrack online — 125 BPM"
+			m.status = fmt.Sprintf("HARD SYNC ONLINE // %d BPM // speakers may bite", setupaudio.SoundtrackBPM)
 		} else {
-			m.status = "Soundtrack muted"
+			m.status = "AUDIO BUS MUTED // stealth mode"
 		}
 		return m, nil
 	case authMsg:
 		m.busy = false
 		if msg.err != nil {
 			m.err = msg.err
-			m.status = "Codex authentication command failed"
+			m.status = "AUTH HANDOFF FAILED // dcode returned static"
 		} else {
 			m.err = nil
-			m.status = "Authentication command finished; readiness will recheck on Review"
+			m.status = "AUTH HANDOFF COMPLETE // oracle rechecks on Review"
 		}
 		return m, nil
 	}
@@ -115,7 +118,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.writeCmd(true)
 		case "esc", "n":
 			m.replace = false
-			m.status = "Existing file left untouched"
+			m.status = "GHOSTED COLLISION // existing file untouched"
 		}
 		return m, nil
 	}
@@ -158,11 +161,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.advanced = !m.advanced
 		m.cursor = 0
 		m.syncFocus()
+		if m.advanced {
+			m.status = "DEEP MODE UNCHAINED // expert nodes visible"
+		} else {
+			m.status = "QUICK MODE // expert nodes cloaked"
+		}
 		return m, nil
 	case "f4":
 		if m.page == pageLinear && !m.busy {
 			m.busy = true
-			m.status = "Discovering Linear teams…"
+			m.status = "OPENING TRACKER UPLINK // discovering Linear teams..."
 			return m, m.discoverTeamsCmd()
 		}
 	case "f5":
@@ -170,17 +178,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			command, err := m.codexAuthCommand()
 			if err != nil {
 				m.err = err
-				m.status = "Codex authentication is unavailable"
+				m.status = "AUTH PORT SEALED // Codex handoff unavailable"
 				return m, nil
 			}
 			m.busy = true
-			m.status = "Opening dcode; run /auth and choose openai_codex"
+			m.status = "DROPPING TO DCODE // run /auth then choose openai_codex"
 			return m, tea.ExecProcess(command, func(err error) tea.Msg { return authMsg{err: err} })
 		}
 	case "enter":
 		if err := m.applyFields(); err != nil {
 			m.err = err
-			m.status = "Fix the highlighted input before continuing"
+			m.status = "NODE REJECTED // repair the active input"
 			return m, nil
 		}
 		visible := m.visibleFields()
@@ -197,12 +205,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			raw, err := setup.Render(m.draft.Config)
 			if err != nil {
 				m.err = err
-				m.status = "Configuration is not valid yet"
+				m.status = "CONFIG MATRIX INVALID // repair before burn"
 				return m, nil
 			}
 			m.raw = raw
 			m.busy = true
-			m.status = "Running read-only readiness checks…"
+			m.status = "READINESS ORACLE ONLINE // read-only spectral scan..."
 			return m, m.checkCmd()
 		}
 		m.syncFocus()
@@ -222,6 +230,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.fields[index].input, cmd = m.fields[index].input.Update(key)
 	m.haveReport = false
 	return m, cmd
+}
+
+func (m *Model) resizeInputs() {
+	width := min(58, max(12, m.contentTextWidth()-4))
+	for i := range m.fields {
+		m.fields[i].input.Width = width
+	}
 }
 
 func (m Model) startAudioCmd() tea.Cmd {
@@ -267,13 +282,13 @@ func (m Model) updateReview(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		if !m.busy {
 			m.busy = true
-			m.status = "Running read-only readiness checks…"
+			m.status = "READINESS ORACLE ONLINE // read-only spectral scan..."
 			return m, m.checkCmd()
 		}
 	case "enter", "w":
 		if !m.busy && m.haveReport {
 			m.busy = true
-			m.status = "Writing private config atomically…"
+			m.status = "ATOMIC DISK BURN // writing private config..."
 			return m, m.writeCmd(false)
 		}
 	case "tab", "right":
@@ -347,7 +362,7 @@ func (m *Model) chooseTeam(index int) {
 			m.fields[i].input.SetValue(team.ID)
 		}
 	}
-	m.status = "Selected Linear team " + team.Key + " — " + team.Name
+	m.status = "TRACKER LOCKED // " + team.Key + " // " + team.Name
 }
 
 func (m *Model) cycleOption(index int, forward bool) {
