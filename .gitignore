@@ -20,6 +20,9 @@
 *.db-wal
 *.db-shm
 
+# local Clipse runtime state (board database, lock, logs, and worktrees)
+/.clipse/
+
 # superpowers ledger (never commit)
 .superpowers/
 

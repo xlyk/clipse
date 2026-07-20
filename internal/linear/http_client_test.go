@@ -2,6 +2,7 @@ package linear_test
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -55,9 +56,40 @@ func TestBuildCandidateIssuesRequest(t *testing.T) {
 	if !strings.Contains(linear.CandidateIssuesQuery, "state {\n            type") && !strings.Contains(linear.CandidateIssuesQuery, "state { type }") {
 		t.Errorf("candidate query must fetch each blocker's state type on inverseRelations")
 	}
+	if !strings.Contains(linear.CandidateIssuesQuery, "state { type }\n            labels") {
+		t.Errorf("candidate query must fetch each blocker's labels for label-state dependency gating")
+	}
 	wantVars := map[string]any{"teamKey": "CLI", "labelPrefix": "agent:"}
 	if len(req.Variables) != len(wantVars) || req.Variables["teamKey"] != wantVars["teamKey"] || req.Variables["labelPrefix"] != wantVars["labelPrefix"] {
 		t.Errorf("Variables = %v, want %v (team + label-prefix scoping)", req.Variables, wantVars)
+	}
+}
+
+func TestBuildLabelStateCandidateIssuesRequest_ReconcilesRecentCompleted(t *testing.T) {
+	body, err := linear.BuildLabelStateCandidateIssuesRequest("SPA", "agent:")
+	if err != nil {
+		t.Fatalf("BuildLabelStateCandidateIssuesRequest: unexpected error: %v", err)
+	}
+
+	var req gqlRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("unmarshaling request body: %v", err)
+	}
+	if req.Query != linear.LabelStateCandidateIssuesQuery {
+		t.Errorf("Query = %q, want the label-state candidate query", req.Query)
+	}
+	if !strings.Contains(req.Query, `eq: "completed"`) {
+		t.Errorf("label-state candidate query must re-include completed issues for terminal reconciliation")
+	}
+	if strings.Count(req.Query, `updatedAt: { gt: "-P14D" }`) != 2 {
+		t.Errorf("label-state candidate query must recency-bound both canceled and completed terminal branches")
+	}
+	if strings.Contains(linear.CandidateIssuesQuery, `eq: "completed"`) {
+		t.Errorf("workflow-state candidate query must remain unchanged and exclude completed issues")
+	}
+	wantVars := map[string]any{"teamKey": "SPA", "labelPrefix": "agent:"}
+	if !reflect.DeepEqual(req.Variables, wantVars) {
+		t.Errorf("Variables = %#v, want %#v", req.Variables, wantVars)
 	}
 }
 
@@ -149,7 +181,7 @@ func TestCandidateIssuesQuery_KeepsCancelledIssuesInScope(t *testing.T) {
 	}
 
 	// The recency-scoped branch folds canceled back into view, but only
-	// within the last cancelledRecencyDays window.
+	// within the terminal-observation recency window.
 	if !strings.Contains(q, `eq: "canceled"`) {
 		t.Errorf("query = %q, want a second branch re-including canceled issues", q)
 	}

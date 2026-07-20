@@ -146,6 +146,34 @@ func TestHTTPClient_SetState_ResolvesAllCanonicalColumns(t *testing.T) {
 	}
 }
 
+func TestHTTPClient_ValidateWorkflowStatesIsReadOnlyAndComplete(t *testing.T) {
+	requests := 0
+	c := newLoopbackClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		req, ok := decodeGQLRequest(t, r)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if req.Query != linear.TeamWorkflowStatesQuery {
+			t.Errorf("query = %q, want TeamWorkflowStatesQuery", req.Query)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(teamStatesFixture))
+	})
+
+	if err := c.ValidateWorkflowStates(context.Background()); err != nil {
+		t.Fatalf("ValidateWorkflowStates: %v", err)
+	}
+	if err := c.ValidateWorkflowStates(context.Background()); err != nil {
+		t.Fatalf("ValidateWorkflowStates cached: %v", err)
+	}
+	if requests != 1 {
+		t.Errorf("requests = %d, want one cached read-only query", requests)
+	}
+}
+
 // TestHTTPClient_SetState_CachesWorkflowStatesAcrossCalls asserts the
 // team's workflow-states map is fetched once and reused across multiple
 // SetState calls, not refetched per call.

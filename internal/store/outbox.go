@@ -339,6 +339,24 @@ func (s *Store) HasPendingLinearSetState(ctx context.Context, issueID string) (b
 	return pending, nil
 }
 
+// HasPendingLinearSetStateTarget reports whether issueID already has an
+// unmirrored state transition to target. Label-mode terminal reconciliation
+// uses this narrower check so an older pending active-state mirror does not
+// suppress the trailing done cleanup that must ultimately win.
+func (s *Store) HasPendingLinearSetStateTarget(ctx context.Context, issueID, target string) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+			SELECT 1 FROM linear_writes
+			WHERE issue_id = ? AND kind = 'setstate' AND target = ? AND status = 'pending'
+		)
+	`
+	var pending bool
+	if err := s.db.QueryRowContext(ctx, q, issueID, target).Scan(&pending); err != nil {
+		return false, fmt.Errorf("checking pending setstate to %s for issue %s: %w", target, issueID, err)
+	}
+	return pending, nil
+}
+
 // DrainPendingLinearWrites returns up to limit pending linear_writes rows,
 // ordered by id (oldest first), so the dispatcher processes the outbox in
 // enqueue order.

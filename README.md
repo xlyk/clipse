@@ -34,6 +34,7 @@ Expected result: the binary prints the `board`, `dispatch`, `status`, and `tui` 
 - **Isolated agent tools** — Daytona runs DAC filesystem and shell tools in remote sandboxes; local worktrees remain an explicit option.
 - **Real review and merge lanes** — coder and reviewer lanes run DAC turns; the git-operator merge gate is deterministic Go.
 - **Declarative board bootstrap** — `clipse board plan|apply` reconciles a `board.yaml` of issues, dependencies, and lane labels onto Linear, and a re-apply touches only what changed.
+- **Board-independent state labels** — optionally mirror Clipse columns through `clipse:<state>` labels instead of changing a team's Linear workflow.
 - **Live operations surface** — `clipse status` prints a SQLite snapshot, and `clipse tui` shows the board, activity, transcripts, and worker tails.
 - **Behavioral evals** — `make eval` runs live-model cases that pin known coder, docs, and reviewer incidents.
 <!-- managed:readme-agents-doc:section=FEATURES:END -->
@@ -58,7 +59,11 @@ $EDITOR configs/clipse.yaml
 
 The shipped example selects `agent_backend.type: daytona`. Its coder and docs turns reuse one issue-scoped sandbox; each reviewer run gets a fresh disposable sandbox. Sandboxes stop after 60 idle minutes by default. Reviewers also request automatic deletion after 60 minutes as a fallback to explicit cleanup. Daytona setup or provider failures stop the run—Clipse never falls back silently to local execution.
 
+For the complete single-instance and multi-instance setup, including credentials, state modes, Daytona snapshots, isolated board directories, and verification, see the [configuration guide](docs/configuration-guide.md).
+
 To keep the original host-worktree path, set `agent_backend.type: local` or omit the entire `agent_backend` block. Local mode is supported but is not recommended for new installations.
+
+By default, Clipse maps its columns to Linear workflow states. To leave a shared team's workflow untouched, set `state_label_prefix: "clipse:"` and pre-create these team labels: `clipse:todo`, `clipse:ready`, `clipse:running`, `clipse:review`, `clipse:merging`, `clipse:done`, `clipse:rework`, and `clipse:blocked`. Startup verifies the complete set before claiming work. In label mode, an opted-in issue with no state label starts at `todo`; multiple or unknown `clipse:` state labels fail safe to `blocked`. Completed and canceled Linear workflow types remain terminal safety overrides. Reaching `done` removes the issue's `agent:<lane>` opt-in label. To requeue it safely, remove `clipse:done` (or replace it with `clipse:todo`), reopen a completed/canceled Linear workflow into any non-terminal state when needed, and only then add the desired `agent:<lane>` label as the final step. Terminal workflow types override state labels.
 
 ### Bootstrap a Linear board
 
@@ -97,7 +102,7 @@ graph LR
   GitOps --> Linear
 ```
 
-**Request path (one trace):** Linear issue with an `agent:<lane>` label -> dispatcher poll -> SQLite CAS claim -> worker subprocess using the configured agent backend -> typed JSON result -> store transition plus outbox row -> Linear state/comment update -> reviewer or git-operator lane -> merged PR -> `done`.
+**Request path (one trace):** Linear issue with an `agent:<lane>` label -> dispatcher poll -> SQLite CAS claim -> worker subprocess using the configured agent backend -> typed JSON result -> store transition plus outbox row -> Linear workflow-state or `clipse:<state>` label update plus comment -> reviewer or git-operator lane -> merged PR -> `done`.
 
 Full rationale and decision log: [docs/design/2026-07-01-clipse-design.md](docs/design/2026-07-01-clipse-design.md).
 <!-- managed:readme-agents-doc:section=ARCHITECTURE:END -->
@@ -106,6 +111,7 @@ Full rationale and decision log: [docs/design/2026-07-01-clipse-design.md](docs/
 ## Gotchas
 
 - **SQLite is runtime truth** — Linear expresses task intent, but the dispatcher-owned SQLite state decides current board status and active claims; see [AGENTS.md](AGENTS.md).
+- **State labels are opt-in and pre-existing** — `state_label_prefix` switches all non-terminal state reads and writes to the eight reserved labels; Clipse validates them at startup but does not create them.
 - **`running` is CAS-only** — never write `board_status='running'` directly; only `store.ClaimReady` may enter that state.
 - **Contracts are generated** — edit `schema/*.schema.json`, then run `make codegen`; do not hand-edit `internal/contract/contract.go` or `agent/src/clipse_agent/contract.py`.
 - **Live evals cost tokens** — `make eval` uses real models and `gh`; it is outside `make test` and needs `ANTHROPIC_API_KEY` unless the selected lane model manages its own auth.

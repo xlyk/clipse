@@ -291,3 +291,85 @@ func TestNormalizeCandidateIssues_CustomLabelPrefix(t *testing.T) {
 		t.Errorf("Lane = %q, want empty (an \"agent:\" label must not match a configured \"clipse:\" prefix)", issuesAgent[0].Lane)
 	}
 }
+
+func TestNormalizeCandidateIssues_StateLabelMode(t *testing.T) {
+	const raw = `{
+		"data": {"issues": {"nodes": [
+			{
+				"id": "rework", "identifier": "SPA-1", "title": "rework", "description": "",
+				"priority": 0, "branchName": "spa-1", "updatedAt": "2026-07-01T00:00:00.000Z",
+				"state": {"name": "In Progress", "type": "started"},
+				"labels": {"nodes": [{"name": "agent:coder"}, {"name": "clipse:rework"}]},
+				"inverseRelations": {"nodes": []}
+			},
+			{
+				"id": "unseeded", "identifier": "SPA-2", "title": "unseeded", "description": "",
+				"priority": 0, "branchName": "spa-2", "updatedAt": "2026-07-01T00:00:00.000Z",
+				"state": {"name": "In Progress", "type": "started"},
+				"labels": {"nodes": [{"name": "agent:coder"}]},
+				"inverseRelations": {"nodes": []}
+			},
+			{
+				"id": "terminal", "identifier": "SPA-3", "title": "terminal", "description": "",
+				"priority": 0, "branchName": "spa-3", "updatedAt": "2026-07-01T00:00:00.000Z",
+				"state": {"name": "Ready for Release", "type": "completed"},
+				"labels": {"nodes": [{"name": "agent:coder"}, {"name": "clipse:ready"}]},
+				"inverseRelations": {"nodes": []}
+			},
+			{
+				"id": "conflict", "identifier": "SPA-4", "title": "conflict", "description": "",
+				"priority": 0, "branchName": "spa-4", "updatedAt": "2026-07-01T00:00:00.000Z",
+				"state": {"name": "Todo", "type": "unstarted"},
+				"labels": {"nodes": [{"name": "agent:coder"}, {"name": "clipse:ready"}, {"name": "clipse:review"}]},
+				"inverseRelations": {"nodes": []}
+			}
+		]}}
+	}`
+
+	issues, err := linear.NormalizeCandidateIssues([]byte(raw), "agent:", "clipse:")
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: %v", err)
+	}
+	byID := make(map[string]linear.Issue, len(issues))
+	for _, issue := range issues {
+		byID[issue.ID] = issue
+	}
+	if got := byID["rework"].Status; got != string(contract.ColumnRework) {
+		t.Errorf("rework Status = %q, want rework (label overrides workflow state)", got)
+	}
+	if got := byID["unseeded"].Status; got != string(contract.ColumnTodo) {
+		t.Errorf("unseeded Status = %q, want todo (label mode ignores active workflow names)", got)
+	}
+	if got := byID["terminal"].Status; got != string(contract.ColumnDone) {
+		t.Errorf("terminal Status = %q, want done (completed workflow type is a safety override)", got)
+	}
+	if got := byID["conflict"].Status; got != string(contract.ColumnBlocked) {
+		t.Errorf("conflict Status = %q, want blocked (ambiguous state labels fail safe)", got)
+	}
+}
+
+func TestNormalizeCandidateIssues_StateLabelDoneSatisfiesDependency(t *testing.T) {
+	const raw = `{
+		"data": {"issues": {"nodes": [{
+			"id": "child", "identifier": "SPA-2", "title": "child", "description": "",
+			"priority": 0, "branchName": "spa-2", "updatedAt": "2026-07-01T00:00:00.000Z",
+			"state": {"name": "Todo", "type": "unstarted"},
+			"labels": {"nodes": [{"name": "agent:coder"}, {"name": "clipse:todo"}]},
+			"inverseRelations": {"nodes": [{
+				"type": "blocks",
+				"issue": {
+					"id": "blocker", "state": {"type": "unstarted"},
+					"labels": {"nodes": [{"name": "clipse:done"}]}
+				}
+			}]}
+		}]}}
+	}`
+
+	issues, err := linear.NormalizeCandidateIssues([]byte(raw), "agent:", "clipse:")
+	if err != nil {
+		t.Fatalf("NormalizeCandidateIssues: %v", err)
+	}
+	if got := issues[0].Deps; len(got) != 0 {
+		t.Errorf("Deps = %v, want empty (clipse:done blocker is terminal)", got)
+	}
+}

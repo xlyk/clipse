@@ -75,6 +75,34 @@ func (d *Dispatcher) pollAndUpsert(ctx context.Context) error {
 		if err := d.reconcileLinearDivergence(ctx, li.ID, li.Status, now); err != nil {
 			return fmt.Errorf("reconciling linear divergence for issue %s: %w", li.Identifier, err)
 		}
+		if err := d.ensureLabelModeDoneCleanup(ctx, li.ID, li.Status, now); err != nil {
+			return fmt.Errorf("scheduling label-mode done cleanup for issue %s: %w", li.Identifier, err)
+		}
+	}
+	return nil
+}
+
+// ensureLabelModeDoneCleanup makes every observed label-mode done state
+// converge through HTTPClient.SetState("done"), even when Linear already
+// carries clipse:done or the issue was first ingested as done. That idempotent
+// write is what removes the agent:<lane> opt-in label, keeping terminal work
+// out of CandidateIssuesQuery's capped result. The outbox remains the only
+// automated Linear write path. Only an already-pending done write suppresses
+// a duplicate: an older active-state write must be followed by done so the
+// terminal cleanup wins after the outbox drains in issue order.
+func (d *Dispatcher) ensureLabelModeDoneCleanup(ctx context.Context, issueID, linearStatus string, now int64) error {
+	if d.cfg.StateLabelPrefix == "" || linearStatus != string(contract.ColumnDone) {
+		return nil
+	}
+	pending, err := d.store.HasPendingLinearSetStateTarget(ctx, issueID, string(contract.ColumnDone))
+	if err != nil {
+		return fmt.Errorf("checking pending state cleanup for issue %s: %w", issueID, err)
+	}
+	if pending {
+		return nil
+	}
+	if err := d.store.EnqueueLinearSetState(ctx, issueID, string(contract.ColumnDone), now); err != nil {
+		return fmt.Errorf("enqueueing done label cleanup for issue %s: %w", issueID, err)
 	}
 	return nil
 }
@@ -105,6 +133,14 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 		return nil
 	}
 
+	// In label mode a terminal Linear observation outranks an older pending
+	// label mirror when there is no active claim. A pending ready/review write
+	// cannot change Linear's completed/canceled workflow type, and preserving
+	// the cached active SQLite status here would let selectAndClaim start work
+	// before the stale mirror drains. Adopt terminal now; the label-mode done
+	// cleanup is queued behind any older write and ultimately wins.
+	labelModeTerminalOverride := d.cfg.StateLabelPrefix != "" && terminalStatuses[linearStatus]
+
 	// board_status="running" is entered ONLY via the CAS claim
 	// (store.ClaimReady/ClaimColumn) -- see AGENTS.md's kernel invariant.
 	// Reaching here at all already means issue.BoardStatus != linearStatus,
@@ -123,7 +159,7 @@ func (d *Dispatcher) reconcileLinearDivergence(ctx context.Context, issueID, lin
 		if err != nil {
 			return fmt.Errorf("checking pending setstate for issue %s: %w", issueID, err)
 		}
-		if pendingSetState {
+		if pendingSetState && !labelModeTerminalOverride {
 			return nil
 		}
 		return d.adoptLinearMove(ctx, issueID, issue.BoardStatus, linearStatus, now)

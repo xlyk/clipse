@@ -60,6 +60,47 @@ func statusFromWorkflowName(name, stateType string) string {
 	return "todo"
 }
 
+// statusFromLinearIssue selects the board status for an issue. Linear's
+// terminal workflow-state types remain authoritative in both modes so a
+// completed or cancelled issue can never be accidentally re-run. When a
+// state-label prefix is configured, every non-terminal issue is otherwise
+// driven only by its prefixed label; an unlabelled issue starts at todo and
+// ambiguous or unknown prefixed labels fail safe to blocked.
+func statusFromLinearIssue(name, stateType string, labelNames []string, stateLabelPrefix string) string {
+	if stateType == "canceled" || stateType == "completed" {
+		return statusFromWorkflowName(name, stateType)
+	}
+	if stateLabelPrefix == "" {
+		return statusFromWorkflowName(name, stateType)
+	}
+	if status, found := statusFromLabels(labelNames, stateLabelPrefix); found {
+		return status
+	}
+	return "todo"
+}
+
+// statusFromLabels returns the single valid board state encoded by labels
+// under prefix. It reports found=false when no prefixed label exists. More
+// than one prefixed label, or any unknown suffix in the reserved namespace,
+// is an invalid state and returns blocked so the dispatcher cannot claim it.
+func statusFromLabels(labelNames []string, prefix string) (status string, found bool) {
+	for _, name := range labelNames {
+		rest, ok := strings.CutPrefix(name, prefix)
+		if !ok {
+			continue
+		}
+		if found {
+			return "blocked", true
+		}
+		found = true
+		if _, ok := canonicalWorkflowNameByColumn[rest]; !ok {
+			return "blocked", true
+		}
+		status = rest
+	}
+	return status, found
+}
+
 // canonicalWorkflowNameByColumn is the (single-valued) inverse of
 // statusByWorkflowName, keyed by the bare board Column string (e.g.
 // "review"): it names the one canonical Linear workflow-state NAME
