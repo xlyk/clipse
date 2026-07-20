@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -325,6 +326,50 @@ func TestLocalSpawner_Timeout(t *testing.T) {
 	}
 	if !errors.Is(res.Err, context.DeadlineExceeded) {
 		t.Errorf("Result.Err = %v, want it to wrap context.DeadlineExceeded", res.Err)
+	}
+}
+
+// TestLocalSpawner_TimeoutKillsPipeHoldingProcessGroup reproduces the
+// SPA-1012 shutdown hang: CommandContext kills the launcher, but cmd.Wait
+// cannot return while a surviving child still owns the stdout/stderr pipes.
+// The deadline path must kill the complete process group before waiting on
+// those pipes.
+func TestLocalSpawner_TimeoutKillsPipeHoldingProcessGroup(t *testing.T) {
+	boardDir := t.TempDir()
+	command := []string{
+		"/bin/sh", "-c",
+		`trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & wait`,
+	}
+	s := spawn.NewLocalSpawner(command, boardDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	handle, err := s.Spawn(ctx, newSpec(t, boardDir, "unused"))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	done := make(chan struct{})
+	var res spawn.Result
+	var waitErr error
+	go func() {
+		res, waitErr = handle.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait remained blocked by a child that inherited worker pipes")
+	}
+	if waitErr != nil {
+		t.Fatalf("Wait: %v", waitErr)
+	}
+	if !errors.Is(res.Err, context.DeadlineExceeded) {
+		t.Fatalf("Result.Err = %v, want context deadline exceeded", res.Err)
+	}
+	if err := syscall.Kill(-handle.PID(), 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("worker process group %d still exists after Wait: %v", handle.PID(), err)
 	}
 }
 
