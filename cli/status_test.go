@@ -88,6 +88,11 @@ func TestRenderStatus_SummaryAndPerIssueTable(t *testing.T) {
 		t.Fatalf("RenderStatus: unexpected error: %v", err)
 	}
 	got := buf.String()
+	for _, want := range []string{"DISPATCHER", "desired / observed", "active runs", "safe to restart"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing dispatcher control field %q, got:\n%s", want, got)
+		}
+	}
 
 	// Per-status summary must surface counts for the statuses present.
 	for _, want := range []string{"running", "ready", "blocked", "review"} {

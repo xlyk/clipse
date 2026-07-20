@@ -8,7 +8,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -54,6 +57,10 @@ of pending Linear mirror writes, once per poll interval, until interrupted
 	cmd.Flags().StringVar(&flags.configPath, "config", configPathDefault(), "path to clipse.yaml")
 	cmd.Flags().StringVar(&flags.boardDir, "board", "", "board state directory (default: config board_dir)")
 	cmd.Flags().StringVar(&flags.workerBin, "worker", "", "override worker command with a single binary (default: config worker.command)")
+	cmd.AddCommand(newDispatchPauseCmd())
+	cmd.AddCommand(newDispatchDrainCmd())
+	cmd.AddCommand(newDispatchResumeCmd())
+	cmd.AddCommand(newDispatchControlStatusCmd())
 
 	return cmd
 }
@@ -190,8 +197,78 @@ func runDispatch(cmd *cobra.Command, flags *dispatchFlags) error {
 	}
 	d := dispatcher.New(*cfg, st, lc, spawner, ws, options...)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	return coordinateDispatcherSignals(st, d, logger, signals)
+}
 
-	return d.Run(ctx)
+type dispatcherRunner interface {
+	Run(context.Context) error
+}
+
+// coordinateDispatcherSignals owns the explicit two-signal lifecycle. It is
+// split from runDispatch so tests can inject a signal channel without sending
+// SIGTERM to the test process.
+func coordinateDispatcherSignals(st *store.Store, runner dispatcherRunner, logger *slog.Logger, signals <-chan os.Signal) error {
+	runCtx, forceCancel := context.WithCancel(context.Background())
+	defer forceCancel()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(runCtx) }()
+
+	firstSignal := true
+	for {
+		select {
+		case err := <-done:
+			return err
+		case sig := <-signals:
+			runs, err := st.ListOpenRuns(context.Background())
+			if err != nil {
+				logger.Error("listing open runs for signal handling failed", "signal", sig.String(), "error", err)
+				continue
+			}
+			if firstSignal && len(runs) == 0 {
+				logger.Info("dispatcher signal received with no active work; exiting", "signal", sig.String())
+				forceCancel()
+				firstSignal = false
+				continue
+			}
+			if firstSignal {
+				requestID, err := newControlRequestID()
+				if err != nil {
+					logger.Error("generating signal drain request failed", "signal", sig.String(), "error", err)
+					continue
+				}
+				if err := st.RequestDrain(context.Background(), requestID, time.Now().Unix(), false); err != nil {
+					logger.Error("requesting signal drain failed", "signal", sig.String(), "request_id", requestID, "error", err)
+					continue
+				}
+				control, err := st.ReadDispatcherControl(context.Background())
+				if err != nil {
+					logger.Error("reading signal drain target failed", "signal", sig.String(), "request_id", requestID, "error", err)
+					continue
+				}
+				logger.Info("dispatcher signal requested drain",
+					"signal", sig.String(),
+					"request_id", requestID,
+					"instance_id", control.DrainTargetInstanceID,
+					"active_runs", len(runs),
+				)
+				firstSignal = false
+				continue
+			}
+
+			runIDs := make([]string, 0, len(runs))
+			for _, run := range runs {
+				runIDs = append(runIDs, run.RunID)
+			}
+			sort.Strings(runIDs)
+			logger.Warn("second dispatcher signal forcing immediate shutdown; open runs require orphan recovery",
+				"signal", sig.String(),
+				"open_run_ids", strings.Join(runIDs, ","),
+				"active_runs", len(runIDs),
+			)
+			forceCancel()
+		}
+	}
 }

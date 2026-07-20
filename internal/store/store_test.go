@@ -37,7 +37,7 @@ func TestOpen_MigratesEmptyDB(t *testing.T) {
 	defer s.Close()
 
 	db := s.DB()
-	wantTables := []string{"issues", "runs", "events"}
+	wantTables := []string{"issues", "runs", "events", "dispatcher_control"}
 	for _, name := range wantTables {
 		var got string
 		row := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, name)

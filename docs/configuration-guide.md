@@ -387,6 +387,42 @@ Inspect the corresponding board explicitly:
 
 `status` and `tui` read a board directory rather than a config file. When several instances exist, always pass `--board` instead of accepting the `./.clipse` default.
 
+## Pausing, draining, and safe restarts
+
+Scheduling control is durable and board-scoped. `pause` and `drain` update the singleton control row in `<board_dir>/clipse.db`; every coder, reviewer, and git-operator claim reads that row inside its existing `BEGIN IMMEDIATE` transaction. The committed request is therefore a hard boundary: a claim either committed first and is allowed to finish, or observes the pause and creates no run.
+
+Use this sequence for a configuration, model, credential, or Daytona snapshot change:
+
+```sh
+./bin/clipse dispatch drain \
+  --board /absolute/path/to/runtime/yourrepo \
+  --wait
+
+# Change the YAML or launcher, then start the replacement.
+./bin/clipse dispatch --config /absolute/path/to/clipse.yaml
+
+# A completed drain leaves the replacement paused.
+./bin/clipse dispatch control-status \
+  --board /absolute/path/to/runtime/yourrepo
+./bin/clipse status --board /absolute/path/to/runtime/yourrepo
+
+./bin/clipse dispatch resume \
+  --board /absolute/path/to/runtime/yourrepo
+```
+
+The controls are:
+
+- `dispatch pause --board <dir> [--wait] [--timeout 30s]` — prevent new claims while the daemon keeps polling, reconciling results, heartbeating active claims, cleaning workspaces, promoting dependencies, and draining the Linear outbox.
+- `dispatch drain --board <dir> [--wait] [--timeout 65m] [--strict]` — pause and target the registered daemon. It exits after every admitted run has a durable result. The default reports but does not wait for durable outbox/cleanup backlog; `--strict` waits for both queues to reach zero.
+- `dispatch resume --board <dir> [--cancel-drain]` — reopen claims. An unfinished targeted drain refuses plain resume; `--cancel-drain` is the explicit escape hatch.
+- `dispatch control-status --board <dir>` — show desired/observed mode, registered instance and PID, request/drain target, active runs, pending durable side effects, and `safe to restart` from SQLite only.
+
+All control commands require an existing board database and print its resolved absolute path. A drain request with no registered daemon still leaves scheduling paused but returns nonzero because there was no instance to target. A `--wait` timeout also returns nonzero and leaves the board paused; it never resumes or kills a worker.
+
+The replacement performs normal orphan recovery before its first paused tick. A completed planned drain has no open run to recover. If the old daemon crashed mid-drain, the replacement records `dispatcher_drain_interrupted`, performs ordinary bounded orphan recovery, and remains paused for operator inspection.
+
+Signal behavior follows the same safety model: the first SIGINT/SIGTERM requests a drain when active runs exist, or exits immediately when none exist. A second signal forces immediate shutdown and logs the exact open run IDs that the next startup must recover.
+
 ## Startup preflights
 
 Before it can claim work, a Daytona-backed dispatcher:

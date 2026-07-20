@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/xlyk/clipse/internal/contract"
 )
@@ -160,6 +161,18 @@ func (s *LocalSpawner) Spawn(ctx context.Context, spec WorkerSpec) (RunHandle, e
 	// alone) can be extended to signal the whole group, reaping any
 	// children the worker spawns.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// CommandContext's default cancellation kills only cmd.Process. Replace
+	// it before Start so a deadline terminates the complete worker process
+	// group before cmd.Wait can block on pipes inherited by a surviving
+	// child. WaitDelay is the final bound for an unclosed pipe or a platform
+	// cancellation anomaly; the normal path returns as soon as the group dies.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return killProcessGroup(cmd.Process.Pid)
+	}
+	cmd.WaitDelay = 2 * time.Second
 
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
@@ -224,14 +237,19 @@ func (h *localHandle) Kill() error {
 	}
 	h.killed = true
 
-	pgid := h.pid
+	return killProcessGroup(h.pid)
+}
+
+func killProcessGroup(pgid int) error {
+	if pgid <= 0 {
+		return fmt.Errorf("killing worker process group: invalid pgid %d", pgid)
+	}
 	// Best-effort graceful termination first; ignore errors here since the
 	// process may already be gone or may ignore SIGTERM, either of which
 	// the follow-up SIGKILL handles.
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			// Process group is already gone: not an error.
 			return nil
 		}
 		return fmt.Errorf("killing worker process group %d: %w", pgid, err)

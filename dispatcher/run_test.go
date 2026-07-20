@@ -240,6 +240,7 @@ func (c *countingLinearClient) Count() int64 { return c.n.Load() }
 // a Run ctx cancellation and observe whether its context got cancelled.
 type gatedSpawner struct {
 	release chan struct{}
+	result  spawn.Result
 
 	n      atomic.Int64
 	handle *gatedHandle
@@ -247,7 +248,11 @@ type gatedSpawner struct {
 
 func (g *gatedSpawner) Spawn(ctx context.Context, spec spawn.WorkerSpec) (spawn.RunHandle, error) {
 	g.n.Add(1)
-	h := &gatedHandle{ctx: ctx, release: g.release, pid: 12345}
+	result := g.result
+	if result.Worker.Outcome == "" && result.Err == nil {
+		result = spawn.Result{Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeDone}}
+	}
+	h := &gatedHandle{ctx: ctx, release: g.release, result: result, pid: 12345}
 	g.handle = h
 	return h, nil
 }
@@ -266,6 +271,7 @@ func (g *gatedSpawner) handleCtxErr() error {
 type gatedHandle struct {
 	ctx     context.Context
 	release chan struct{}
+	result  spawn.Result
 	pid     int
 }
 
@@ -275,5 +281,5 @@ func (h *gatedHandle) Kill() error          { return nil }
 
 func (h *gatedHandle) Wait() (spawn.Result, error) {
 	<-h.release
-	return spawn.Result{Worker: contract.WorkerResult{Outcome: contract.WorkerResultOutcomeDone}}, nil
+	return h.result, nil
 }

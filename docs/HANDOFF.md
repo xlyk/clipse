@@ -94,6 +94,9 @@ fix was live — the exact bug it was built for. The smoke config lives at
 - `make build` — compile `./bin/clipse`.
 - `./bin/clipse dispatch --config <clipse.yaml>` — the daemon (`--board <dir>`
   optional; defaults to config `board_dir`).
+- `./bin/clipse dispatch pause|drain|resume|control-status --board <dir>` —
+  durable scheduling control and restart-safety evidence. A completed drain
+  leaves the replacement paused until explicit resume.
 - `./bin/clipse tui --board <dir>` — live dashboard. Keys: `?` help, `tab`
   kanban, `enter` detail, `q` quit. (`--board` defaults to `./.clipse`.)
 - `./bin/clipse status` — one-shot SQLite snapshot table.

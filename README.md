@@ -36,6 +36,7 @@ Expected result: the binary prints the `board`, `configure`, `dispatch`, `status
 - **Declarative board bootstrap** — `clipse board plan|apply` reconciles a `board.yaml` of issues, dependencies, and lane labels onto Linear, and a re-apply touches only what changed.
 - **Board-independent state labels** — optionally mirror Clipse columns through `clipse:<state>` labels instead of changing a team's Linear workflow.
 - **Live operations surface** — `clipse status` prints a SQLite snapshot, and `clipse tui` shows the board, activity, transcripts, and worker tails.
+- **Atomic pause and drain** — board-scoped SQLite control prevents post-pause claims, lets admitted work finish, and makes config-safe dispatcher restarts observable.
 - **Behavioral evals** — `make eval` runs live-model cases that pin known coder, docs, and reviewer incidents.
 <!-- managed:readme-agents-doc:section=FEATURES:END -->
 
@@ -115,6 +116,17 @@ A second apply skips unchanged issues, updates edited ones, and never deletes �
 ```
 
 `status` is a one-shot table. Its backend columns show the provider, role, lifecycle state, and shortened sandbox ID. `tui` shows the full sandbox ID, remote path, last lifecycle action, and sanitized cleanup error in issue details. Cleanup is durable: terminal coder sandboxes and every reviewer sandbox enter a retryable cleanup queue, and startup reconciliation repairs interrupted lifecycle work.
+
+For a planned restart, drain the current daemon, start its replacement (which remains paused), verify the new configuration, then resume:
+
+```sh
+./bin/clipse dispatch drain --board /absolute/path/to/board --wait
+./bin/clipse dispatch --config /absolute/path/to/clipse.yaml
+./bin/clipse dispatch control-status --board /absolute/path/to/board
+./bin/clipse dispatch resume --board /absolute/path/to/board
+```
+
+`pause` and `drain` commit their no-new-claims barrier in the same SQLite transaction order used by coder, reviewer, and git-operator claims. `drain --strict` additionally waits for the Linear outbox and workspace-cleanup queue; without `--strict`, those durable side effects are reported but do not make an execution-safe restart hang.
 <!-- managed:readme-agents-doc:section=USAGE:END -->
 
 <!-- managed:readme-agents-doc:section=ARCHITECTURE:BEGIN -->
@@ -142,6 +154,7 @@ Full rationale and decision log: [docs/design/2026-07-01-clipse-design.md](docs/
 ## Gotchas
 
 - **SQLite is runtime truth** — Linear expresses task intent, but the dispatcher-owned SQLite state decides current board status and active claims; see [AGENTS.md](AGENTS.md).
+- **Planned restarts are drain/resume operations** — do not time a SIGTERM around a retry boundary. Drain by board directory, start the replacement paused, verify status/config, then resume.
 - **State labels are opt-in and pre-existing** — `state_label_prefix` switches all non-terminal state reads and writes to the eight reserved labels; Clipse validates them at startup but does not create them.
 - **`running` is CAS-only** — never write `board_status='running'` directly; only `store.ClaimReady` may enter that state.
 - **Contracts are generated** — edit `schema/*.schema.json`, then run `make codegen`; do not hand-edit `internal/contract/contract.go` or `agent/src/clipse_agent/contract.py`.
