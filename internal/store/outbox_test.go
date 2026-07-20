@@ -242,6 +242,14 @@ func TestHasPendingLinearSetState(t *testing.T) {
 	if err != nil || !has {
 		t.Fatalf("issue-1 pending setstate = %v, err=%v", has, err)
 	}
+	has, err = s.HasPendingLinearSetStateTarget(ctx, "issue-1", "done")
+	if err != nil || !has {
+		t.Fatalf("issue-1 pending done setstate = %v, err=%v", has, err)
+	}
+	has, err = s.HasPendingLinearSetStateTarget(ctx, "issue-1", "ready")
+	if err != nil || has {
+		t.Fatalf("issue-1 pending ready setstate = %v, err=%v", has, err)
+	}
 	has, err = s.HasPendingLinearSetState(ctx, "issue-2")
 	if err != nil || has {
 		t.Fatalf("issue-2 pending setstate = %v, err=%v", has, err)
@@ -256,6 +264,10 @@ func TestHasPendingLinearSetState(t *testing.T) {
 	has, err = s.HasPendingLinearSetState(ctx, "issue-1")
 	if err != nil || has {
 		t.Fatalf("completed issue-1 setstate still pending = %v, err=%v", has, err)
+	}
+	has, err = s.HasPendingLinearSetStateTarget(ctx, "issue-1", "done")
+	if err != nil || has {
+		t.Fatalf("completed issue-1 done setstate still pending = %v, err=%v", has, err)
 	}
 }
 

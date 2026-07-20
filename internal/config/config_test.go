@@ -70,6 +70,7 @@ recover_cap: 5
 recover_backoff_s: 90
 max_tokens_per_run: 250000
 lane_label_prefix: "lane:"
+state_label_prefix: "clipse:"
 max_attempts: 4
 env_allowlist:
   - ANTHROPIC_API_KEY
@@ -143,6 +144,9 @@ board_dir: "/abs/path/board"
 	}
 	if cfg.LaneLabelPrefix != "lane:" {
 		t.Errorf("LaneLabelPrefix = %q, want %q", cfg.LaneLabelPrefix, "lane:")
+	}
+	if cfg.StateLabelPrefix != "clipse:" {
+		t.Errorf("StateLabelPrefix = %q, want %q", cfg.StateLabelPrefix, "clipse:")
 	}
 	if cfg.MaxAttempts != 4 {
 		t.Errorf("MaxAttempts = %d, want 4", cfg.MaxAttempts)
@@ -228,6 +232,9 @@ worker:
 	if cfg.LaneLabelPrefix != "agent:" {
 		t.Errorf("LaneLabelPrefix = %q, want default %q", cfg.LaneLabelPrefix, "agent:")
 	}
+	if cfg.StateLabelPrefix != "" {
+		t.Errorf("StateLabelPrefix = %q, want empty default (workflow-state mode)", cfg.StateLabelPrefix)
+	}
 	if cfg.MaxAttempts != 3 {
 		t.Errorf("MaxAttempts = %d, want default 3", cfg.MaxAttempts)
 	}
@@ -257,6 +264,34 @@ worker:
 	// wait for CI to register rather than proceeding to merge).
 	if !cfg.Repo.RequireChecks {
 		t.Errorf("Repo.RequireChecks = %v, want default true", cfg.Repo.RequireChecks)
+	}
+}
+
+func TestLoad_StateLabelPrefixMustNotOverlapLanePrefix(t *testing.T) {
+	tests := []struct {
+		name        string
+		lanePrefix  string
+		statePrefix string
+	}{
+		{name: "same", lanePrefix: "clipse:", statePrefix: "clipse:"},
+		{name: "state nested under lane", lanePrefix: "clipse:", statePrefix: "clipse:state:"},
+		{name: "lane nested under state", lanePrefix: "clipse:", statePrefix: "clip"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeYAML(t, baseValidYAML+`
+lane_label_prefix: "`+tt.lanePrefix+`"
+state_label_prefix: "`+tt.statePrefix+`"
+`)
+			_, err := config.Load(path)
+			if err == nil {
+				t.Fatal("Load: expected overlapping label prefixes to be rejected")
+			}
+			if !strings.Contains(err.Error(), "state_label_prefix") {
+				t.Errorf("Load error = %q, want state_label_prefix", err)
+			}
+		})
 	}
 }
 

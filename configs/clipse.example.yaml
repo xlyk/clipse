@@ -18,8 +18,8 @@ repo:
   require_checks: true
 
 # team_key / team_id: the Linear team clipse operates against. team_key
-# scopes the candidate-issues query to this team; team_id resolves board
-# columns to that team's Linear workflow-state ids for SetState.
+# scopes the candidate-issues query to this team; team_id resolves either
+# workflow-state ids or state-label ids for SetState.
 team_key: "CLI"
 team_id: "8b5b3301-8da3-4933-9b07-9efc027bc09d"
 
@@ -60,6 +60,23 @@ max_tokens_per_run: 400000
 # lane_label_prefix: Linear label prefix used to select a lane for an issue.
 # e.g. the label "agent:coder" selects the coder lane.
 lane_label_prefix: "agent:"
+
+# state_label_prefix: optional label-backed board state. When omitted (the
+# default), Clipse reads and writes Linear workflow states. When set, Clipse
+# leaves the team's workflow untouched and uses exactly one of these labels:
+# clipse:todo, clipse:ready, clipse:running, clipse:review, clipse:merging,
+# clipse:done, clipse:rework, clipse:blocked. All eight labels must already
+# exist on the configured team; dispatch startup preflights them before any
+# issue can be claimed. No state label means todo. Conflicting or unknown
+# labels in the reserved namespace read as blocked. Linear's completed and
+# canceled workflow types remain terminal safety overrides. A done transition
+# also removes the agent:<lane> opt-in label so completed work leaves the
+# candidate queue. To requeue safely, remove clipse:done (or replace it with
+# clipse:todo), reopen a completed/canceled Linear workflow into any
+# non-terminal state when needed, then add agent:<lane> last. Terminal
+# workflow types override labels.
+# The state and lane prefixes must not overlap.
+# state_label_prefix: "clipse:"
 
 # max_attempts: maximum dispatch attempts for a single issue (across retries
 # and dispatcher-restart requeues) before it is parked in Blocked instead of

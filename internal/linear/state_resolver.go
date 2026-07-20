@@ -116,3 +116,19 @@ func (c *HTTPClient) workflowStateIDs(ctx context.Context) (map[string]string, e
 	c.stateIDs = ids
 	return ids, nil
 }
+
+// ValidateWorkflowStates performs the dispatcher's workflow-state resolution
+// preflight without mutating an issue. Every Clipse column must have the exact
+// writable state name selected by canonicalWorkflowName. Results share the
+// normal state-id cache, so a later SetState does not repeat the query.
+func (c *HTTPClient) ValidateWorkflowStates(ctx context.Context) error {
+	if c.stateLabelPrefix != "" {
+		return nil
+	}
+	for _, column := range stateLabelColumns {
+		if _, err := c.resolveStateID(ctx, column); err != nil {
+			return fmt.Errorf("validating workflow states: %w", err)
+		}
+	}
+	return nil
+}

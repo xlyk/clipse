@@ -49,6 +49,11 @@ type issueNode struct {
 				State struct {
 					Type string `json:"type"`
 				} `json:"state"`
+				Labels struct {
+					Nodes []struct {
+						Name string `json:"name"`
+					} `json:"nodes"`
+				} `json:"labels"`
 			} `json:"issue"`
 		} `json:"nodes"`
 	} `json:"inverseRelations"`
@@ -59,7 +64,11 @@ type issueNode struct {
 // to their bare lane (via labelPrefix, e.g. "agent:"), workflow-state names
 // are mapped to our Column enum, and "blocks"/"blocked-by" relations are
 // folded into a single Deps list.
-func NormalizeCandidateIssues(body []byte, labelPrefix string) ([]Issue, error) {
+func NormalizeCandidateIssues(body []byte, labelPrefix string, stateLabelPrefixes ...string) ([]Issue, error) {
+	stateLabelPrefix := ""
+	if len(stateLabelPrefixes) > 0 {
+		stateLabelPrefix = stateLabelPrefixes[0]
+	}
 	var resp candidateIssuesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("normalizing candidate issues: %w", err)
@@ -68,7 +77,7 @@ func NormalizeCandidateIssues(body []byte, labelPrefix string) ([]Issue, error) 
 	nodes := resp.Data.Issues.Nodes
 	issues := make([]Issue, 0, len(nodes))
 	for _, n := range nodes {
-		issue, err := normalizeIssueNode(n, labelPrefix)
+		issue, err := normalizeIssueNode(n, labelPrefix, stateLabelPrefix)
 		if err != nil {
 			return nil, fmt.Errorf("normalizing issue %s: %w", n.Identifier, err)
 		}
@@ -78,7 +87,7 @@ func NormalizeCandidateIssues(body []byte, labelPrefix string) ([]Issue, error) 
 }
 
 // normalizeIssueNode maps a single raw issue node to a normalized Issue.
-func normalizeIssueNode(n issueNode, labelPrefix string) (Issue, error) {
+func normalizeIssueNode(n issueNode, labelPrefix, stateLabelPrefix string) (Issue, error) {
 	labelNames := make([]string, 0, len(n.Labels.Nodes))
 	for _, l := range n.Labels.Nodes {
 		labelNames = append(labelNames, l.Name)
@@ -102,6 +111,15 @@ func normalizeIssueNode(n issueNode, labelPrefix string) (Issue, error) {
 		if t := r.Issue.State.Type; t == "completed" || t == "canceled" {
 			continue
 		}
+		if stateLabelPrefix != "" {
+			blockerLabels := make([]string, 0, len(r.Issue.Labels.Nodes))
+			for _, label := range r.Issue.Labels.Nodes {
+				blockerLabels = append(blockerLabels, label.Name)
+			}
+			if status, found := statusFromLabels(blockerLabels, stateLabelPrefix); found && status == "done" {
+				continue
+			}
+		}
 		deps = append(deps, r.Issue.ID)
 	}
 
@@ -115,7 +133,7 @@ func normalizeIssueNode(n issueNode, labelPrefix string) (Issue, error) {
 		Identifier:  n.Identifier,
 		Title:       n.Title,
 		Description: n.Description,
-		Status:      statusFromWorkflowName(n.State.Name, n.State.Type),
+		Status:      statusFromLinearIssue(n.State.Name, n.State.Type, labelNames, stateLabelPrefix),
 		Lane:        laneFromLabels(labelNames, labelPrefix),
 		Deps:        deps,
 		Priority:    n.Priority,

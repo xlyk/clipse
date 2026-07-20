@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -271,6 +272,130 @@ func TestTick_PollAdoptsHumanMoveWhenUnclaimed(t *testing.T) {
 	}
 	if got2.BoardStatus != "running" {
 		t.Errorf("BoardStatus after second tick = %q, want running (adopted issue was claimable)", got2.BoardStatus)
+	}
+}
+
+func TestTick_LabelModeDoneCandidateIsTerminalAndCleansLaneOptIn(t *testing.T) {
+	for _, cachedStatus := range []string{"", "ready"} {
+		name := "first observed as done"
+		if cachedStatus != "" {
+			name = "cached ready then human completed"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := openTestStore(t)
+			ctx := context.Background()
+			if cachedStatus != "" {
+				seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+			}
+
+			lc := &linear.MockClient{Issues: []linear.Issue{{
+				ID:         "issue-1",
+				Identifier: "SPA-1",
+				Status:     "done",
+				Lane:       "coder",
+				Priority:   1,
+				BranchName: "spa-1",
+				UpdatedAt:  200,
+			}}}
+			spawner := newFakeSpawner()
+			cfg := testConfig()
+			cfg.StateLabelPrefix = "clipse:"
+			d := newTestDispatcher(t, cfg, s, lc, spawner, newStubWorkspacer(t.TempDir()), fixedClock(1000))
+
+			if err := d.Tick(ctx); err != nil {
+				t.Fatalf("Tick: unexpected error: %v", err)
+			}
+
+			got, err := s.GetIssue(ctx, "issue-1")
+			if err != nil {
+				t.Fatalf("GetIssue: %v", err)
+			}
+			if got.BoardStatus != "done" {
+				t.Errorf("BoardStatus = %q, want done", got.BoardStatus)
+			}
+			if spawner.SpawnCount() != 0 {
+				t.Errorf("SpawnCount = %d, want 0 (completed issue must not be claimed)", spawner.SpawnCount())
+			}
+			if len(lc.SetStateCalls) != 1 || lc.SetStateCalls[0].IssueID != "issue-1" || lc.SetStateCalls[0].TargetColumn != "done" {
+				t.Errorf("SetStateCalls = %+v, want one idempotent done update that removes the lane label", lc.SetStateCalls)
+			}
+		})
+	}
+}
+
+func TestTick_LabelModeDoneCleanupDoesNotDuplicatePendingWrite(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	lc := &linear.MockClient{
+		Issues: []linear.Issue{{
+			ID: "issue-1", Identifier: "SPA-1", Status: "done", Lane: "coder",
+			Priority: 1, BranchName: "spa-1", UpdatedAt: 200,
+		}},
+		SetStateErr: errFakeLinearDown,
+	}
+	cfg := testConfig()
+	cfg.StateLabelPrefix = "clipse:"
+	d := newTestDispatcher(t, cfg, s, lc, newFakeSpawner(), newStubWorkspacer(t.TempDir()), fixedClock(1000))
+
+	for i := 0; i < 2; i++ {
+		if err := d.Tick(ctx); err != nil {
+			t.Fatalf("Tick %d: unexpected error (outbox failures stay pending): %v", i+1, err)
+		}
+	}
+
+	pending, err := s.DrainPendingLinearWrites(ctx, 100)
+	if err != nil {
+		t.Fatalf("DrainPendingLinearWrites: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Kind != "setstate" || pending[0].Target != "done" {
+		t.Errorf("pending writes = %+v, want one retryable done cleanup", pending)
+	}
+}
+
+func TestTick_LabelModeCompletedOverridesPendingActiveMirror(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedReadyIssue(t, s, "issue-1", "coder", 1, 100)
+	if err := s.EnqueueLinearSetState(ctx, "issue-1", "ready", 150); err != nil {
+		t.Fatalf("EnqueueLinearSetState: %v", err)
+	}
+
+	// The ready mirror failed on an earlier tick, then a human completed the
+	// issue in Linear. A terminal observation must park the cached row before
+	// selectAndClaim, while a trailing done cleanup waits behind the stale
+	// ready write and restores the final label state deterministically.
+	lc := &linear.MockClient{Issues: []linear.Issue{{
+		ID: "issue-1", Identifier: "SPA-1", Status: "done", Lane: "coder",
+		Priority: 1, BranchName: "spa-1", UpdatedAt: 200,
+	}}}
+	spawner := newFakeSpawner()
+	cfg := testConfig()
+	cfg.StateLabelPrefix = "clipse:"
+	d := newTestDispatcher(t, cfg, s, lc, spawner, newStubWorkspacer(t.TempDir()), fixedClock(1000))
+
+	if err := d.Tick(ctx); err != nil {
+		t.Fatalf("Tick: unexpected error: %v", err)
+	}
+
+	got, err := s.GetIssue(ctx, "issue-1")
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.BoardStatus != "done" {
+		t.Errorf("BoardStatus = %q, want done", got.BoardStatus)
+	}
+	if got.ClaimLock.Valid {
+		t.Error("ClaimLock.Valid = true, want completed issue left unclaimed")
+	}
+	if spawner.SpawnCount() != 0 {
+		t.Errorf("SpawnCount = %d, want 0 (completed issue must outrank stale pending ready)", spawner.SpawnCount())
+	}
+	wantCalls := []linear.SetStateCall{
+		{IssueID: "issue-1", TargetColumn: "ready"},
+		{IssueID: "issue-1", TargetColumn: "done"},
+	}
+	if !reflect.DeepEqual(lc.SetStateCalls, wantCalls) {
+		t.Errorf("SetStateCalls = %+v, want stale ready followed by terminal done cleanup %+v", lc.SetStateCalls, wantCalls)
 	}
 }
 

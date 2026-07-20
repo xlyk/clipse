@@ -6,6 +6,7 @@
 # command) — configs/clipse.example.yaml is the committed, documented
 # template this is copied from.
 /configs/clipse.yaml
+/configs/clipse.*.local.yaml
 
 # smoke-test local config + generated artifacts (machine-specific; templates
 # are scripts/smoke/smoke.env.example + configs/clipse.smoke.example.yaml).
@@ -19,6 +20,9 @@
 *.db
 *.db-wal
 *.db-shm
+
+# local Clipse runtime state (board database, lock, logs, and worktrees)
+/.clipse/
 
 # superpowers ledger (never commit)
 .superpowers/

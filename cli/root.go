@@ -32,6 +32,7 @@ a deterministic state machine.`,
 	root.AddCommand(newStatusCmd())
 	root.AddCommand(newTUICmd())
 	root.AddCommand(newBoardCmd())
+	root.AddCommand(newConfigureCmd())
 
 	return root
 }

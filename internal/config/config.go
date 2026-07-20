@@ -99,6 +99,54 @@ var defaultEnvAllowlist = []string{
 	"TESTWORKER_SCENARIO",
 }
 
+// Defaults returns a fresh Config containing every production default. Fields
+// that are required and machine-specific (repo, team, and worker.command) are
+// intentionally left empty. Callers may safely mutate the returned slices.
+// Load and Parse remain the authoritative paths for applying these defaults
+// to YAML and validating the resulting configuration.
+func Defaults() Config {
+	return Config{
+		Repo: Repo{RequireChecks: true},
+		AgentBackend: AgentBackend{
+			Type: defaultAgentBackendType,
+			Daytona: DaytonaBackend{
+				AutoStopMinutes:           defaultDaytonaAutoStopMinutes,
+				ReviewerAutoDeleteMinutes: defaultReviewerAutoDeleteMinutes,
+			},
+		},
+		PollIntervalS: defaultPollIntervalS,
+		Caps: Caps{
+			Global: defaultCapsGlobal,
+			PerLane: PerLaneCaps{
+				Coder:       defaultCapsPerLaneCoder,
+				Reviewer:    defaultCapsPerLaneReview,
+				GitOperator: defaultCapsPerLaneGitOp,
+			},
+		},
+		TurnCap:         defaultTurnCap,
+		MaxRuntimeS:     defaultMaxRuntimeS,
+		LaneLabelPrefix: defaultLaneLabelPrefix,
+		MaxAttempts:     defaultMaxAttempts,
+		ReworkCap:       defaultReworkCap,
+		RecoverCap:      defaultRecoverCap,
+		RecoverBackoffS: defaultPollIntervalS,
+		Models: Models{
+			Coder:     defaultModelCoder,
+			CoderDocs: defaultModelCoderDocs,
+			Reviewer:  defaultModelReviewer,
+		},
+		Shell: Shell{
+			Coder:     ShellPolicy{All: true},
+			CoderDocs: ShellPolicy{All: true},
+			Reviewer:  ShellPolicy{All: true},
+		},
+		MaxTokensPerRun: defaultMaxTokensPerRun,
+		CheckpointsDir:  defaultCheckpointsDir,
+		BoardDir:        defaultBoardDir,
+		EnvAllowlist:    append([]string(nil), defaultEnvAllowlist...),
+	}
+}
+
 // Repo describes the single repository clipse manages.
 type Repo struct {
 	Remote     string `yaml:"remote"`
@@ -245,7 +293,12 @@ type Config struct {
 	TurnCap         int    `yaml:"turn_cap"`
 	MaxRuntimeS     int    `yaml:"max_runtime_s"`
 	LaneLabelPrefix string `yaml:"lane_label_prefix"`
-	MaxAttempts     int    `yaml:"max_attempts"`
+	// StateLabelPrefix enables label-backed board state when non-empty. In
+	// that mode Linear workflow states remain untouched and the dispatcher
+	// mirrors its columns through labels such as "clipse:ready" instead.
+	// Empty (the default) preserves the workflow-state integration.
+	StateLabelPrefix string `yaml:"state_label_prefix"`
+	MaxAttempts      int    `yaml:"max_attempts"`
 	// ReworkCap bounds how many times a single issue may cycle into rework
 	// (amendment C1) — see issues.rework_count (internal/store) and
 	// dispatcher.blockIfReworkCapExceeded, which parks the issue in
@@ -411,20 +464,21 @@ type rawConfig struct {
 	// Commands:nil} mean "absent from YAML" unambiguously (see
 	// ShellPolicy.UnmarshalYAML's doc comment), so no further raw/pointer
 	// mirroring is needed to detect absence before defaulting.
-	Shell           Shell    `yaml:"shell_allow_list"`
-	PollIntervalS   *int     `yaml:"poll_interval_s"`
-	Caps            rawCaps  `yaml:"caps"`
-	TurnCap         *int     `yaml:"turn_cap"`
-	MaxRuntimeS     *int     `yaml:"max_runtime_s"`
-	LaneLabelPrefix *string  `yaml:"lane_label_prefix"`
-	MaxAttempts     *int     `yaml:"max_attempts"`
-	ReworkCap       *int     `yaml:"rework_cap"`
-	RecoverCap      *int     `yaml:"recover_cap"`
-	RecoverBackoffS *int     `yaml:"recover_backoff_s"`
-	MaxTokensPerRun *int     `yaml:"max_tokens_per_run"`
-	CheckpointsDir  *string  `yaml:"checkpoints_dir"`
-	BoardDir        *string  `yaml:"board_dir"`
-	EnvAllowlist    []string `yaml:"env_allowlist"`
+	Shell            Shell    `yaml:"shell_allow_list"`
+	PollIntervalS    *int     `yaml:"poll_interval_s"`
+	Caps             rawCaps  `yaml:"caps"`
+	TurnCap          *int     `yaml:"turn_cap"`
+	MaxRuntimeS      *int     `yaml:"max_runtime_s"`
+	LaneLabelPrefix  *string  `yaml:"lane_label_prefix"`
+	StateLabelPrefix *string  `yaml:"state_label_prefix"`
+	MaxAttempts      *int     `yaml:"max_attempts"`
+	ReworkCap        *int     `yaml:"rework_cap"`
+	RecoverCap       *int     `yaml:"recover_cap"`
+	RecoverBackoffS  *int     `yaml:"recover_backoff_s"`
+	MaxTokensPerRun  *int     `yaml:"max_tokens_per_run"`
+	CheckpointsDir   *string  `yaml:"checkpoints_dir"`
+	BoardDir         *string  `yaml:"board_dir"`
+	EnvAllowlist     []string `yaml:"env_allowlist"`
 }
 
 // Load reads the clipse config file at path, applies defaults for fields
@@ -435,10 +489,16 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading config %s: %w", path, err)
 	}
+	return Parse(data, path)
+}
 
+// Parse decodes, defaults, and validates one in-memory clipse YAML document.
+// source is used only in errors so callers can identify a file, draft, or
+// generated document without first writing it to disk.
+func Parse(data []byte, source string) (*Config, error) {
 	var raw rawConfig
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+		return nil, fmt.Errorf("parsing config %s: %w", source, err)
 	}
 
 	// Resolve poll_interval_s first: recover_backoff_s defaults to it (a retry
@@ -484,18 +544,19 @@ func Load(path string) (*Config, error) {
 			CoderDocs: defaultShellPolicy(raw.Shell.CoderDocs),
 			Reviewer:  defaultShellPolicy(raw.Shell.Reviewer),
 		},
-		PollIntervalS:   pollIntervalS,
-		TurnCap:         intOrDefault(raw.TurnCap, defaultTurnCap),
-		MaxRuntimeS:     intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),
-		LaneLabelPrefix: stringOrDefault(raw.LaneLabelPrefix, defaultLaneLabelPrefix),
-		MaxAttempts:     intOrDefault(raw.MaxAttempts, defaultMaxAttempts),
-		ReworkCap:       intOrDefault(raw.ReworkCap, defaultReworkCap),
-		RecoverCap:      intOrDefault(raw.RecoverCap, defaultRecoverCap),
-		RecoverBackoffS: intOrDefault(raw.RecoverBackoffS, pollIntervalS),
-		MaxTokensPerRun: intOrDefault(raw.MaxTokensPerRun, defaultMaxTokensPerRun),
-		CheckpointsDir:  stringOrDefault(raw.CheckpointsDir, defaultCheckpointsDir),
-		BoardDir:        stringOrDefault(raw.BoardDir, defaultBoardDir),
-		EnvAllowlist:    stringSliceOrDefault(raw.EnvAllowlist, defaultEnvAllowlist),
+		PollIntervalS:    pollIntervalS,
+		TurnCap:          intOrDefault(raw.TurnCap, defaultTurnCap),
+		MaxRuntimeS:      intOrDefault(raw.MaxRuntimeS, defaultMaxRuntimeS),
+		LaneLabelPrefix:  stringOrDefault(raw.LaneLabelPrefix, defaultLaneLabelPrefix),
+		StateLabelPrefix: stringValueOrDefault(raw.StateLabelPrefix, ""),
+		MaxAttempts:      intOrDefault(raw.MaxAttempts, defaultMaxAttempts),
+		ReworkCap:        intOrDefault(raw.ReworkCap, defaultReworkCap),
+		RecoverCap:       intOrDefault(raw.RecoverCap, defaultRecoverCap),
+		RecoverBackoffS:  intOrDefault(raw.RecoverBackoffS, pollIntervalS),
+		MaxTokensPerRun:  intOrDefault(raw.MaxTokensPerRun, defaultMaxTokensPerRun),
+		CheckpointsDir:   stringOrDefault(raw.CheckpointsDir, defaultCheckpointsDir),
+		BoardDir:         stringOrDefault(raw.BoardDir, defaultBoardDir),
+		EnvAllowlist:     stringSliceOrDefault(raw.EnvAllowlist, defaultEnvAllowlist),
 		Caps: Caps{
 			Global: intOrDefault(raw.Caps.Global, defaultCapsGlobal),
 			PerLane: PerLaneCaps{
@@ -507,13 +568,13 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := validate(cfg); err != nil {
-		return nil, fmt.Errorf("validating config %s: %w", path, err)
+		return nil, fmt.Errorf("validating config %s: %w", source, err)
 	}
 	if raw.AgentBackend.Daytona.Snapshot != nil && cfg.AgentBackend.Daytona.Snapshot == "" {
-		return nil, fmt.Errorf("validating config %s: agent_backend.daytona.snapshot must not be empty when present", path)
+		return nil, fmt.Errorf("validating config %s: agent_backend.daytona.snapshot must not be empty when present", source)
 	}
 	if raw.AgentBackend.Daytona.Target != nil && cfg.AgentBackend.Daytona.Target == "" {
-		return nil, fmt.Errorf("validating config %s: agent_backend.daytona.target must not be empty when present", path)
+		return nil, fmt.Errorf("validating config %s: agent_backend.daytona.target must not be empty when present", source)
 	}
 
 	return cfg, nil
@@ -658,6 +719,11 @@ func validate(cfg *Config) error {
 	}
 	if cfg.TeamID == "" {
 		return fmt.Errorf("team_id is required")
+	}
+	if cfg.StateLabelPrefix != "" &&
+		(strings.HasPrefix(cfg.StateLabelPrefix, cfg.LaneLabelPrefix) ||
+			strings.HasPrefix(cfg.LaneLabelPrefix, cfg.StateLabelPrefix)) {
+		return fmt.Errorf("state_label_prefix %q must not overlap lane_label_prefix %q", cfg.StateLabelPrefix, cfg.LaneLabelPrefix)
 	}
 	if cfg.MaxTokensPerRun <= 0 {
 		return fmt.Errorf("max_tokens_per_run must be positive, got %d", cfg.MaxTokensPerRun)
