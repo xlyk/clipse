@@ -44,7 +44,7 @@ func TestApplyCreatesInDepOrderWithMarkersAndRelations(t *testing.T) {
 		{Ref: "a", Title: "A", Body: "aa"},
 		{Ref: "h", Title: "H", Body: "hh", Human: true, Deps: []string{"a"}},
 	}}
-	p := BuildPlan(spec, nil) // all create; relations b->a, h->a
+	p := mustBuildPlan(t, spec, nil) // all create; relations b->a, h->a
 	f := newFakeLinear()
 	if err := Apply(context.Background(), f, spec, p); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -86,7 +86,7 @@ func TestApplyThenReplanIsAllSkip(t *testing.T) {
 		{Ref: "b", Title: "B", Body: "bb", Deps: []string{"a"}},
 	}}
 	f := newFakeLinear()
-	if err := Apply(context.Background(), f, spec, BuildPlan(spec, nil)); err != nil {
+	if err := Apply(context.Background(), f, spec, mustBuildPlan(t, spec, nil)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -109,7 +109,7 @@ func TestApplyThenReplanIsAllSkip(t *testing.T) {
 		byID[dep].BlockedBy = append(byID[dep].BlockedBy, blk)
 	}
 
-	p2 := BuildPlan(spec, reconstructed)
+	p2 := mustBuildPlan(t, spec, reconstructed)
 	for _, op := range p2.Issues {
 		if op.Action != Skip {
 			t.Errorf("re-plan op %q = %v, want skip", op.Ref, op.Action)
@@ -123,7 +123,7 @@ func TestApplyThenReplanIsAllSkip(t *testing.T) {
 func TestApplyUpdatesChangedIssue(t *testing.T) {
 	spec := &Spec{Team: "CLI", Issues: []Issue{{Ref: "a", Title: "A", Body: "new"}}}
 	board := []BoardIssue{{ID: "LA", Description: "old\n\n" + RenderMarker("a", "stale000")}}
-	p := BuildPlan(spec, board)
+	p := mustBuildPlan(t, spec, board)
 	f := newFakeLinear()
 	if err := Apply(context.Background(), f, spec, p); err != nil {
 		t.Fatalf("Apply: %v", err)

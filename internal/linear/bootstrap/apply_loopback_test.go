@@ -34,7 +34,7 @@ func TestApplyLoopbackCreatesWithMarkerAndRelation(t *testing.T) {
 				sawMarkerInCreate = true
 			}
 			// each create gets a distinct id
-			w.Write([]byte(`{"data":{"issueCreate":{"issue":{"id":"L` + itoa(created) + `","identifier":"CLI-` + itoa(created) + `"}}}}`))
+			w.Write([]byte(`{"data":{"issueCreate":{"success":true,"issue":{"id":"L` + itoa(created) + `","identifier":"CLI-` + itoa(created) + `"}}}}`))
 		case strings.Contains(q, "issueRelationCreate"):
 			sawRelation = true
 			w.Write([]byte(`{"data":{"issueRelationCreate":{"success":true}}}`))
@@ -53,7 +53,10 @@ func TestApplyLoopbackCreatesWithMarkerAndRelation(t *testing.T) {
 		{Ref: "a", Title: "A", Body: "aa"},
 		{Ref: "b", Title: "B", Body: "bb", Deps: []string{"a"}},
 	}}
-	p := boardspec.BuildPlan(spec, nil)
+	p, err := boardspec.BuildPlan(spec, nil)
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
 	if err := boardspec.Apply(context.Background(), c, spec, p); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

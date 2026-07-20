@@ -105,7 +105,7 @@ A new project needs a board before the dispatcher has work: issues, `blocked-by`
 ./bin/clipse board apply board.yaml
 ```
 
-A second apply skips unchanged issues, updates edited ones, and never deletes — a hidden ref marker in each issue ties it to its spec entry. The repo-versioned `clipse-board-bootstrap` skill (`skills/`) turns a prose project plan into a valid `board.yaml`.
+A second apply skips unchanged issues, updates edited ones, and never deletes — a hidden ref marker in each issue ties it to its spec entry. Refs use the safe identifier shape `[A-Za-z0-9][A-Za-z0-9._-]*`. Removed dependency edges are reported as stale and left alone for explicit operator cleanup. The repo-versioned `clipse-board-bootstrap` skill (`skills/`) turns a prose project plan into a valid `board.yaml`.
 
 ### Inspect board state
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "clipse board spec",
-  "description": "Reference schema for board.yaml consumed by `clipse board plan|apply`. Authoring aid and documentation only: it is NOT codegen'd and NOT loaded at runtime; the Go applier validates a hand-written yaml struct (internal/board).",
+  "description": "Reference schema for board.yaml consumed by `clipse board plan|apply`. Authoring aid and documentation only: it is NOT codegen'd and NOT loaded at runtime; the Go applier validates a hand-written yaml struct (internal/boardspec).",
   "type": "object",
   "required": ["team", "issues"],
   "properties": {
@@ -14,7 +14,7 @@
         "type": "object",
         "required": ["ref", "title"],
         "properties": {
-          "ref": { "type": "string", "minLength": 1 },
+          "ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
           "title": { "type": "string", "minLength": 1 },
           "milestone": { "type": "string" },
           "labels": { "type": "array", "items": { "type": "string", "minLength": 1 } },

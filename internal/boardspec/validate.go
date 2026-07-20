@@ -3,7 +3,10 @@ package boardspec
 import (
 	"errors"
 	"fmt"
+	"regexp"
 )
+
+var safeRefRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // Validate returns a single error joining every problem in the spec, or nil.
 // It runs before any network call so the operator sees all issues at once.
@@ -12,11 +15,18 @@ func (s *Spec) Validate() error {
 	if s.Team == "" {
 		errs = append(errs, errors.New("team is required"))
 	}
+	for _, l := range s.DefaultLabels {
+		if l == "" {
+			errs = append(errs, errors.New("empty default label"))
+		}
+	}
 	seen := map[string]bool{}
 	for _, is := range s.Issues {
 		switch {
 		case is.Ref == "":
 			errs = append(errs, errors.New("issue with empty ref"))
+		case !safeRefRE.MatchString(is.Ref):
+			errs = append(errs, fmt.Errorf("issue ref %q must be a safe identifier matching %s", is.Ref, safeRefRE.String()))
 		case seen[is.Ref]:
 			errs = append(errs, fmt.Errorf("duplicate ref %q", is.Ref))
 		default:

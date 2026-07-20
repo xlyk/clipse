@@ -1,13 +1,22 @@
 # Clipse — Technical Design
 
-**Status:** Draft for review · **Date:** 2026-07-01 · **Owner:** Kyle
+**Status:** Implemented; historical decision record · **Date:** 2026-07-01 · **Owner:** Kyle
+
+> [!IMPORTANT]
+> This document began as the pre-implementation proposal and intentionally
+> retains historical rationale. [AGENTS.md](../../AGENTS.md) is authoritative
+> for current behavior and invariants. In particular, current Clipse has no
+> `documentation` column or Scribe lane; documentation is a best-effort Coder
+> sub-turn, Git-operator is deterministic Go, transient recovery is bounded,
+> and Daytona is the recommended remote backend.
 
 ## Overview
 
 Clipse is a personal, autonomous coding-agent orchestrator. A deterministic
 dispatcher watches a Linear board and, for each eligible issue, spins up a
-headless coding-agent worker in an isolated git worktree. The worker writes
-code, commits, and opens a PR; downstream lanes review, merge, and document it.
+headless coding-agent worker in an isolated local worktree or Daytona sandbox.
+The worker writes code and documentation, commits, and opens a PR; downstream
+lanes review and merge it.
 Work fans out across many issues in parallel.
 
 One line: **Symphony's Linear-as-control-plane + Hermes's dispatcher discipline,
@@ -25,7 +34,6 @@ with per-lane LangGraph workers wrapping Deep Agents Code (DAC) as the engine.**
 
 - Automatic task decomposition / an orchestrator agent (v2).
 - Multi-repo (v2 — config is shaped for it).
-- Remote/multi-host workers (v2 — behind a Spawner seam).
 - A web dashboard (a terminal TUI covers v1).
 
 ### Inspirations
@@ -66,7 +74,7 @@ flowchart LR
   Linear["Linear board<br/>(task intent)"] -->|poll| Kernel
   subgraph GoPlane["Dispatcher plane (Go)"]
     Kernel["Dispatch loop"] --> Store[("SQLite kernel<br/>issues / runs / events")]
-    Kernel --> Spawn["Spawner (local)"]
+    Kernel --> Spawn["Backend lifecycle (local / Daytona)"]
   end
   Spawn -->|"clipse-worker --issue --lane --run"| Worker
   subgraph PyPlane["Worker plane (Python)"]
@@ -93,33 +101,33 @@ This is also how Linear-write failures self-heal (A2): the transition commits
 to SQLite first, and a pending-write outbox drains and retries the mirror each
 tick, so SQLite and Linear reconverge without a human in the loop.
 
-Columns: `Todo → Ready → Running → Review → Merging → Documentation → Done`,
-plus `Rework` and `Blocked`.
+Columns: `Todo → Ready → Running → Review → Merging → Done`, plus `Rework`,
+`Blocked`, and terminal `Cancelled`.
 
 | Column | Meaning | Lane | Transition out |
 |---|---|---|---|
 | **Todo** | Has unfinished dependencies; not dispatchable | — | deps terminal → `Ready` |
 | **Ready** | Dependencies clear; dispatcher may claim | Coder | claim → `Running` |
-| **Running** | Claimed; worker active | (active lane) | per typed result |
+| **Running** | Initial Coder claim; worker active | Coder | per typed result |
 | **Review** | PR open, awaiting review | Reviewer | pass → `Merging`; changes → `Rework` |
 | **Rework** | Reviewer requested changes | Coder | re-run → `Review` |
-| **Merging** | Approved; land it | Git-operator | merged + tagged → `Documentation` |
-| **Documentation** | Merged; write docs (always-on) | Scribe | docs PR or no-op → `Done` |
+| **Merging** | Approved; land it | Git-operator | merged + tagged → `Done` |
 | **Blocked** | Failed / stuck / needs input | — | human requeue → `Ready`/`Todo` |
+| **Cancelled** | Human-cancelled terminal work | — | — |
 | **Done** | Terminal | — | — |
 
 ### Lanes
 
-A lane is a **named DAC profile** — its own system prompt, toolset, skills,
-optional model override, and shell allow-list — selected per issue by a Linear
-label `agent:<lane>`. New lanes are config, not code.
+A worker lane is a **named DAC profile** — its own system prompt, toolset,
+skills, optional model override, and shell policy. The deterministic
+`git_operator` lane remains board/store semantics, but is executed by Go rather
+than DAC.
 
 | Lane | Responsibility |
 |---|---|
-| **Coder** | Edit files, **commit, push, open the PR** on the issue's worktree/branch. |
+| **Coder** | Edit files, run a best-effort `coder_docs` sub-turn, then **commit, push, and open the PR** on the issue's workspace/branch. |
 | **Reviewer** | Check out the PR, review; return `pass` or `changes_requested` + inline comments. |
-| **Git-operator** | **Merge** PRs (CI + branch-protection gated), tags, and repo-level git ops (cleanup, rebase-onto-main) outside coder scope. |
-| **Scribe** | Documentation. Runs on every merged issue; no-ops when there is nothing to write. |
+| **Git-operator** | Deterministic Go executor for **merging** PRs (CI + branch-protection gated), tags, and workspace cleanup. |
 
 Merge is **auto-merge when clean** (D2): a reviewer pass hands off to the
 Git-operator, which merges only when required CI checks are green and branch
@@ -157,7 +165,7 @@ agent. The graph:
 - gives **fine-grained control** the DAC CLI can't: typed graph state,
   checkpointed **resume** (for continuation turns), and **interrupts** (for
   blocked/needs-input);
-- runs in the worktree the kernel resolved;
+- runs in the workspace the kernel resolved;
 - writes its outcome as the graph's terminal state, serialized to JSON on
   stdout.
 
@@ -166,16 +174,18 @@ Coder graph (representative):
 ```mermaid
 flowchart TD
   A["load_context<br/>(Linear issue + prior run summaries)"] --> B["ensure_worktree"]
-  B --> C["run_DAC<br/>interactive=False, auto_approve=True"]
-  C --> D{outcome?}
-  D -->|done| E["commit → push → open_PR"]
-  D -->|needs input / stuck| F["interrupt → block"]
-  E --> G["emit_result (JSON)"]
-  F --> G
+  B --> C["sync_base"]
+  C --> D["run_DAC"]
+  D --> E{outcome?}
+  E -->|done| F["run_docs (best effort)"]
+  E -->|needs input / stuck| G["interrupt → block"]
+  F --> H["commit → push → open_PR"]
+  H --> I["emit_result (JSON)"]
+  G --> I
 ```
 
-Reviewer, Git-operator, and Scribe are analogous graphs with lane-specific
-nodes and DAC profiles.
+Reviewer is a separate DAC graph. Git-operator is deterministic Go, and the
+documentation profile runs only as the Coder graph's `run_docs` sub-turn.
 
 ### CLI + TUI (Go)
 
@@ -245,10 +255,10 @@ Adapted from Hermes `dispatch_once`, run each tick on interval (G — poll):
 ## Concurrency & fan-out
 
 - **Global cap** (`max_in_progress`) and **per-lane caps** (e.g. coder=4,
-  reviewer=2, git-operator=1, scribe=1).
-- Workers run as local subprocesses in v1, spawned through a **`Spawner`
-  interface**. A remote/SSH implementation can drop in later without touching
-  the loop.
+  reviewer=2, git-operator=1).
+- Workers run in provider-neutral workspaces. Local worktrees are the
+  compatibility default; Daytona is the recommended remote backend and never
+  silently falls back to the host.
 
 ## Workspace & git lifecycle
 
@@ -276,10 +286,11 @@ Derived from Hermes:
 - Claim TTL + heartbeat → no indefinite `Running`.
 - PID crash detection requeues/fails dead workers.
 - `max_runtime` kills and requeues over-budget workers.
-- **Everything parks in `Blocked`** on failure (H): no failure auto-retry
-  classification. A stuck/failed/needs-input run moves to `Blocked` with a
-  reason comment; you requeue. The per-issue turn cap bounds continuation, so
-  clean-but-incomplete runs can't churn forever.
+- **Transient failures recover automatically under a bounded budget.** Worker
+  transient blocks, crashes, malformed results, timeouts, and spawn/workspace
+  failures return to their release column after `recover_backoff_s` while
+  `recover_attempts < recover_cap`; exhausted or non-transient work parks in
+  `Blocked` with a reason comment.
 - **Dispatcher-restart orphans are requeued, not Blocked.** H governs *worker*
   failures (stuck/failed/needs-input); a dispatcher restart is infrastructure,
   not a worker failure. On startup, before any claim release, the dispatcher
@@ -364,7 +375,7 @@ clipse/
 │   │   ├── dac.py                 #   create_cli_agent wiring
 │   │   ├── contract.py            #   Pydantic models (from schema/)
 │   │   ├── profiles/              #   per-lane DAC config (prompt/tools/skills/model)
-│   │   └── graphs/{coder,reviewer,scribe}.py   # git_operator runs as internal/gitops, not a graph
+│   │   └── graphs/{coder,reviewer}.py   # docs are in coder; git_operator is internal/gitops
 │   └── tests/
 │
 ├── testworker/                   # Go fake worker for v1 kernel tests (canned JSON)
@@ -385,27 +396,28 @@ Notes:
 
 ## Build phases
 
-1. **v1 — Go kernel + TUI, fake worker.** SQLite schema + migrations, Linear
+1. **Complete — Go kernel + TUI, fake worker.** SQLite schema + migrations, Linear
    poll/normalize, state machine, CAS claim, caps, stale/crash reclaim,
    transitions, Spawner interface, `clipse status`/`tui`. Built test-first
    against `testworker/`. Zero LLM tokens.
-2. **Coder LangGraph worker** (real DAC) behind the contract → real PRs.
-3. **Reviewer + Git-operator + Scribe** lanes; auto-merge; Merging / Rework /
-   Documentation columns live.
-4. **v2**: orchestrator / auto-decompose, multi-repo, remote Spawner, richer
+2. **Complete — Coder LangGraph worker** (real DAC) behind the contract → real PRs.
+3. **Complete — Reviewer + deterministic Git-operator**; auto-merge, Rework,
+   coder-graph documentation, and provider-neutral workspace cleanup.
+4. **Future**: runtime orchestrator/auto-decompose, multi-repo, and richer
    observability.
 
-## Open questions / to verify
+## Historical verification questions
 
 - **DAC ↔ LangGraph resume specifics** — ✅ **RESOLVED by the spike (2026-07-01,
   `deepagents_code` 0.1.22)**; see "DAC API spike findings" below.
-- **Linear workflow-state setup** — create the custom columns (`Rework`,
-  `Merging`, `Documentation`) and the `agent:<lane>` labels; confirm the
-  candidate-issue GraphQL query and branch-name auto-link behavior.
-- **Git-operator merge gating** — confirm branch-protection + required-check
-  configuration on the target repo so auto-merge is safe.
-- **Continuation vs Blocked boundary** — final turn-cap value and what a worker
-  returns as `continue` vs `blocked`.
+- **Linear workflow-state setup** — ✅ **RESOLVED.** Rework and Merging are live;
+  Documentation was removed by D3. Team-scoped state resolution and candidate
+  queries are implemented.
+- **Git-operator merge gating** — ✅ **RESOLVED.** `internal/gitops` requires
+  branch protection and required checks before merging.
+- **Continuation vs Blocked boundary** — ✅ **RESOLVED for current DAC.** The
+  worker runs a DAC turn to completion; runtime/turn caps bound work, and typed
+  transient vs non-transient outcomes drive retry or parking.
 
 ### DAC API spike findings (verified 2026-07-01, `deepagents_code` 0.1.22)
 
@@ -459,17 +471,17 @@ do **not** shell out to `dcode -n`.
 | C2 | Symphony-style auto-continuation + hard per-issue turn cap; resume via LangGraph checkpointer |
 | D1 | Lane = named DAC profile, `agent:<lane>` label-selected |
 | D2 | Reviewer reviews → auto-merge when clean; else Rework → Coder |
-| D3 | Always-on Documentation stage (Scribe no-ops if nothing). **Amended (reversed):** documentation is now a best-effort step *inside* the Coder graph (`graphs/coder.py`'s `run_docs` node), not a separate always-on Scribe lane/column. Docs are written into the coder's own worktree before the PR is opened, so they ride the same commit/PR and get reviewed; a merged PR goes `merging → done` directly. This retires the `documentation` column, the `scribe` lane, and the `-docs` branch/worktree (and with them the non-fast-forward push bug that branch existed to dodge, plus its worktree leak). |
+| D3 | Documentation is a best-effort step *inside* the Coder graph (`graphs/coder.py`'s `run_docs` node), not a Scribe lane/column. Docs ride the same commit/PR and get reviewed; a merged PR goes `merging → done` directly. |
 | E | Single machine + pluggable Spawner seam + global/per-lane caps |
-| F | Single configured repo; worktree-per-issue |
+| F | Single configured repo; provider-neutral workspace per issue |
 | G | Poll Linear on interval |
-| H | Everything parks in Blocked (no failure auto-retry) |
+| H | Transient failures retry with a bounded budget/backoff; non-transient or exhausted work parks in Blocked |
 | I | Dependencies only for v1 (orchestrator/decompose = v2) |
-| J | 4 lanes: Coder (edit+commit+push+PR), Reviewer, Git-operator (merge+tags), Scribe; merge gated by branch protection + CI. **Amended:** the Git-operator lane's *executor* is deterministic kernel code (`internal/gitops`), not a DAC worker — merge/tag/cleanup is pure CLI/API work with exact success criteria, and running it through an LLM adds cost, latency, and nondeterminism at the single most dangerous transition in the pipeline. The `git_operator` lane label remains board semantics only. |
+| J | Coder and Reviewer are DAC workers; `coder_docs` is a Coder sub-turn; Git-operator is deterministic kernel code (`internal/gitops`). Merge remains gated by branch protection + CI. |
 | K | Linear board + Symphony-style terminal TUI |
 | L | Go dispatcher/CLI/TUI + Python LangGraph worker |
 | M | v1 = kernel-first, tested against a fake worker |
 | N | Secrets via `op`/env (`LINEAR_API_KEY` v1; `ANTHROPIC_API_KEY` + `gh` phase 2) |
 | O | Dispatcher-restart orphans are requeued to `ready` with an incremented `attempt` (bounded by `max_attempts`), not parked in `Blocked` by default — refines H, which governs worker failures; a dispatcher restart is infrastructure |
-| P | **Cross-lane claiming = per-column claim, not handoff-spawn** (Phase 3): a downstream card is claimed *in place* in its entry column via `store.ClaimColumn` (CAS-lock, `board_status` unchanged), so the claim — not a fire-after-transition spawn — is the restart-safe source of truth (a crash after the transition still leaves a claimable card). `review`→reviewer, `rework`→coder, `documentation`→scribe run as DAC workers; `merging` runs `internal/gitops` inline. Stale-release/orphan-recover return a card to `ready` only when it was `running` (coder), else keep its own column (shared `ColumnAfterRelease` helper). Downstream claims don't mirror Linear (the column didn't change). |
+| P | **Cross-lane claiming = per-column claim, not handoff-spawn**: a downstream card is claimed *in place* via `store.ClaimColumn`, so the claim is the restart-safe source of truth. `review`→reviewer, `rework`→coder, and `merging`→`internal/gitops`; stale release preserves the entry column except for the coder's `running` claim. |
 | Repo | Single Go module; one `clipse` binary (subcommands); JSON Schema → codegen both sides |

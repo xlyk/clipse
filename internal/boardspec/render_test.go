@@ -11,8 +11,9 @@ func TestPlanRenderSummary(t *testing.T) {
 			{Ref: "a", Action: Create, Issue: Issue{Title: "A"}},
 			{Ref: "b", Action: Skip, Issue: Issue{Title: "B"}},
 		},
-		Relations: []RelationOp{{FromRef: "b", ToRef: "a"}},
-		Orphans:   []string{"z"},
+		Relations:      []RelationOp{{FromRef: "b", ToRef: "a"}},
+		StaleRelations: []RelationOp{{FromRef: "c", ToRef: "b"}},
+		Orphans:        []string{"z"},
 	}
 	out := p.Render()
 	if !strings.Contains(out, "+ create") || !strings.Contains(out, "= skip") {
@@ -23,5 +24,8 @@ func TestPlanRenderSummary(t *testing.T) {
 	}
 	if !strings.Contains(out, "relation b blocked-by a") {
 		t.Errorf("missing relation row:\n%s", out)
+	}
+	if !strings.Contains(out, "stale relation c blocked-by b") || !strings.Contains(out, "left alone") {
+		t.Errorf("missing stale-relation warning:\n%s", out)
 	}
 }

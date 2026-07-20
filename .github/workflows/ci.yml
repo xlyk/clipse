@@ -2,7 +2,15 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   go:
@@ -29,9 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: cd agent && uv sync
-      - run: cd agent && uv run pytest
-      - run: cd agent && uvx ruff check .
+        with:
+          enable-cache: true
+          cache-dependency-glob: agent/uv.lock
+      - run: cd agent && uv sync --locked
+      - run: cd agent && uv run --locked pytest
+      - run: cd agent && uv run --locked ruff check .
 
   codegen-drift:
     runs-on: ubuntu-latest
@@ -41,5 +52,8 @@ jobs:
         with:
           go-version: "1.25.x"
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: agent/uv.lock
       - run: make codegen
       - run: git diff --exit-code

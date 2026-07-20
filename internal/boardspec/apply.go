@@ -91,7 +91,7 @@ func Apply(ctx context.Context, l Linear, spec *Spec, p *Plan) error {
 		case Create:
 			id, err := l.CreateIssue(ctx, CreateInput{
 				Title:       is.Title,
-				Description: WithBody(is),
+				Description: WithBody(spec, is),
 				StateID:     stateID,
 				Labels:      effectiveLabels(spec, is),
 			})
@@ -102,7 +102,7 @@ func Apply(ctx context.Context, l Linear, spec *Spec, p *Plan) error {
 		case Update:
 			if err := l.UpdateIssue(ctx, op.ExistingID, UpdateInput{
 				Title:       is.Title,
-				Description: WithBody(is),
+				Description: WithBody(spec, is),
 				Labels:      effectiveLabels(spec, is),
 			}); err != nil {
 				return fmt.Errorf("updating issue %q: %w", is.Ref, err)
