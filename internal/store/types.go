@@ -2,6 +2,48 @@ package store
 
 import "database/sql"
 
+// SchedulingMode is the durable operator intent consulted atomically by
+// every claim transaction.
+type SchedulingMode string
+
+const (
+	SchedulingRunning SchedulingMode = "running"
+	SchedulingPaused  SchedulingMode = "paused"
+)
+
+// ObservedMode is the active dispatcher's last acknowledged control state.
+type ObservedMode string
+
+const (
+	ObservedRunning  ObservedMode = "running"
+	ObservedPaused   ObservedMode = "paused"
+	ObservedDraining ObservedMode = "draining"
+)
+
+// DispatcherControl mirrors the singleton board-scoped scheduling row.
+// Empty strings and zero timestamps represent absent optional values.
+type DispatcherControl struct {
+	DesiredMode           SchedulingMode
+	ObservedMode          ObservedMode
+	RequestID             string
+	RequestedAt           int64
+	AcknowledgedAt        int64
+	ActiveInstanceID      string
+	ActivePID             int
+	InstanceStartedAt     int64
+	HeartbeatAt           int64
+	DrainTargetInstanceID string
+	DrainStrict           bool
+	DrainedAt             int64
+}
+
+// DispatcherRegistration reports the state observed by a newly registered
+// daemon and whether it repaired a drain targeting a prior dead instance.
+type DispatcherRegistration struct {
+	Control          DispatcherControl
+	DrainInterrupted bool
+}
+
 // Issue mirrors a row in the issues table: a cache of Linear issue state
 // plus dispatcher-owned claim fields. Deps is a JSON array (of issue ids)
 // encoded as TEXT.

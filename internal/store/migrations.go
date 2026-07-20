@@ -86,6 +86,22 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_agent_workspaces_issue ON agent_workspaces(issue_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_agent_workspaces_cleanup ON agent_workspaces(state)`,
+	`CREATE TABLE IF NOT EXISTS dispatcher_control (
+		id                       INTEGER PRIMARY KEY,
+		desired_mode             TEXT NOT NULL DEFAULT 'running',
+		observed_mode            TEXT NOT NULL DEFAULT 'running',
+		request_id               TEXT NOT NULL DEFAULT '',
+		requested_at             INTEGER NOT NULL DEFAULT 0,
+		acknowledged_at          INTEGER NOT NULL DEFAULT 0,
+		active_instance_id       TEXT NOT NULL DEFAULT '',
+		active_pid               INTEGER NOT NULL DEFAULT 0,
+		instance_started_at      INTEGER NOT NULL DEFAULT 0,
+		heartbeat_at             INTEGER NOT NULL DEFAULT 0,
+		drain_target_instance_id TEXT NOT NULL DEFAULT '',
+		drain_strict             INTEGER NOT NULL DEFAULT 0,
+		drained_at               INTEGER NOT NULL DEFAULT 0
+	)`,
+	`INSERT OR IGNORE INTO dispatcher_control (id) VALUES (1)`,
 }
 
 // migrate applies every migration statement in order, then applies any

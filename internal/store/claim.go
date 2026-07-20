@@ -12,6 +12,21 @@ import (
 // or a concurrent claimer won the race for the only one.
 var ErrNoReady = errors.New("no ready issue to claim")
 
+// ErrSchedulingPaused is returned before candidate selection when the
+// board's durable control row forbids new claims.
+var ErrSchedulingPaused = errors.New("dispatcher scheduling is paused")
+
+func ensureSchedulingRunning(ctx context.Context, tx *sql.Tx) error {
+	var desired SchedulingMode
+	if err := tx.QueryRowContext(ctx, `SELECT desired_mode FROM dispatcher_control WHERE id = 1`).Scan(&desired); err != nil {
+		return fmt.Errorf("reading dispatcher scheduling mode: %w", err)
+	}
+	if desired != SchedulingRunning {
+		return ErrSchedulingPaused
+	}
+	return nil
+}
+
 // Claim is the result of a successful ClaimReady or ClaimColumn: the issue
 // that was won plus the run row created to track the attempt.
 type Claim struct {
@@ -143,6 +158,12 @@ func (s *Store) ClaimReady(ctx context.Context, laneLabel, runID string, now, tt
 		return nil, fmt.Errorf("claiming ready issue: beginning tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op if already committed
+	if err := ensureSchedulingRunning(ctx, tx); err != nil {
+		if errors.Is(err, ErrSchedulingPaused) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("claiming ready issue: checking scheduling control: %w", err)
+	}
 
 	issue, err := selectClaimCandidate(ctx, tx, now, "board_status = 'ready' AND lane_label = ?", laneLabel)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -237,6 +258,12 @@ func (s *Store) ClaimColumn(ctx context.Context, column, lane, runID string, now
 		return nil, fmt.Errorf("claiming column %s: beginning tx: %w", column, err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op if already committed
+	if err := ensureSchedulingRunning(ctx, tx); err != nil {
+		if errors.Is(err, ErrSchedulingPaused) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("claiming column %s: checking scheduling control: %w", column, err)
+	}
 
 	issue, err := selectClaimCandidate(ctx, tx, now, "board_status = ?", column)
 	if errors.Is(err, sql.ErrNoRows) {
